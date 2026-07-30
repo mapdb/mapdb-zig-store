@@ -26,6 +26,9 @@ pub const listener = @import("listener.zig");
 pub const queue = @import("queue/mod.zig");
 /// DB/DBMaker facade: name catalog, typed makers, Atomic, Bind.
 pub const db = @import("db/mod.zig");
+/// Cross-port conformance fixture tests (golden files in src/xfixtures/data/,
+/// consumed via @embedFile; generator wired as `zig build fixtures`).
+pub const xfixtures = @import("xfixtures/conformance_test.zig");
 
 /// The single error set every public API returns.
 pub const DbError = errors.DbError;
