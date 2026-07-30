@@ -1,5 +1,6 @@
 //! Cross-port conformance fixture tests — Stage 1 (D accept matrix + the
-//! reject rows derivable from D outputs).
+//! reject rows derivable from D outputs) and Stage 2 (W WAL accept cells +
+//! WAL-file-based reject rows).
 //!
 //! These fixtures pin the CURRENT state of an UNSTABLE on-disk format for
 //! divergence detection between the java/rust/zig store engines. Cross-engine
@@ -17,10 +18,12 @@
 //! 1. parse MANIFEST.tsv, assert `version 1`;
 //! 2. gunzip every referenced `.gz`, verify rawSha256 + rawLen (and gzSha256);
 //! 3. for each `expect` row with engine == zig: fresh per-cell temp dir, copy
-//!    the fixture file in as `placeAs`, run the cell (accept: open + verify()
+//!    the fixture file in as `placeAs`, run the cell (accept: open — opener
+//!    `direct` = StoreDirect, opener `wal` = StoreWAL replay — + verify()
 //!    + per-recid assertions + getAllRecids set equality; reject:
 //!    `error.DataCorruption` from the opener), then assert the working copy
-//!    is byte-identical and no files beyond `.lock` sidecars appeared.
+//!    is byte-identical and no files beyond `.lock` sidecars appeared (in
+//!    particular NO `.ckpt` companion after a clean StoreWAL close).
 
 const std = @import("std");
 const testing = std.testing;
@@ -38,10 +41,15 @@ const ENGINE = "zig";
 const manifest_tsv: []const u8 = @embedFile("data/MANIFEST.tsv");
 
 const EmbeddedGz = struct { rel_name: []const u8, gz: []const u8 };
-/// NOTE: this list MUST match the `file` rows of data/MANIFEST.tsv — one
-/// entry per row, `rel_name` == the row's relName, embedding `<relName>.gz`.
-/// `@embedFile` needs comptime-known names, so the list is static; the
-/// runtime lookup below hard-fails on any manifest file row missing here.
+/// NOTE: this list MUST cover every `file` row of data/MANIFEST.tsv —
+/// `rel_name` == the row's relName, embedding `<relName>.gz`. `@embedFile`
+/// needs comptime-known names, so the list is static (all 14 Stage-2 manifest
+/// files); the runtime preflight hard-fails on any manifest file row missing
+/// here. The CONVERSE is tolerated: an embedded entry the current manifest
+/// does not reference is harmless surplus (see `loadBaselines`), which keeps
+/// compilation stable across sync generations — the manifest is data while
+/// this list is comptime, so a not-yet-distributed fixture only needs a
+/// placeholder .gz in data/, not a code change.
 const embedded_gz = [_]EmbeddedGz{
     .{ .rel_name = "direct-v1-java.db", .gz = @embedFile("data/direct-v1-java.db.gz") },
     .{ .rel_name = "direct-v1-rust.db", .gz = @embedFile("data/direct-v1-rust.db.gz") },
@@ -50,6 +58,13 @@ const embedded_gz = [_]EmbeddedGz{
     .{ .rel_name = "reject-sd1-badfeatures.db", .gz = @embedFile("data/reject-sd1-badfeatures.db.gz") },
     .{ .rel_name = "reject-sd1-badchecksum.db", .gz = @embedFile("data/reject-sd1-badchecksum.db.gz") },
     .{ .rel_name = "reject-sd1-short.db", .gz = @embedFile("data/reject-sd1-short.db.gz") },
+    .{ .rel_name = "wal-v1-rust-tail.wal", .gz = @embedFile("data/wal-v1-rust-tail.wal.gz") },
+    .{ .rel_name = "wal-v1-rust-ckpt.wal", .gz = @embedFile("data/wal-v1-rust-ckpt.wal.gz") },
+    .{ .rel_name = "wal-v1-zig-tail.wal", .gz = @embedFile("data/wal-v1-zig-tail.wal.gz") },
+    .{ .rel_name = "wal-v1-zig-ckpt.wal", .gz = @embedFile("data/wal-v1-zig-ckpt.wal.gz") },
+    .{ .rel_name = "reject-mdb5-wal.wal", .gz = @embedFile("data/reject-mdb5-wal.wal.gz") },
+    .{ .rel_name = "reject-wal-v1-badflags.wal", .gz = @embedFile("data/reject-wal-v1-badflags.wal.gz") },
+    .{ .rel_name = "reject-wal-java-v3.walseg", .gz = @embedFile("data/reject-wal-java-v3.walseg.gz") },
 };
 
 // ---------------------------------------------------------------- serializer
@@ -143,13 +158,14 @@ const Manifest = struct {
         self.recids.deinit(alloc);
     }
 
-    /// Stage 1: every fixture has exactly ONE file row (asserted here).
+    /// Every fixture has exactly ONE file row (Stage-1 rule, still in force
+    /// for Stage 2 — every Stage-2 fixture is single-file; asserted here).
     fn fileFor(self: *const Manifest, fixture: []const u8) !FileRow {
         var found: ?FileRow = null;
         for (self.files.items) |f| {
             if (std.mem.eql(u8, f.fixture, fixture)) {
                 if (found != null) {
-                    std.debug.print("[xfixtures] fixture {s}: more than one file row (Stage 1 forbids)\n", .{fixture});
+                    std.debug.print("[xfixtures] fixture {s}: more than one file row (contract forbids)\n", .{fixture});
                     return error.XFixturesManifest;
                 }
                 found = f;
@@ -338,24 +354,28 @@ const Baseline = struct {
 };
 
 fn loadBaselines(alloc: Allocator, m: *const Manifest) !std.ArrayListUnmanaged(Baseline) {
-    if (embedded_gz.len != m.files.items.len) {
-        std.debug.print(
-            "[xfixtures] embedded_gz/file-row count mismatch: embedded {d}, manifest {d}\n",
-            .{ embedded_gz.len, m.files.items.len },
-        );
-        return error.XFixturesManifest;
-    }
-    for (embedded_gz) |embedded| {
-        var matches: usize = 0;
-        for (m.files.items) |row| {
-            if (std.mem.eql(u8, embedded.rel_name, row.rel_name)) matches += 1;
+    // Preflight coupling (relaxed from Stage 1's exact one-to-one): every
+    // manifest file row MUST be embedded — `rawContentFor` below hard-fails on
+    // a missing one — while embedded entries the manifest does not reference
+    // are harmless surplus. The embed list is comptime-static but the manifest
+    // is sync-generated data, so tolerating surplus keeps this repo compiling
+    // (and its cells running) across sync generations where some fixtures are
+    // only placeholder .gz files not yet referenced by the local manifest.
+    // Ambiguity is still rejected: duplicate rel_names on either side.
+    for (embedded_gz, 0..) |embedded, i| {
+        for (embedded_gz[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, embedded.rel_name, other.rel_name)) {
+                std.debug.print("[xfixtures] duplicate embedded file `{s}`\n", .{embedded.rel_name});
+                return error.XFixturesManifest;
+            }
         }
-        if (matches != 1) {
-            std.debug.print(
-                "[xfixtures] embedded file `{s}` has {d} matching manifest file rows, want 1\n",
-                .{ embedded.rel_name, matches },
-            );
-            return error.XFixturesManifest;
+    }
+    for (m.files.items, 0..) |row, i| {
+        for (m.files.items[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, row.rel_name, other.rel_name)) {
+                std.debug.print("[xfixtures] duplicate manifest file row relName `{s}`\n", .{row.rel_name});
+                return error.XFixturesManifest;
+            }
         }
     }
 
@@ -396,7 +416,10 @@ fn cellFail(cell: ExpectRow, comptime fmt: []const u8, args: anytype) error{XFix
     return error.XFixturesCell;
 }
 
-fn checkRecid(alloc: Allocator, s: *StoreDirect, cell: ExpectRow, row: RecidRow, recid: u64) !void {
+// `s: anytype` — the identical assertion block runs against *StoreDirect
+// (opener=direct) and *StoreWAL (opener=wal); both expose the same
+// get/verify/getAllRecids/close surface.
+fn checkRecid(alloc: Allocator, s: anytype, cell: ExpectRow, row: RecidRow, recid: u64) !void {
     switch (row.state) {
         .live => {
             const pid = row.pid_base + (recid - row.from);
@@ -427,10 +450,11 @@ fn checkRecid(alloc: Allocator, s: *StoreDirect, cell: ExpectRow, row: RecidRow,
     }
 }
 
-fn runAcceptDirect(alloc: Allocator, cell: ExpectRow, db_path: []const u8, m: *const Manifest) !void {
-    var s = StoreDirect.openFile(alloc, db_path, true) catch |e|
-        return cellFail(cell, "open failed: {s}", .{@errorName(e)});
-    defer s.deinit();
+/// SAME reader assertion block for every accept cell (direct and wal):
+/// verify(), per-recid assertions, EXACT getAllRecids set, close.
+fn assertAcceptedStore(alloc: Allocator, cell: ExpectRow, s: anytype, m: *const Manifest) !void {
+    // Both StoreDirect and StoreWAL expose verify() (StoreWAL delegates to
+    // its replayed inner StoreDirect), so wal cells do NOT skip it.
     s.verify() catch |e| return cellFail(cell, "verify() failed: {s}", .{@errorName(e)});
 
     // per-recid assertions + expected getAllRecids set (live + null rows)
@@ -440,7 +464,7 @@ fn runAcceptDirect(alloc: Allocator, cell: ExpectRow, db_path: []const u8, m: *c
         if (!std.mem.eql(u8, row.fixture, cell.fixture)) continue;
         var recid = row.from;
         while (recid <= row.to) : (recid += 1) {
-            try checkRecid(alloc, &s, cell, row, recid);
+            try checkRecid(alloc, s, cell, row, recid);
             if (row.state == .live or row.state == .null_rec) try want_all.append(alloc, recid);
         }
     }
@@ -452,6 +476,25 @@ fn runAcceptDirect(alloc: Allocator, cell: ExpectRow, db_path: []const u8, m: *c
         return cellFail(cell, "getAllRecids set mismatch: got {d} recids, want {d}", .{ all.len, want_all.items.len });
 
     s.close() catch |e| return cellFail(cell, "close failed: {s}", .{@errorName(e)});
+}
+
+fn runAcceptDirect(alloc: Allocator, cell: ExpectRow, db_path: []const u8, m: *const Manifest) !void {
+    var s = StoreDirect.openFile(alloc, db_path, true) catch |e|
+        return cellFail(cell, "open failed: {s}", .{@errorName(e)});
+    defer s.deinit();
+    try assertAcceptedStore(alloc, cell, &s, m);
+}
+
+/// Stage-2 ("accept","wal") arm: StoreWAL.open takes the literal WAL file
+/// path (openArg), replays the log, then the SAME reader assertion block as
+/// direct-accept cells runs. `checkCellDir` afterwards enforces byte-identity
+/// and "no new files" — in particular a `.ckpt` companion must NOT exist
+/// after a clean close (its appearance is a cell failure, not a sidecar).
+fn runAcceptWal(alloc: Allocator, cell: ExpectRow, wal_path: []const u8, m: *const Manifest) !void {
+    var s = StoreWAL.open(alloc, wal_path, true) catch |e|
+        return cellFail(cell, "open failed: {s}", .{@errorName(e)});
+    defer s.deinit();
+    try assertAcceptedStore(alloc, cell, &s, m);
 }
 
 fn runReject(alloc: Allocator, cell: ExpectRow, path: []const u8) !void {
@@ -475,7 +518,9 @@ fn runReject(alloc: Allocator, cell: ExpectRow, path: []const u8) !void {
 }
 
 /// Post-cell invariants: working copy byte-identical to the pristine raw, and
-/// no files beyond `.lock` sidecars appeared in the cell dir.
+/// no files beyond `.lock` sidecars appeared in the cell dir. `.ckpt` is
+/// deliberately NOT on the allowed list: a clean StoreWAL close must leave no
+/// checkpoint temp behind, so its appearance fails the cell.
 fn checkCellDir(alloc: Allocator, cell_dir: std.fs.Dir, cell: ExpectRow, pristine: []const u8) !void {
     const after = cell_dir.readFileAlloc(alloc, cell.place_as, 256 * 1024 * 1024) catch |e|
         return cellFail(cell, "working copy unreadable after cell: {s}", .{@errorName(e)});
@@ -492,7 +537,7 @@ fn checkCellDir(alloc: Allocator, cell_dir: std.fs.Dir, cell: ExpectRow, pristin
 
 // ------------------------------------------------------------------- tests
 
-test "xfixtures: Stage-1 cross-port conformance (engine=zig)" {
+test "xfixtures: cross-port conformance (engine=zig)" {
     const alloc = testing.allocator;
     var m = try parseManifest(alloc);
     defer m.deinit(alloc);
@@ -528,9 +573,13 @@ test "xfixtures: Stage-1 cross-port conformance (engine=zig)" {
         defer alloc.free(open_path);
 
         if (std.mem.eql(u8, cell.verdict, "accept")) {
-            if (!std.mem.eql(u8, cell.opener, "direct"))
-                return cellFail(cell, "accept opener `{s}` is Stage 2 (unsupported here)", .{cell.opener});
-            try runAcceptDirect(alloc, cell, open_path, &m);
+            if (std.mem.eql(u8, cell.opener, "direct")) {
+                try runAcceptDirect(alloc, cell, open_path, &m);
+            } else if (std.mem.eql(u8, cell.opener, "wal")) {
+                try runAcceptWal(alloc, cell, open_path, &m);
+            } else {
+                return cellFail(cell, "unknown accept opener `{s}`", .{cell.opener});
+            }
         } else if (std.mem.eql(u8, cell.verdict, "reject")) {
             try runReject(alloc, cell, open_path);
         } else {

@@ -16,14 +16,16 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_unit.step);
 
-    // Cross-port conformance fixture generator (Stage 1, D workload).
-    // Dedicated run step — never fires during `zig build test`. The output
-    // directory is passed as RUN ARGS (not a -D build option):
+    // Cross-port conformance fixture generator (Stage 1 D workload + Stage 2
+    // W WAL workloads). Dedicated run step — never fires during
+    // `zig build test`. The output directory is passed as RUN ARGS (not a -D
+    // build option):
     //
     //   zig build fixtures -- --out <dir> [--force] [--commit <hash>]
     //
     // Refuses a nonempty output dir unless --force; writes
-    // `direct-v1-zig.db` + `fragment.tsv`. See src/xfixtures/generator.zig.
+    // `direct-v1-zig.db` + `wal-v1-zig-tail.wal` + `wal-v1-zig-ckpt.wal` +
+    // `fragment.tsv`. See src/xfixtures/generator.zig.
     const fixtures_exe = b.addExecutable(.{
         .name = "xfixtures-gen",
         .root_module = b.createModule(.{
@@ -35,6 +37,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_fixtures = b.addRunArtifact(fixtures_exe);
     if (b.args) |args| run_fixtures.addArgs(args);
-    const fixtures_step = b.step("fixtures", "Write the Stage-1 cross-port conformance fixture (-- --out <dir> [--force])");
+    const fixtures_step = b.step("fixtures", "Write the cross-port conformance fixtures (-- --out <dir> [--force])");
     fixtures_step.dependOn(&run_fixtures.step);
 }

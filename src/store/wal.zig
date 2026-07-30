@@ -145,7 +145,10 @@ fn writeFileHeader(file: std.fs.File) DbError!void {
     file.pwriteAll(&h, 0) catch return error.Io;
 }
 
-/// True when the file carries the v1 magic; rejects unknown future versions.
+/// True when the file carries the v1 magic; rejects unknown future versions
+/// and nonzero v1 header flags (both explicit `DataCorruption`, never a silent
+/// `false` — a current-magic file must not fall through to the framed-MDB
+/// guard or the legacy replay with a misleading error path).
 fn isV1(file: std.fs.File, size: u64) DbError!bool {
     if (size < FILE_HDR) return false;
     var h: [FILE_HDR]u8 = undefined;
@@ -153,6 +156,12 @@ fn isV1(file: std.fs.File, size: u64) DbError!bool {
     if (!std.mem.eql(u8, h[0..8], &MAGIC)) return false;
     const version = getI32Be(&h, 8);
     if (version != FORMAT_VERSION) return error.DataCorruption; // unsupported WAL format version
+    // v1 declares flags == 0 (see the format comment above); an unknown flag
+    // may change the meaning of every byte that follows, so reject it BEFORE
+    // any replay or truncation (strictness parity with Java v3, which rejects
+    // nonzero segment flags).
+    const flags = getI32Be(&h, 12);
+    if (flags != 0) return error.DataCorruption; // nonzero v1 WAL header flags
     return true;
 }
 

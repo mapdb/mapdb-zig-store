@@ -494,6 +494,39 @@ test "WAL: unsupported version is rejected" {
     try testing.expectError(error.DataCorruption, StoreWAL.open(a, p, true));
 }
 
+test "WAL: nonzero v1 header flags are rejected without rewrite" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const p = try tmpPath(a, &tmp, "badflags.wal");
+    defer a.free(p);
+
+    {
+        var s = try StoreWAL.open(a, p, true);
+        defer s.deinit();
+        _ = try s.put(i64, a, @as(i64, 1), L);
+        try s.commit();
+        try s.close();
+    }
+    // set the low byte of the flags word (offset 12..16, big-endian) to 1.
+    {
+        const f = try std.fs.cwd().openFile(p, .{ .mode = .write_only });
+        defer f.close();
+        try f.pwriteAll(&[_]u8{1}, 15);
+        try f.sync();
+    }
+    const before = try std.fs.cwd().readFileAlloc(a, p, 1024);
+    defer a.free(before);
+
+    // magic + version == 1 + flags != 0 must be an EXPLICIT DataCorruption
+    // (not a silent "not v1" that would fall through to the framed-MDB guard),
+    // and the failed open must leave the file bytes unchanged.
+    try testing.expectError(error.DataCorruption, StoreWAL.open(a, p, true));
+    const after = try std.fs.cwd().readFileAlloc(a, p, 1024);
+    defer a.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoint: compacts the log to one snapshot section, preserving state.
 // ---------------------------------------------------------------------------
