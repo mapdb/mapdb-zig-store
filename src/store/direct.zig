@@ -1,7 +1,7 @@
 //! `StoreDirect` — durable direct store: recid index, free lists, allocator
 //! metadata and record data all live on the volume (Java `StoreDirect`,
 //! §5). Ported faithfully from `mapdb-rust-store/src/store/direct.rs`; on-volume
-//! format v1, magic "MDB5.SD1". The layout was ported from the Rust port's and
+//! format v1, magic "MDBS.SD1". The layout was ported from the Rust port's and
 //! is not a stabilised cross-engine contract — see `README.md`.
 //!
 //! v1 read path is the LOCKED baseline (accepted deviation D9.5): reads take the
@@ -48,8 +48,8 @@ const Volume = volume.Volume;
 // ---------- on-volume geometry ----------
 
 const PAGE_SIZE: u64 = volume.SLICE_SIZE;
-/// "MDB5.SD1" big-endian.
-const MAGIC: u64 = 0x4D44_4235_2E53_4431;
+/// "MDBS.SD1" big-endian.
+const MAGIC: u64 = 0x4D44_4253_2E53_4431;
 
 const O_FEATURES: u64 = 8;
 const O_HEAD_CHECKSUM: u64 = 16;

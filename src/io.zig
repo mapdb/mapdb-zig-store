@@ -380,10 +380,10 @@ test "unpackLongSkip matches decode" {
 }
 
 test "matchBytes always advances" {
-    var inp = DataInput2.init("MDB5.SD1extra");
-    try testing.expect(try inp.matchBytes("MDB5.SD1"));
+    var inp = DataInput2.init("MDBS.SD1extra");
+    try testing.expect(try inp.matchBytes("MDBS.SD1"));
     try testing.expectEqual(@as(usize, 8), inp.pos);
-    var inp2 = DataInput2.init("MDB5.SD1extra");
+    var inp2 = DataInput2.init("MDBS.SD1extra");
     try testing.expect(!try inp2.matchBytes("XXXX.SD1"));
     try testing.expectEqual(@as(usize, 8), inp2.pos);
 }

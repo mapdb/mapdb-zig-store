@@ -97,6 +97,84 @@ fn getLong(s: *StoreWAL, alloc: Allocator, recid: u64) !?i64 {
     return s.get(i64, alloc, recid, L);
 }
 
+test "WAL: old framed magic is rejected without rewrite" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const p = try tmpPath(a, &tmp, "old-magic.wal");
+    defer a.free(p);
+    {
+        var s = try StoreWAL.open(a, p, true);
+        defer s.deinit();
+        try s.close();
+    }
+    {
+        const f = try std.fs.cwd().openFile(p, .{ .mode = .write_only });
+        defer f.close();
+        try f.pwriteAll("MDB5.WAL", 0);
+    }
+    const before = try std.fs.cwd().readFileAlloc(a, p, 1024);
+    defer a.free(before);
+
+    try testing.expectError(error.DataCorruption, StoreWAL.open(a, p, true));
+    const after = try std.fs.cwd().readFileAlloc(a, p, 1024);
+    defer a.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+}
+
+test "WAL: valid legacy headerless WAL is migrated" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const p = try tmpPath(a, &tmp, "legacy.wal");
+    defer a.free(p);
+
+    // PREALLOC recid 1, followed by the legacy COMMIT seal and the CRC32 of
+    // the operation bytes. A real legacy stream therefore begins with opcode
+    // 1, not an ASCII magic byte.
+    var legacy = [_]u8{ 1, 0x81, 8, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, legacy[3..7], std.hash.crc.Crc32.hash(legacy[0..2]), .big);
+    {
+        const f = try std.fs.cwd().createFile(p, .{});
+        defer f.close();
+        try f.writeAll(&legacy);
+    }
+
+    var s = try StoreWAL.open(a, p, true);
+    defer s.deinit();
+    try s.verify();
+    try s.close();
+    const migrated = try std.fs.cwd().readFileAlloc(a, p, 1024);
+    defer a.free(migrated);
+    try testing.expectEqualSlices(u8, "MDBS.WAL", migrated[0..8]);
+}
+
+test "WAL: one and two byte legacy tails are safe" {
+    const a = testing.allocator;
+    const tails = [_][]const u8{ &[_]u8{1}, &[_]u8{ 1, 0x81 } };
+    const names = [_][]const u8{ "one-byte.wal", "two-byte.wal" };
+
+    inline for (tails, names) |tail, name| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const p = try tmpPath(a, &tmp, name);
+        defer a.free(p);
+        {
+            const f = try std.fs.cwd().createFile(p, .{});
+            defer f.close();
+            try f.writeAll(tail);
+        }
+
+        var s = try StoreWAL.open(a, p, true);
+        defer s.deinit();
+        try s.verify();
+        try s.close();
+        const migrated = try std.fs.cwd().readFileAlloc(a, p, 1024);
+        defer a.free(migrated);
+        try testing.expectEqualSlices(u8, "MDBS.WAL", migrated[0..8]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Durability: only committed state survives a reopen.
 // ---------------------------------------------------------------------------

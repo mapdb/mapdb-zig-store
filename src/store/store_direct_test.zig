@@ -240,6 +240,26 @@ test "file reopen clean roundtrip" {
     }
 }
 
+test "old file magic is rejected" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(a, &tmp, "old-magic.sd1");
+    defer a.free(path);
+    {
+        var s = try StoreDirect.openFile(a, path, true);
+        defer s.deinit();
+        try s.close();
+    }
+    {
+        const f = try std.fs.cwd().openFile(path, .{ .mode = .write_only });
+        defer f.close();
+        try f.pwriteAll("MDB5.SD1", 0);
+    }
+
+    try testing.expectError(error.DataCorruption, StoreDirect.openFile(a, path, true));
+}
+
 test "file reopen after uncommitted change refuses (crash sim)" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});

@@ -15,7 +15,7 @@
 //! and no cross-engine compatibility is claimed.
 //! ```text
 //! file       := fileHeader section*
-//! fileHeader := magic "MDB5.WAL" (8) | version i32=1 | flags i32=0        (16 B)
+//! fileHeader := magic "MDBS.WAL" (8) | version i32=1 | flags i32=0        (16 B)
 //! section    := tag u8 ('S' commit, 'C' checkpoint)
 //!             | lsn i64 (strictly increasing)
 //!             | bodyLen i64
@@ -61,7 +61,7 @@ const T_DELETE: u8 = 4;
 /// Legacy (headerless format) trailing seal tag; v1 sections are length-prefixed.
 const T_COMMIT: u8 = 8;
 
-const MAGIC: [8]u8 = "MDB5.WAL".*;
+const MAGIC: [8]u8 = "MDBS.WAL".*;
 const FORMAT_VERSION: i32 = 1;
 /// File header: magic(8) + version(4) + flags(4).
 const FILE_HDR: u64 = 16;
@@ -154,6 +154,18 @@ fn isV1(file: std.fs.File, size: u64) DbError!bool {
     const version = getI32Be(&h, 8);
     if (version != FORMAT_VERSION) return error.DataCorruption; // unsupported WAL format version
     return true;
+}
+
+/// A framed MapDB-family header must never be reinterpreted as the legacy
+/// headerless WAL. In particular, this makes a hard magic swap reject old v1
+/// files instead of treating their first byte as a torn legacy instruction and
+/// destructively migrating an empty prefix.
+fn hasFramedMagicPrefix(file: std.fs.File, size: u64) DbError!bool {
+    if (size < 3) return false;
+    var prefix: [3]u8 = undefined;
+    const n = file.preadAll(&prefix, 0) catch return error.Io;
+    if (n < prefix.len) return error.Io;
+    return std.mem.eql(u8, &prefix, "MDB");
 }
 
 /// fsync the directory so a create/rename of `path` is itself durable. On the
@@ -570,6 +582,8 @@ const WalState = struct {
             break :blk FILE_HDR;
         } else if (try isV1(self.file, size)) blk: {
             break :blk try self.replayV1(size);
+        } else if (try hasFramedMagicPrefix(self.file, size)) {
+            return error.DataCorruption;
         } else blk: {
             legacy = true;
             break :blk try self.replayLegacy(size);

@@ -70,8 +70,8 @@ runs identically over each. They differ in durability and cost:
 |-------|---------|:-------:|:--------------:|:-------------:|----------|
 | `StoreOnHeap` | live objects, never serialized | no | no | no | fastest in-memory maps; tests |
 | `StoreByteArray` | one `[]u8` per record | no | yes | no | the reference oracle; in-memory with byte semantics |
-| `StoreDirect` | single mmap file (`MDB5.SD1`) | yes (on `commit`) | yes | no | durable maps without transactions |
-| `StoreWAL` | `StoreDirect` (heap volume) + write-ahead log (`MDB5.WAL`) | yes (on `commit`) | yes | yes | durable maps with atomic commit/rollback and crash recovery |
+| `StoreDirect` | single mmap file (`MDBS.SD1`) | yes (on `commit`) | yes | no | durable maps without transactions |
+| `StoreWAL` | `StoreDirect` (heap volume) + write-ahead log (`MDBS.WAL`) | yes (on `commit`) | yes | yes | durable maps with atomic commit/rollback and crash recovery |
 
 - **`StoreOnHeap`** keeps records as boxed live objects and dispatches
   `onObject` push-down reads; it requires a **stateless** (zero-sized)

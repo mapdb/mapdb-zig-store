@@ -37,8 +37,8 @@ Built:
 | `io` | `DataInput2`/`DataOutput2`, packed varints, errors |
 | `ser` | serializers and all group formats (scalar, delta, prefix, tuple, columnar), UTF-16-order compare |
 | store core | `Store` interface, `StoreOnHeap`, `StoreByteArray`, segment locks, lease table, the `Shared(T)` pin kernel |
-| `StoreDirect` | durable single-file store (`MDB5.SD1`), volume, two-phase sync, `verify`, `compact` |
-| `StoreWAL` | transactional store (`MDB5.WAL`), streaming replay, checkpoint, rollback |
+| `StoreDirect` | durable single-file store (`MDBS.SD1`), volume, two-phase sync, `verify`, `compact` |
+| `StoreWAL` | transactional store (`MDBS.WAL`), streaming replay, checkpoint, rollback |
 | `BTreeMap` | B-link tree, push-down readers with Lehman-Yao writers, `RangeView`, `TreePump`, columnar scan |
 
 **Not built:** `StoreAppendOnly`, `BufferedPageFormat` + `BufferTreeMap`, the

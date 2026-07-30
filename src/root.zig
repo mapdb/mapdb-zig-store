@@ -38,9 +38,9 @@ pub const Shared = shared.Shared;
 pub const StoreOnHeap = store.StoreOnHeap;
 /// In-memory byte store — the reference oracle for the byte-format stores.
 pub const StoreByteArray = store.StoreByteArray;
-/// Durable single-file store (mmap volume, format `MDB5.SD1`).
+/// Durable single-file store (mmap volume, format `MDBS.SD1`).
 pub const StoreDirect = store.StoreDirect;
-/// Transactional store: StoreDirect + write-ahead log (`MDB5.WAL`).
+/// Transactional store: StoreDirect + write-ahead log (`MDBS.WAL`).
 pub const StoreWAL = store.StoreWAL;
 pub const Volume = store.Volume;
 pub const RecordRead = store.RecordRead;

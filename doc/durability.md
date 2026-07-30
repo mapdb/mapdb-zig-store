@@ -8,7 +8,7 @@ authority. **The format is not stabilised and no cross-implementation
 compatibility is claimed** — this port was written against the Java reference
 implementation at
 <https://github.com/mapdb/mapdb-java-store>, whose `StoreDirect` and `StoreWAL`
-sources define the layouts (`MDB5.SD1`, `MDB5.WAL`, index-slot bit packing,
+sources define the layouts (`MDBS.SD1`, `MDBS.WAL`, index-slot bit packing,
 long-stack free lists, linked-record chunking, header checksum). Read those if
 you need the bytes; where this port and they disagree, they are right.
 
@@ -20,7 +20,7 @@ everything here concerns `StoreDirect` and `StoreWAL`.
 
 ## `StoreDirect` — durable, non-transactional
 
-Backed by a single mmap file, magic `MDB5.SD1`. Records, the recid index, free
+Backed by a single mmap file, magic `MDBS.SD1`. Records, the recid index, free
 lists and allocator metadata all live on the volume.
 
 **Commit is the durability point.** `commit()` uses a strict **two-phase sync**
@@ -55,7 +55,7 @@ flag rather than leaving torn geometry.
 ## `StoreWAL` — transactional, crash-recoverable
 
 A `StoreDirect` (on a heap volume) fronted by a write-ahead log file, magic
-`MDB5.WAL`. Mutations are **staged** in memory and appended to the log; reads
+`MDBS.WAL`. Mutations are **staged** in memory and appended to the log; reads
 merge staged-over-inner. There is one global writer.
 
 **Commit protocol** (the fsync is the durability point):
