@@ -1,0 +1,55 @@
+# Always-on gate: runs on every push and pull request.
+#
+# The Zig version is pinned to `minimum_zig_version` in build.zig.zon. Zig is
+# pre-1.0 and its standard library still moves between releases, so a floating
+# toolchain would make an unrelated upstream change indistinguishable from a
+# regression here. Bump both together, deliberately.
+name: ci
+on: [push, pull_request]
+
+env:
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig fmt --check src build.zig
+      - run: zig build
+      - run: zig build test
+
+  # Release modes exercise different code: safety checks are removed in
+  # ReleaseFast, and the store's internal invariants are expressed as
+  # assertions. Both must build and pass.
+  release-modes:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [ReleaseSafe, ReleaseFast]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build -Doptimize=${{ matrix.mode }}
+      - run: zig build test -Doptimize=${{ matrix.mode }}
+
+  # `.paths` in build.zig.zon is an allowlist: anything not named there is
+  # absent from the package a dependent fetches. Guard the files a consumer is
+  # entitled to.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: required files are listed in .paths
+        run: |
+          set -euo pipefail
+          for f in README.md NOTICE.md LICENSE-EPL-1.0.txt LICENSE-EDL-1.0.txt; do
+            grep -q "\"$f\"" build.zig.zon || { echo "not in build.zig.zon .paths: $f"; exit 1; }
+            test -f "$f" || { echo "listed in .paths but missing on disk: $f"; exit 1; }
+          done

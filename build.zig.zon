@@ -1,0 +1,17 @@
+.{
+    .name = .mapdb_zig_store,
+    .version = "0.1.0",
+    .fingerprint = 0x89a31660c5225b67,
+    .minimum_zig_version = "0.15.2",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "doc",
+        "README.md",
+        "LICENSE-EPL-1.0.txt",
+        "LICENSE-EDL-1.0.txt",
+        "NOTICE.md",
+    },
+    .dependencies = .{},
+}
