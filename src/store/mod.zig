@@ -53,6 +53,11 @@ pub const index_val = @import("index_val.zig");
 pub const volume = @import("volume.zig");
 pub const direct = @import("direct.zig");
 pub const wal = @import("wal.zig");
+/// WAL format v3 (slice B0+): the durability-event seam and the segment-set
+/// namespace layer. Not reachable from any public open until the B2 cutover.
+pub const wal_io = @import("wal_io.zig");
+pub const wal_segments = @import("wal_segments.zig");
+pub const wal_segments_test = @import("wal_segments_test.zig");
 pub const tck = @import("tck.zig");
 pub const read_only = @import("read_only.zig");
 pub const store_direct_test = @import("store_direct_test.zig");

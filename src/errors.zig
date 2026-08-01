@@ -24,6 +24,13 @@ pub const DbError = error{
     NotSorted,
     /// A conflicting handle already holds the open lease.
     AlreadyOpen,
+    /// The WAL store lock is held by another process, or by another open in
+    /// THIS process. Distinct from `AlreadyOpen`, which is the in-handle lease:
+    /// this one is the cross-process store lock of WAL format v3 (`<base>.lock`,
+    /// an OFD record lock plus a process-local claim). Java throws
+    /// `DBException` for both; the ports separate them because only this one
+    /// says "another owner has the store", which a caller may reasonably retry.
+    Locked,
     /// `Db.close()` while a facade-created handle (map/set/atomic/queue) is still
     /// open (Zig teardown-order enforcement).
     HandlesOpen,
