@@ -141,6 +141,11 @@ pub const Segment = struct {
     /// A corruption verdict found in this segment, HELD until R4 decides it is
     /// relevant. A static reason string; `null` means no verdict.
     held: ?[]const u8 = null,
+    /// The offset the held verdict is about. Rust interpolates it into a formatted
+    /// message; this port keeps reasons static and allocation-free (see the
+    /// diagnostics note in `wal_recover.zig`), so the location travels beside the
+    /// reason instead of inside it. Meaningless while `held` is `null`.
+    held_at: u64 = 0,
 
     fn init(seq: i64, path: []u8, read_only: bool, header: [@as(usize, SEG_HDR)]u8, file_len: u64) Segment {
         return .{

@@ -895,6 +895,55 @@ pub const StoreDirect = struct {
         }
     }
 
+    /// `delete` for WAL replay: tolerant of a target that is already void or
+    /// already deleted, where the public `delete` answers `GetVoid`.
+    ///
+    /// That tolerance is not laxity, it is the shape a legitimate log takes. A
+    /// `T_DELETE` whose record was never established is exactly what a
+    /// skipped-append history leaves behind, and the retained log may also begin
+    /// after the entry that created the record — the cleaner is allowed to retire
+    /// the segments below a mark, so replay routinely sees a delete for a recid it
+    /// never saw born. Refusing there would turn an ordinary cleaned log into a
+    /// corruption verdict.
+    ///
+    /// Unlike `delete`, it takes no `assertNotInAction`/`checkClosed`: recovery
+    /// runs before the store is open to anyone.
+    pub fn walDelete(self: *Self, recid: u64) DbError!void {
+        var c = try self.mutateEnter();
+        defer c.unlock();
+        var wg: SegWriteGuard = undefined;
+        self.segs.write(recid, &wg);
+        defer wg.unlock();
+        const ivval = try self.rawIndexGet(recid);
+        if (ivval == 0) return;
+        if (!ivParityOk(ivval)) return error.DataCorruption; // index slot parity broken
+        if (!ivSemanticOk(ivval)) return error.DataCorruption; // capUnits/flags out of domain
+        if (iv.capUnits(ivval) == iv.CAP_DELETED) return;
+        try self.releaseOldData(ivval);
+        {
+            self.structural_lock.lock();
+            defer self.structural_lock.unlock();
+            try self.freeRecidLocked(recid);
+        }
+        try self.indexSet(recid, iv.compose(iv.CAP_DELETED, 0, 0));
+    }
+
+    /// Fault injection: breaks the index slot's parity so the next read of it
+    /// answers `DataCorruption`.
+    ///
+    /// The store guards every persisted index value with a parity bit precisely so
+    /// a damaged slot cannot be acted on, and that guard is otherwise unreachable
+    /// from a test — nothing this store WRITES is ever parity-broken. WAL replay
+    /// needs it: an inner-store verdict raised mid-replay has to reach the caller
+    /// carrying a reason, and no hand-built WAL image can produce one, so the fault
+    /// is injected here instead of asserted to be impossible.
+    pub fn corruptIndexSlotForTest(self: *Self, recid: u64) DbError!void {
+        const off = (try self.recidToOffset(recid)) orelse return error.DataCorruption;
+        // Any single flipped bit inverts the population count, which is the whole
+        // parity predicate — so this needs no knowledge of which bit carries it.
+        try self.vol.putU64(off, (try self.vol.getU64(off)) ^ 1);
+    }
+
     pub fn recState(self: *Self, recid: u64) DbError!i32 {
         var c = try self.mutateEnter();
         defer c.unlock();
