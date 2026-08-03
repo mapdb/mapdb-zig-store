@@ -2645,13 +2645,13 @@ test "wal3 B1: a read past the section's soft limit is corruption, not a torn ta
 /// path that cannot fail in production. Refusing them unconditionally instead
 /// routes every growth through `alloc`, which is the only call that can fail, and
 /// keeps the counting run's indices identical to the injected runs'.
-const FailingAllocator = struct {
+pub const FailingAllocator = struct {
     inner: Allocator,
     /// Index of the allocation that fails, or `null` to fail none (counting run).
     fail_at: ?usize,
     calls: usize = 0,
 
-    fn allocator(self: *FailingAllocator) Allocator {
+    pub fn allocator(self: *FailingAllocator) Allocator {
         return .{ .ptr = self, .vtable = &.{
             .alloc = allocFn,
             .resize = resizeFn,

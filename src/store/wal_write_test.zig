@@ -31,6 +31,10 @@ const DataOutput2 = io_mod.DataOutput2;
 const ww = @import("wal_write.zig");
 const appendSection = ww.appendSection;
 const BodySink = ww.BodySink;
+/// B1's one-shot, alloc-only failing allocator — shared rather than re-derived,
+/// so this suite inherits its rule that refusing a growing resize/remap is not
+/// an allocation failure.
+const FailingAllocator = @import("wal_recover_test.zig").FailingAllocator;
 
 const BUF: usize = 1 << 20;
 /// A segment that can hold a header and one section header, and nothing more —
@@ -120,19 +124,49 @@ fn emitFixed(ctx: *const Fixed, sink: *BodySink) DbError!void {
     return ctx.emit(sink);
 }
 
-/// An emitter that writes DIFFERENT bytes on its second pass — the shape the
-/// two-pass divergence check exists for.
+/// An emitter that writes MORE bytes on its second pass — four then five, the
+/// genuine length divergence (rust's test emits an extra fifth byte the same
+/// way). Both halves of the check can see this one; the half that ONLY the
+/// length comparison can see is `ResidueDrift` below.
 const Drifting = struct {
     calls: usize = 0,
 
     fn emit(self: *Drifting, sink: *BodySink) DbError!void {
         self.calls += 1;
         if (self.calls == 1) return sink.write("aaaa");
-        return sink.write("bbbb");
+        return sink.write("aaaab");
     }
 };
 
 fn emitDrifting(ctx: *Drifting, sink: *BodySink) DbError!void {
+    return ctx.emit(sink);
+}
+
+/// An emitter whose passes differ in LENGTH but agree in CRC, so only the length
+/// operand of the divergence check can refuse it. Each pass ends by emitting the
+/// little-endian FINALIZED running CRC: for this CRC (reflected, init and xorout
+/// both all-ones) that drives any stream's final value to the fixed residue
+/// constant, whatever came before — so both passes finalize identically while
+/// one is two bytes longer. The finals are recorded so the test can prove the
+/// collision happened rather than assume it.
+const ResidueDrift = struct {
+    calls: usize = 0,
+    finals: [2]u32 = .{ 0, 1 },
+
+    fn emit(self: *ResidueDrift, sink: *BodySink) DbError!void {
+        self.calls += 1;
+        const body: []const u8 = if (self.calls == 1) "aaaa" else "aaaabb";
+        try sink.write(body);
+        var c = sink.crc;
+        var le: [4]u8 = undefined;
+        std.mem.writeInt(u32, &le, c.final(), .little);
+        try sink.write(&le);
+        var f = sink.crc;
+        if (self.calls <= 2) self.finals[self.calls - 1] = f.final();
+    }
+};
+
+fn emitResidue(ctx: *ResidueDrift, sink: *BodySink) DbError!void {
     return ctx.emit(sink);
 }
 
@@ -254,7 +288,7 @@ test "wal3 B2: a body far larger than the sink buffer round-trips" {
     try testing.expectEqual(@as(i64, 3), back.next_lsn);
 }
 
-test "wal3 B2: both passes run, and the second reproduces the first" {
+test "wal3 B2: the emitter runs exactly twice — measure, then write" {
     const a = testing.allocator;
     var sc = try Scratch.init(a, "twopass");
     defer sc.deinit();
@@ -335,6 +369,30 @@ test "wal3 B2: an oversize section gets a segment to itself rather than being sp
     const back = try recoverBack(a, &sc);
     try testing.expectEqual(@as(i64, 4), back.next_lsn);
     try testing.expectEqual(@as(usize, 3), back.seqs);
+}
+
+test "wal3 B2: a segment landing exactly ON the limit rolls at the next append" {
+    const a = testing.allocator;
+    var sc = try Scratch.init(a, "exact");
+    defer sc.deinit();
+    var f = try Fixture.init(a, &sc, null);
+    defer f.deinit();
+    const b = try deleteBody(a, 10);
+    defer a.free(b);
+    // The limit is chosen so the first append ends EXACTLY at it. W3's condition
+    // is `>=`, as Java's: a segment that has REACHED the limit rolls, not only
+    // one past it — `>` would keep appending into a segment sitting exactly at
+    // its configured size forever.
+    const limit = SEG_HDR + SEC_HDR + @as(u64, b.len);
+    try f.append(limit, 1, b, 0);
+    try testing.expectEqual(limit, f.set.active().?.file_len);
+    const seqs1 = try f.seqs(a);
+    defer a.free(seqs1);
+    try testing.expectEqualSlices(i64, &.{1}, seqs1);
+    try f.append(limit, 2, b, 0);
+    const seqs2 = try f.seqs(a);
+    defer a.free(seqs2);
+    try testing.expectEqualSlices(i64, &.{ 1, 2 }, seqs2);
 }
 
 test "wal3 B2: the rolled-to segment states the LSN of the section that rolled it" {
@@ -436,6 +494,28 @@ test "wal3 B2: an emitter whose passes disagree in length is refused before the 
     try testing.expectEqual(@as(usize, 0), rec.count(.force_data));
 }
 
+test "wal3 B2: a length divergence the CRC cannot see is still refused" {
+    const a = testing.allocator;
+    var sc = try Scratch.init(a, "drift_residue");
+    defer sc.deinit();
+    var rec = RecordingIo.init(a);
+    defer rec.deinit();
+    const seam = rec.io();
+    var f = try Fixture.init(a, &sc, &seam);
+    defer f.deinit();
+    var d = ResidueDrift{};
+    try testing.expectError(
+        DbError.DataCorruption,
+        appendSection(&f.set, 1 << 20, f.set.io, TAG_SECTION, 1, a, &d, emitResidue),
+    );
+    // The collision really happened — both passes finalized to the same CRC — so
+    // the refusal above can only have come from the LENGTH half of the check.
+    // This is the test that pins that operand; the CONTENT test below pins the
+    // CRC half, and neither can stand in for the other.
+    try testing.expectEqual(d.finals[0], d.finals[1]);
+    try testing.expectEqual(@as(usize, 0), rec.count(.force_data));
+}
+
 test "wal3 B2: an emitter whose passes disagree only in CONTENT is refused too" {
     const a = testing.allocator;
     var sc = try Scratch.init(a, "drift_crc");
@@ -475,13 +555,20 @@ test "wal3 B2: file_len and valid_end move only after the force" {
     try testing.expectEqual(SEG_HDR, f.set.active().?.file_len);
     try testing.expectEqual(SEG_HDR, f.set.active().?.valid_end);
 
-    rec.fail_at = null;
-    try f.append(1 << 20, 1, "abc", 0);
+    // The success half runs in a FRESH namespace, deliberately not as a retry of
+    // the failed one: appending again after a failed force is exactly the
+    // operation W9 forbids (the caller closes the store instead), and a test
+    // that retried would normalize it.
+    var sc2 = try Scratch.init(a, "accounting_ok");
+    defer sc2.deinit();
+    var f2 = try Fixture.init(a, &sc2, null);
+    defer f2.deinit();
+    try f2.append(1 << 20, 1, "abc", 0);
     const end = SEG_HDR + SEC_HDR + 3;
-    try testing.expectEqual(end, f.set.active().?.file_len);
-    try testing.expectEqual(end, f.set.active().?.valid_end);
-    try testing.expectEqual(end, f.set.logBytes());
-    try testing.expectEqual(f.set.logBytesExact(), f.set.logBytes());
+    try testing.expectEqual(end, f2.set.active().?.file_len);
+    try testing.expectEqual(end, f2.set.active().?.valid_end);
+    try testing.expectEqual(end, f2.set.logBytes());
+    try testing.expectEqual(f2.set.logBytesExact(), f2.set.logBytes());
 }
 
 test "wal3 B2: a failure at any reported step propagates rather than acknowledging" {
@@ -529,6 +616,46 @@ test "wal3 B2: a rollover that cannot seal fails rather than creating a successo
     defer a.free(seqs);
     try testing.expectEqualSlices(i64, &.{1}, seqs);
     try testing.expectEqual(creates_before, rec.count(.create));
+}
+
+test "wal3 B2: allocation failure after the header is on disk is OutOfMemory, not corruption" {
+    const a = testing.allocator;
+    var sc = try Scratch.init(a, "oom");
+    defer sc.deinit();
+    var rec = RecordingIo.init(a);
+    defer rec.deinit();
+    const seam = rec.io();
+    {
+        var f = try Fixture.init(a, &sc, &seam);
+        defer f.deinit();
+        // The sink buffer is allocated AFTER the section header is written (pass 1
+        // allocates nothing at all), so its failure is the zig-only crash shape
+        // rust cannot produce: durable bytes exist that the acknowledgement path
+        // never reached. Risk 14 classifies it: operational, never corruption.
+        var fa = FailingAllocator{ .inner = a, .fail_at = 0 };
+        var calls: usize = 0;
+        const ctx = Fixed{ .body = "abc", .calls = &calls };
+        try testing.expectError(
+            DbError.OutOfMemory,
+            appendSection(&f.set, 1 << 20, f.set.io, TAG_SECTION, 1, fa.allocator(), &ctx, emitFixed),
+        );
+        // Exactly the buffer allocation was attempted, EXACTLY `OutOfMemory` came
+        // back — not `DataCorruption`, not a torn-tail verdict — and nothing
+        // forced or advanced: the failure is refused where it happened.
+        try testing.expectEqual(@as(usize, 1), fa.calls);
+        try testing.expectEqual(@as(usize, 1), rec.count(.sec_header));
+        try testing.expectEqual(@as(usize, 0), rec.count(.force_data));
+        try testing.expectEqual(SEG_HDR, f.set.active().?.file_len);
+        try testing.expectEqual(SEG_HDR, f.set.active().?.valid_end);
+    }
+    // The device may hold the orphaned section header. That is a TORN TAIL — the
+    // crash shape recovery already classifies (S3/S4) — so a reopen succeeds and
+    // truncates it away rather than refusing the image. TWO segments after: W7
+    // rotates on an actual truncation (truncate, force, create a fresh active),
+    // so later appends never reuse the truncated segment's checksum domain.
+    const back = try recoverBack(a, &sc);
+    try testing.expectEqual(@as(i64, 1), back.next_lsn);
+    try testing.expectEqual(@as(usize, 2), back.seqs);
 }
 
 // ---------------------------------------------------------------- no segment

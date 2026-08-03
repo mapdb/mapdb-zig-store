@@ -25,8 +25,10 @@
 //!
 //! The body is emitted TWICE — a measure pass (length + CRC, no I/O) and a write
 //! pass — instead of being accumulated into a list. That is what lets one commit
-//! exceed 2 GiB: `bodyLen` is an `i64` in the format and this writer actually uses
-//! the range. The header is still written FIRST and final, so the crash shapes are
+//! exceed 2 GiB: `bodyLen` is an `i64` in the format, and nothing here buffers or
+//! narrows the body — though the >2 GiB proof itself is a stress-tier test, as it
+//! is in Java, not anything the unit suite runs.
+//! The header is still written FIRST and final, so the crash shapes are
 //! the ones recovery classifies (a tear mid-body leaves a valid header over a
 //! short or CRC-bad body — S3/S4/S5), and the pass-divergence check runs BEFORE
 //! the force, so a nondeterministic emitter fails the commit closed rather than
@@ -38,8 +40,10 @@
 //! leaves through a PANIC after I/O began — its stand-in for Java's `Error` arm,
 //! which cannot be turned into a return value without `catch_unwind`. Zig has no
 //! unwinding, so there is no such path: every failure here is an error return, and
-//! the caller fails the store closed on all of them. The obligation is identical;
-//! only the mechanism rust needed is absent.
+//! the obligation those returns carry is that the caller fail the store closed on
+//! all of them. Until B2 part 2 writes that caller (`commitLocked`), the
+//! obligation is stated here, not yet discharged anywhere — part 2 must implement
+//! and mutation-test it. Only the mechanism rust needed is absent.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -117,14 +121,36 @@ pub const BodySink = struct {
     }
 };
 
+// -------------------------------------------------------------- the two forces
+
+/// The data-only force (W1/W4) as ONE operation: no caller can report the event
+/// without performing the sync, or reorder one around the other. That the sync
+/// really is `fdatasync` — not a no-op, not the wrong flavour — is pinned by the
+/// gate's strace probe (`wal_sync_probe.zig`), which counts the actual syscalls;
+/// the seam trace alone is declared intent, not evidence.
+fn forceData(io: ?*const WalIo, file: std.fs.File, seq: i64, end: u64, tag: u8) DbError!void {
+    try walIoEvent(io, WalOpKind.force_data, seq, end, 0, tag);
+    std.posix.fdatasync(file.handle) catch return error.Io;
+}
+
+/// The sealing force (W3) — force(true), never a data-only sync: the sealed
+/// segment's SIZE is the payload (D5). One operation, like [forceData], and
+/// pinned by the same probe.
+fn forceFull(io: ?*const WalIo, file: std.fs.File, seq: i64, len: u64) DbError!void {
+    try walIoEvent(io, WalOpKind.force_full, seq, len, 0, 0);
+    std.posix.fsync(file.handle) catch return error.Io;
+}
+
 // ------------------------------------------------------------ append a section
 
 /// Appends one complete section to the active segment and forces it, rolling over
 /// first when the segment is full.
 ///
-/// `emit` runs TWICE and **must produce identical bytes both times**; if it does
-/// not, this refuses to acknowledge the section (before the force) rather than
-/// leave a stored `bodyCrc` that replay reads as bit rot.
+/// `emit` runs TWICE and **must produce the same length and CRC both times** —
+/// the check is length plus CRC, exactly Java's, so a CRC-colliding divergence is
+/// accepted identically to the reference. A divergence either half can see
+/// refuses to acknowledge the section (before the force) rather than leave a
+/// stored `bodyCrc` that replay reads as bit rot.
 ///
 /// Every error return is a W9 failure: the caller closes the store. On success the
 /// active segment's `file_len` and `valid_end` have moved to the section's end,
@@ -151,15 +177,11 @@ pub fn appendSection(
         {
             const a = set.active().?;
             try a.ensureOpen();
-            const seq = a.seq;
-            const len = a.file_len;
-            try walIoEvent(io, WalOpKind.force_full, seq, len, 0, 0);
-            // force(true), never a data-only sync: this seals the segment and its
-            // SIZE is the payload. D5 — the distinction is spec, and W3's whole
-            // load collapses if a port's data sync loses a sealed segment's tail
-            // extent, because recovery would then see a torn NON-FINAL segment and
-            // refuse a legitimate image.
-            std.posix.fsync(a.handle().?.handle) catch return error.Io;
+            // The seal takes the FULL force: W3's whole load collapses if a
+            // port's data sync loses a sealed segment's tail extent, because
+            // recovery would then see a torn NON-FINAL segment and refuse a
+            // legitimate image.
+            try forceFull(io, a.handle().?, a.seq, a.file_len);
             // The sealed segment will never be read or written again by this store
             // (nothing reads a segment after recovery). Releasing here is the same
             // recorded divergence as W7's: the reference keeps the stale handle,
@@ -214,8 +236,7 @@ pub fn appendSection(
     // creating a segment (W2), sealing one at rollover (W3), the post-truncate
     // force (W7) — a full sync is used instead, and the distinction is spec.
     const end = body_start + body_len;
-    try walIoEvent(io, WalOpKind.force_data, seq, end, 0, tag);
-    std.posix.fdatasync(file.handle) catch return error.Io;
+    try forceData(io, file, seq, end, tag);
 
     active.file_len = end;
     active.valid_end = end;

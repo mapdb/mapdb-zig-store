@@ -39,4 +39,19 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_fixtures.addArgs(args);
     const fixtures_step = b.step("fixtures", "Write the cross-port conformance fixtures (-- --out <dir> [--force])");
     fixtures_step.dependOn(&run_fixtures.step);
+
+    // The WAL sync probe: a fixed writer scenario the gate runs under strace to
+    // count the REAL fsync/fdatasync calls (see src/store/wal_sync_probe.zig).
+    // Built and installed by its own step; never fires during `zig build test`.
+    const probe_exe = b.addExecutable(.{
+        .name = "wal-sync-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/store/wal_sync_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "mapdb_zig_store", .module = mod }},
+        }),
+    });
+    const probe_step = b.step("sync-probe", "Build the WAL sync probe (run it under strace; see ci/check.sh)");
+    probe_step.dependOn(&b.addInstallArtifact(probe_exe, .{}).step);
 }
