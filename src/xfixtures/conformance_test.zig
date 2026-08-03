@@ -553,9 +553,37 @@ test "xfixtures: cross-port conformance (engine=zig)" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // The `wal-v1-*` accept cells RETIRE at this engine's WAL v3 cutover: the
+    // port refuses format v1 outright (there is no migration, by design), and
+    // its opener no longer takes a WAL FILE path at all, so the cell cannot
+    // even be expressed. D6 retires these IDs family-wide at Stage C, when the
+    // manifest gains the `wal3-namespace` bundle kind and the java generator
+    // stops emitting v1 rows; until then the rows stay in the shared manifest
+    // for the engines that still speak v1, and this engine skips them.
+    //
+    // The list is EXACT and asserted below: a new accept row addressed to zig
+    // must not be silently dropped by a prefix match, and a retired cell
+    // vanishing from the manifest means Stage C has begun and this skip list
+    // must go with it.
+    const retired_v1_accepts = [4][]const u8{
+        "wal-v1-rust-tail",
+        "wal-v1-rust-ckpt",
+        "wal-v1-zig-tail",
+        "wal-v1-zig-ckpt",
+    };
+    var retired_seen = [4]bool{ false, false, false, false };
+
     var cells_run: usize = 0;
     for (m.expects.items, 0..) |cell, idx| {
         if (!std.mem.eql(u8, cell.engine, ENGINE)) continue;
+        if (std.mem.eql(u8, cell.verdict, "accept") and std.mem.eql(u8, cell.opener, "wal")) {
+            const at = for (retired_v1_accepts, 0..) |r, i| {
+                if (std.mem.eql(u8, cell.fixture, r)) break i;
+            } else return cellFail(cell, "accept-wal fixture is not one of the four v1 cells " ++
+                "retired at the v3 cutover — a new WAL accept row needs a v3 (base-path) cell, not a skip", .{});
+            retired_seen[at] = true;
+            continue;
+        }
         const file_row = try m.fileFor(cell.fixture);
         const pristine = try baselineFor(baselines.items, cell.fixture, file_row.rel_name);
 
@@ -591,6 +619,10 @@ test "xfixtures: cross-port conformance (engine=zig)" {
     // The manifest must drive at least one zig cell — an empty run means the
     // sync step produced a manifest this engine silently ignores.
     try testing.expect(cells_run > 0);
+    // Every retired v1 accept cell must still be present in the shared
+    // manifest: one gone means Stage C has begun and the skip list above must
+    // go with it.
+    for (retired_seen) |seen| try testing.expect(seen);
 }
 
 test {

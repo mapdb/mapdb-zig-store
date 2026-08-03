@@ -71,6 +71,14 @@ pub const WalIoEvent = struct {
 pub const WalIo = struct {
     ctx: *anyopaque,
     beforeFn: *const fn (ctx: *anyopaque, e: *const WalIoEvent) DbError!void,
+    /// The RAW-WRITE seam, one level below the events: when set, every
+    /// `pwrite` the section writer issues goes through here instead of the
+    /// syscall, so a test can write a PREFIX of the bytes and then fail —
+    /// the partial-write crash shape W9 exists for, which the event seam
+    /// alone cannot produce (a failed `before` call prevents the write
+    /// entirely; a real partial write leaves bytes). Production stores leave
+    /// it null and take the syscall path.
+    pwriteFn: ?*const fn (ctx: *anyopaque, file: std.fs.File, bytes: []const u8, off: u64) DbError!void = null,
 
     pub fn before(self: *const WalIo, e: *const WalIoEvent) DbError!void {
         return self.beforeFn(self.ctx, e);
@@ -90,6 +98,17 @@ pub fn walIoEvent(
     return seam.before(&.{ .kind = kind, .seq = seq, .off = off, .len = len, .tag = tag });
 }
 
+/// Writes `bytes` at `off` — through the seam's raw-write hook when one is
+/// installed, else the real `pwrite` loop. Every write the section writer
+/// issues goes through here, so the hook can produce a genuine partial write
+/// (some bytes durable, then failure) that no event-level injection can.
+pub fn walIoPwrite(io: ?*const WalIo, file: std.fs.File, bytes: []const u8, off: u64) DbError!void {
+    if (io) |seam| {
+        if (seam.pwriteFn) |f| return f(seam.ctx, file, bytes, off);
+    }
+    file.pwriteAll(bytes, off) catch return error.Io;
+}
+
 // ------------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -97,11 +116,20 @@ const testing = std.testing;
 /// A recording seam: every event in order, plus an optional failure injected at
 /// the n-th call. Shared by the `wal_segments` and (from B2) `wal_write` suites.
 pub const RecordingIo = struct {
+    /// One raw write fails after `at` successful ones, with `partial` of its
+    /// bytes genuinely written first — the crash shape a kernel-level short
+    /// write leaves, which the event-level `fail_at` cannot produce.
+    pub const PwriteFail = struct { at: usize, partial: usize };
+
     events: std.ArrayListUnmanaged(WalIoEvent) = .empty,
     alloc: std.mem.Allocator,
     /// Index of the call that fails, or null. Counted over ALL calls.
     fail_at: ?usize = null,
     calls: usize = 0,
+    /// Raw writes seen (the hook is installed unconditionally; a non-failing
+    /// call performs the real write).
+    pwrites: usize = 0,
+    pwrite_fail: ?PwriteFail = null,
 
     pub fn init(alloc: std.mem.Allocator) RecordingIo {
         return .{ .alloc = alloc };
@@ -112,7 +140,7 @@ pub const RecordingIo = struct {
     }
 
     pub fn io(self: *RecordingIo) WalIo {
-        return .{ .ctx = @ptrCast(self), .beforeFn = beforeImpl };
+        return .{ .ctx = @ptrCast(self), .beforeFn = beforeImpl, .pwriteFn = pwriteImpl };
     }
 
     fn beforeImpl(ctx: *anyopaque, e: *const WalIoEvent) DbError!void {
@@ -120,6 +148,17 @@ pub const RecordingIo = struct {
         defer self.calls += 1;
         if (self.fail_at) |n| if (self.calls == n) return error.Io;
         self.events.append(self.alloc, e.*) catch return error.OutOfMemory;
+    }
+
+    fn pwriteImpl(ctx: *anyopaque, file: std.fs.File, bytes: []const u8, off: u64) DbError!void {
+        const self: *RecordingIo = @ptrCast(@alignCast(ctx));
+        defer self.pwrites += 1;
+        if (self.pwrite_fail) |pf| if (self.pwrites == pf.at) {
+            const n = @min(pf.partial, bytes.len);
+            file.pwriteAll(bytes[0..n], off) catch return error.Io;
+            return error.Io; // the rest never reached the device
+        };
+        file.pwriteAll(bytes, off) catch return error.Io;
     }
 
     /// How many events of `kind` were recorded.

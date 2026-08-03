@@ -494,7 +494,8 @@ test "TCK: StoreDirect heap volume (incl. delta)" {
 }
 
 test "TCK: StoreWAL (transactional, staged-until-commit; incl. delta)" {
-    // StoreWAL.init opens a fresh unique temp WAL file in cwd, removed on deinit:
+    // StoreWAL.init opens a fresh v3 namespace in a unique temp dir under cwd,
+    // removed whole on deinit:
     // the generic TCK passes because reads merge staged
     // mutations over the inner committed image.
     try runCore(StoreWAL, testing.allocator);

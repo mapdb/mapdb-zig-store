@@ -1,39 +1,48 @@
-//! `StoreWAL` — transactional store: an in-memory [`StoreDirect`] volume plus a
-//! write-ahead log file (Java `StoreWAL`). Ported from
-//! `mapdb-rust-store/src/store/wal.rs`.
+//! Transactional store over the v3 segmented write-ahead log — the PUBLIC
+//! layer, and the only file that knows all four v3 modules at once.
 //!
-//! Uncommitted mutations are staged in memory; [`StoreWAL.commit`] serializes
-//! them as one WAL section, fsyncs (the durability point), then applies them to
-//! the inner (memory-backed) StoreDirect. Recovery replays all committed
-//! sections from the start of the file.
+//! Port of `mapdb-rust-store/src/store/wal.rs` (slice A2's public surface),
+//! which is itself Java `StoreWAL`. The division of labour:
 //!
-//! # On-disk format v1
+//! - `wal_segments.zig` (B0) owns which FILES exist: the `<base>.wal.<16 hex>`
+//!   namespace, the store lock, W2 create, W5/W6 unlink discipline, D1's
+//!   legacy-refusal rows, D2's namespace delete.
+//! - `wal_recover.zig` (B1) owns how bytes are READ back: the section/entry
+//!   codec and the two-pass recovery state machine R0-R7.
+//! - `wal_write.zig` (B2 part 1) owns how a section reaches the DEVICE: the
+//!   two-pass streaming writer, W1/W4 force ordering, W3 rollover.
+//! - This file owns the STORE: staging, the commit classifier, the §4.2
+//!   identity maps, W9 fail-closed, D2's lock-owning delete-on-close, D4's
+//!   platform gate, D8's config surface.
 //!
-//! This is **this implementation's** format v1, as ported from the Rust port's
-//! v1. It is not a shared contract: the Java engine has since moved to a
-//! segmented format v3. See `README.md` — the on-disk format is not stabilised
-//! and no cross-engine compatibility is claimed.
-//! ```text
-//! file       := fileHeader section*
-//! fileHeader := magic "MDBS.WAL" (8) | version i32=1 | flags i32=0        (16 B)
-//! section    := tag u8 ('S' commit, 'C' checkpoint)
-//!             | lsn i64 (strictly increasing)
-//!             | bodyLen i64
-//!             | hdrCrc i32 = CRC32(tag ++ lsn ++ bodyLen)
-//!             | bodyCrc i32 = CRC32(body)
-//!             | body: entries T_PREALLOC/T_RECORD/T_APPEND/T_DELETE (packLong framing)
-//! ```
-//! CRCs are validated BEFORE any entry is decoded (garbage never allocates);
-//! replay is entry-by-entry in O(1) memory; a damaged section FOLLOWED by a
-//! valid one is distinguishable from a torn tail — mid-log corruption raises
-//! `DataCorruption` while a bad section at EOF is truncated (decision D4).
+//! One global writer behind `rw`; every write path rechecks `closed` after
+//! acquiring the lock (close publishes `closed` under the same lock, so no
+//! staged mutation or durable append can slip in after `close()` completed).
 //!
-//! CRC32 is IEEE (`std.hash.crc.Crc32`, ISO-HDLC / crc32fast-compatible).
+//! # W9, the caller's half
 //!
-//! Concurrency: ONE global writer. All state lives
-//! behind a single `RwLock`; commit/rollback are transaction boundaries that
-//! never race in-flight mutations. `closed` is published under the write lock
-//! and every write path rechecks it after acquiring.
+//! Every error out of `appendSection` means the active segment may hold partial
+//! bytes; the ONLY safe answer is to fail the store closed so no retry can
+//! append a complete section after them (v1 returned the error with the store
+//! open; the next open then read the retry's acknowledged section as mid-log
+//! garbage and discarded it — a latent v1 defect this obligation exists to
+//! prevent). The same applies PAST the durability point: if applying a forced
+//! section to the inner volume fails, memory and log have diverged and no
+//! retry can reconcile them — close, and let reopen replay the durable state.
+//! Zig has no unwinding, so unlike rust there is no panic path around these
+//! returns; the error returns here are the entire surface, and the mutation
+//! suite pins that every one of them closes the store.
+//!
+//! # The cleaner is B3
+//!
+//! `checkpoint()`/`compact()` and the automatic cleaning hook inside commit are
+//! STUBS on this branch: the incremental cleaner (Java's re-home / W10 audit /
+//! forced-`'K'` + unlink cycle) is slice B3, which joins this branch before it
+//! reaches `main` — a cutover without the cleaner would be an unbounded-log
+//! regression, which is why the branch does not merge without it. D8's three
+//! config knobs land HERE (they are part of the public surface and the crash
+//! harness needs them); the fields the cleaner consumes are maintained from
+//! this slice on.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -44,7 +53,6 @@ const DataInput2 = io.DataInput2;
 const DataOutput2 = io.DataOutput2;
 const mod = @import("mod.zig");
 const iv = @import("index_val.zig");
-const tainted = @import("../tainted.zig");
 const direct = @import("direct.zig");
 const StoreDirect = direct.StoreDirect;
 const STATE_LIVE = direct.STATE_LIVE;
@@ -52,174 +60,76 @@ const STATE_VOID = direct.STATE_VOID;
 const AppendResult = mod.AppendResult;
 const LeaseTable = mod.LeaseTable;
 
-const Crc32 = std.hash.crc.Crc32;
+const segments = @import("wal_segments.zig");
+const WalSegmentSet = segments.WalSegmentSet;
+const SEG_HDR = segments.SEG_HDR;
 
+const wal_io = @import("wal_io.zig");
+const WalIo = wal_io.WalIo;
+
+const wr = @import("wal_recover.zig");
+const Diag = wr.Diag;
+const Identities = wr.Identities;
+const SEC_HDR = wr.SEC_HDR;
+const TAG_SECTION = wr.TAG_SECTION;
+
+const wal_write = @import("wal_write.zig");
+const appendSection = wal_write.appendSection;
+const BodySink = wal_write.BodySink;
+
+// ------------------------------------------------------------------ constants
+
+/// Entry types inside a section body (v3 §4.2, same values as v1 and Java).
 const T_PREALLOC: u8 = 1;
 const T_RECORD: u8 = 2;
 const T_APPEND: u8 = 3;
 const T_DELETE: u8 = 4;
-/// Legacy (headerless format) trailing seal tag; v1 sections are length-prefixed.
-const T_COMMIT: u8 = 8;
+/// Not an entry type: "created and deleted inside one transaction", which is
+/// applied (the preallocated recid is freed) and never logged.
+const T_TRANSIENT: u8 = 0;
 
-const MAGIC: [8]u8 = "MDBS.WAL".*;
-const FORMAT_VERSION: i32 = 1;
-/// File header: magic(8) + version(4) + flags(4).
-const FILE_HDR: u64 = 16;
-/// Section header: tag(1) + lsn(8) + bodyLen(8) + hdrCrc(4) + bodyCrc(4).
-const SEC_HDR: usize = 25;
-/// Bytes of the section header covered by hdrCrc (tag + lsn + bodyLen).
-const SEC_HDR_CRC_LEN: usize = 17;
-const TAG_SECTION: u8 = 'S';
-const TAG_CKPT: u8 = 'C';
-
-/// Default streaming-replay window (bytes); ctor override forces refill edges in tests.
+/// Default streaming-replay window (bytes); the ctor override forces refill
+/// edges in tests.
 const DEFAULT_REPLAY_BUF: usize = 1 << 20;
-/// Default log size past which `commit()` triggers an automatic checkpoint.
-pub const DEFAULT_AUTO_CHECKPOINT_BYTES: i64 = 1 << 30;
 
-/// Streaming replay control flow (mirrors Rust `WalStop`): `error.Torn` marks a
-/// torn tail (truncate + recover — availability); any other member is fatal
-/// (mid-log corruption / IO — integrity). `error.Torn` never escapes a public
-/// method: every boundary catches it and either truncates or maps it to
-/// `DataCorruption` (see [`fatalOnly`]).
-const WalError = DbError || error{Torn};
+/// Default segment size. The writer seals and rolls PAST this, at a section
+/// boundary, so one section may exceed it and an oversize section gets a
+/// segment to itself.
+pub const DEFAULT_SEGMENT_BYTES: u64 = 64 << 20;
 
-inline fn crc32(bytes: []const u8) u32 {
-    return Crc32.hash(bytes);
-}
+/// Smallest legal segment size: a segment header plus one section header.
+/// Anything below it cannot hold a single section.
+pub const MIN_SEGMENT_BYTES: u64 = SEG_HDR + SEC_HDR;
 
-/// A torn tail in a context that requires completeness IS corruption; any other
-/// wal error is already a `DbError`. Callers use this at boundaries where a torn
-/// tail cannot be tolerated (the checkpoint-temp / snapshot path).
-inline fn fatalOnly(e: WalError) DbError {
-    return if (e == error.Torn) error.DataCorruption else @errorCast(e);
-}
+/// Floor under the cleaning trigger (D8): a log smaller than this is never
+/// cleaned, however small the live data is. Without a floor a store holding a
+/// few hundred bytes would clean on every commit.
+pub const DEFAULT_MIN_LOG_BYTES: u64 = 1 << 30;
 
-/// Fallible recid conversion for decode paths: a CRC-valid but semantically
-/// invalid entry carrying recid 0 (reserved) must return `DataCorruption`.
-inline fn nzRes(recid: u64) WalError!u64 {
-    if (recid == 0) return error.DataCorruption;
-    return recid;
-}
+/// Default space-amplification target (D8): clean once the log exceeds this
+/// multiple of the live data. It bounds SPACE, not write amplification.
+pub const DEFAULT_SPACE_AMPLIFICATION: u32 = 2;
 
-// ---------------------------------------------------------------- big-endian
+// Static diagnostic reasons for the store `Diag` (same discipline as
+// `wal_recover`'s R_* set: cleared on entry, written immediately before the
+// error return it explains, asserted by IDENTITY in tests). Rust formats the
+// failure into the error's message; `DbError` has no payload, so the reason
+// travels here instead.
 
-inline fn putI64Be(buf: []u8, off: usize, v: i64) void {
-    std.mem.writeInt(i64, buf[off..][0..8], v, .big);
-}
-inline fn putI32Be(buf: []u8, off: usize, v: i32) void {
-    std.mem.writeInt(i32, buf[off..][0..4], v, .big);
-}
-inline fn getI64Be(buf: []const u8, off: usize) i64 {
-    return std.mem.readInt(i64, buf[off..][0..8], .big);
-}
-inline fn getI32Be(buf: []const u8, off: usize) i32 {
-    return std.mem.readInt(i32, buf[off..][0..4], .big);
-}
+/// The commit section's write or force failed (W9): the store is closed, the
+/// durable state on disk is intact, reopen replays it.
+pub const W_COMMIT_WRITE: []const u8 =
+    "wal commit: section write/force failed; store closed (W9), reopen to recover";
+/// Applying a FORCED section to the inner volume failed: memory and log have
+/// diverged, the store is closed, reopen replays the committed section.
+pub const W_COMMIT_APPLY: []const u8 =
+    "wal commit: apply failed after the durability point; store closed, reopen to recover the committed section";
+/// The inner store refused a committed append during apply — a writer bug
+/// surfacing after the durability point, never an operational condition.
+pub const W_COMMIT_APPEND_REFUSED: []const u8 =
+    "wal commit: inner store refused a committed append after the durability point";
 
-const SecHdr = struct { tag: u8, lsn: i64, body_len: i64, hdr_crc: i32, body_crc: i32 };
-
-fn parseSecHdr(hdr: *const [SEC_HDR]u8) SecHdr {
-    return .{
-        .tag = hdr[0],
-        .lsn = getI64Be(hdr, 1),
-        .body_len = getI64Be(hdr, 9),
-        .hdr_crc = getI32Be(hdr, 17),
-        .body_crc = getI32Be(hdr, 21),
-    };
-}
-
-// ------------------------------------------------------------------ file I/O
-
-/// Positioned full read; a short read (file shorter than claimed) is a torn tail.
-fn readAt(file: std.fs.File, buf: []u8, pos: u64) WalError!void {
-    const n = file.preadAll(buf, pos) catch return error.Io;
-    if (n < buf.len) return error.Torn;
-}
-
-fn writeFileHeader(file: std.fs.File) DbError!void {
-    var h: [FILE_HDR]u8 = undefined;
-    @memcpy(h[0..8], &MAGIC);
-    putI32Be(&h, 8, FORMAT_VERSION);
-    putI32Be(&h, 12, 0);
-    file.pwriteAll(&h, 0) catch return error.Io;
-}
-
-/// True when the file carries the v1 magic; rejects unknown future versions
-/// and nonzero v1 header flags (both explicit `DataCorruption`, never a silent
-/// `false` — a current-magic file must not fall through to the framed-MDB
-/// guard or the legacy replay with a misleading error path).
-fn isV1(file: std.fs.File, size: u64) DbError!bool {
-    if (size < FILE_HDR) return false;
-    var h: [FILE_HDR]u8 = undefined;
-    _ = file.preadAll(&h, 0) catch return error.Io;
-    if (!std.mem.eql(u8, h[0..8], &MAGIC)) return false;
-    const version = getI32Be(&h, 8);
-    if (version != FORMAT_VERSION) return error.DataCorruption; // unsupported WAL format version
-    // v1 declares flags == 0 (see the format comment above); an unknown flag
-    // may change the meaning of every byte that follows, so reject it BEFORE
-    // any replay or truncation (strictness parity with Java v3, which rejects
-    // nonzero segment flags).
-    const flags = getI32Be(&h, 12);
-    if (flags != 0) return error.DataCorruption; // nonzero v1 WAL header flags
-    return true;
-}
-
-/// A framed MapDB-family header must never be reinterpreted as the legacy
-/// headerless WAL. In particular, this makes a hard magic swap reject old v1
-/// files instead of treating their first byte as a torn legacy instruction and
-/// destructively migrating an empty prefix.
-fn hasFramedMagicPrefix(file: std.fs.File, size: u64) DbError!bool {
-    if (size < 3) return false;
-    var prefix: [3]u8 = undefined;
-    const n = file.preadAll(&prefix, 0) catch return error.Io;
-    if (n < prefix.len) return error.Io;
-    return std.mem.eql(u8, &prefix, "MDB");
-}
-
-/// fsync the directory so a create/rename of `path` is itself durable. On the
-/// durability path (initial WAL creation, checkpoint promotion): failure MUST
-/// propagate. Linux-scoped.
-fn fsyncDir(path: []const u8) DbError!void {
-    const parent = std.fs.path.dirname(path) orelse ".";
-    const dir_path = if (parent.len == 0) "." else parent;
-    // `.iterate` forces a real O_RDONLY dir fd (a default O_PATH fd cannot be
-    // fsync'd on Linux → EBADF).
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return error.Io;
-    defer dir.close();
-    std.posix.fsync(dir.fd) catch return error.Io;
-}
-
-/// `<path>.ckpt` (owned; caller frees).
-fn ckptTmp(alloc: Allocator, path: []const u8) DbError![]u8 {
-    return std.mem.concat(alloc, u8, &.{ path, ".ckpt" }) catch return error.OutOfMemory;
-}
-
-fn pathExists(path: []const u8) bool {
-    std.fs.cwd().access(path, .{}) catch return false;
-    return true;
-}
-
-/// CRC32 over the body range `[start, end)`, streamed through a bounded buffer.
-fn bodyCrc(file: std.fs.File, start: u64, end: u64, bufsize: usize, alloc: Allocator) WalError!u32 {
-    var crc = Crc32.init();
-    if (start < end) {
-        const span = end - start;
-        const cap: usize = @intCast(@min(span, @as(u64, @max(bufsize, 16))));
-        const buf = alloc.alloc(u8, cap) catch return error.OutOfMemory;
-        defer alloc.free(buf);
-        var p = start;
-        while (p < end) {
-            const n: usize = @intCast(@min(end - p, @as(u64, buf.len)));
-            try readAt(file, buf[0..n], p);
-            crc.update(buf[0..n]);
-            p += n;
-        }
-    }
-    return crc.final();
-}
-
-// -------------------------------------------------------------- staged state
+// --------------------------------------------------------------- staged state
 
 /// Per-recid staged mutation set (uncommitted). Content == (base or inner) ++ appends.
 const Staged = struct {
@@ -249,309 +159,64 @@ const Staged = struct {
 };
 
 /// Classified commit operation, computed before any apply (state must not shift
-/// mid-apply). `op == 0` = created+deleted: apply-only cleanup, not logged.
+/// mid-apply).
 const WalOp = struct {
+    /// One of `T_*`, or [`T_TRANSIENT`].
     op: u8,
     recid: u64,
+    /// `T_RECORD` only.
     cap: usize,
+    /// Owned by the ops list; freed after commit.
     data: ?[]u8,
+    /// `T_APPEND` only: the LSN of the content image this delta extends, read
+    /// from the live identities at classify time and written to the log as
+    /// `packLong(sectionLsn - base_lsn)`. 0 for every other op, all of which
+    /// are self-contained.
+    base_lsn: i64 = 0,
 };
 
-/// Capacity as the writer encodes it: 0 for null content, else 16-aligned, big
-/// enough for header+content, within the plain-record limit — EXCEPT oversize
-/// (linked) records, which the writer encodes with capacity 0.
-fn capValid(cap: u64, data: ?[]const u8) bool {
-    if (data) |d| {
-        const max = @as(u64, iv.MAX_CAPACITY);
-        const need = @as(u64, d.len) + 4;
-        if (cap == 0) return need > max;
-        return cap >= need and cap <= max and (cap & 15) == 0;
-    } else {
-        return cap == 0;
+/// Capacity as the writer encodes it, for merged content `m` plus a `headroom`
+/// hint: 0 for null content and for genuinely oversize content (stored linked),
+/// else 16-aligned and big enough for header+content.
+///
+/// Headroom is a HINT; the record is the promise. A staged base reports
+/// unlimited capacity, so an append can push the merged content to the plain
+/// maximum and the requested headroom then overflows it. Clamping keeps the
+/// record plain with an exact capacity, which is what a later `T_APPEND`
+/// needs. Falling to capacity 0 there would make the writer acknowledge a
+/// commit the decoder rejects as a garbage capacity (`capValid` allows 0 only
+/// when the CONTENT itself is oversize), i.e. an unopenable log.
+fn recordCap(m: ?[]const u8, headroom: usize) u64 {
+    const b = m orelse return 0;
+    const max = @as(u64, iv.MAX_CAPACITY);
+    // u64 throughout, saturating: the sum of a plain-sized record and a large
+    // headroom is checked against the ceiling, never wrapped into it.
+    const cap = ((4 +| @as(u64, b.len)) +| @as(u64, headroom) +| 15) & ~@as(u64, 15);
+    if (cap > max) {
+        return if (4 + @as(u64, b.len) <= max) max else 0;
     }
+    return cap;
 }
 
-/// Rounded plain-record capacity for `content_len` + `headroom` bytes, or
-/// `RecordTooLarge` on overflow / exceeding MAX_CAPACITY. Caller guarantees the
-/// content is not itself oversize (`4 + content_len <= MAX_CAPACITY`).
-fn plainCap(content_len: usize, headroom: usize) DbError!u64 {
-    const base = std.math.add(u64, 4, @as(u64, content_len)) catch return error.RecordTooLarge;
-    const need = std.math.add(u64, base, @as(u64, headroom)) catch return error.RecordTooLarge;
-    const rounded = (std.math.add(u64, need, 15) catch return error.RecordTooLarge) & ~@as(u64, 15);
-    if (rounded > @as(u64, iv.MAX_CAPACITY)) return error.RecordTooLarge;
-    return rounded;
-}
+// ------------------------------------------------------------------- options
 
-// -------------------------------------------------------- streaming decoder
-
-/// Streaming WAL decoder: a fixed-size window over the file with u64 positions,
-/// bounded by `[start, limit)`, plus an incremental CRC32 (used by the legacy
-/// trailing-seal format only). Never materializes the log, so 2 GiB+ files replay.
-const WalIn = struct {
-    file: std.fs.File,
-    alloc: Allocator,
-    limit: u64 = 0,
-    win: []u8,
-    win_start: u64 = 0,
-    win_pos: usize = 0,
-    win_len: usize = 0,
-    crc: Crc32,
-
-    fn init(file: std.fs.File, alloc: Allocator, bufsize: usize) DbError!WalIn {
-        const win = alloc.alloc(u8, @max(bufsize, 16)) catch return error.OutOfMemory;
-        return .{ .file = file, .alloc = alloc, .win = win, .crc = Crc32.init() };
-    }
-
-    fn deinit(self: *WalIn) void {
-        self.alloc.free(self.win);
-    }
-
-    fn reset(self: *WalIn, start: u64, end: u64) void {
-        self.win_start = start;
-        self.limit = end;
-        self.win_pos = 0;
-        self.win_len = 0;
-        self.crc = Crc32.init();
-    }
-
-    inline fn pos(self: *const WalIn) u64 {
-        return self.win_start + self.win_pos;
-    }
-    inline fn remaining(self: *const WalIn) u64 {
-        return self.limit - self.pos();
-    }
-
-    fn refill(self: *WalIn) WalError!void {
-        self.win_start = self.pos();
-        self.win_pos = 0;
-        if (self.win_start >= self.limit) return error.Torn;
-        const n: usize = @intCast(@min(self.limit - self.win_start, @as(u64, self.win.len)));
-        try readAt(self.file, self.win[0..n], self.win_start);
-        self.win_len = n;
-    }
-
-    /// Unsigned byte, NOT folded into the CRC (callers fold via `crcTag`).
-    fn readByteRaw(self: *WalIn) WalError!u8 {
-        if (self.win_pos >= self.win_len) try self.refill();
-        const b = self.win[self.win_pos];
-        self.win_pos += 1;
-        return b;
-    }
-
-    fn crcTag(self: *WalIn, tag: u8) void {
-        self.crc.update(&.{tag});
-    }
-
-    /// Packed long, CRC'd, capped at 10 bytes (over-long run = corruption).
-    fn unpackLong(self: *WalIn) WalError!u64 {
-        var ret: u64 = 0;
-        var i: usize = 0;
-        while (i < io.max_packed_long_bytes) : (i += 1) {
-            const v = try self.readByteRaw();
-            self.crc.update(&.{v});
-            ret = (ret << 7) | @as(u64, v & 0x7F);
-            if (v & 0x80 != 0) return ret;
-        }
-        return error.DataCorruption; // WAL packed long too long
-    }
-
-    /// Payload bytes, CRC'd.
-    fn readFully(self: *WalIn, dst: []u8) WalError!void {
-        var off: usize = 0;
-        while (off < dst.len) {
-            if (self.win_pos >= self.win_len) try self.refill();
-            const n = @min(self.win_len - self.win_pos, dst.len - off);
-            @memcpy(dst[off .. off + n], self.win[self.win_pos .. self.win_pos + n]);
-            self.win_pos += n;
-            off += n;
-        }
-        self.crc.update(dst);
-    }
-
-    /// Big-endian i32, NOT CRC'd (the stored section CRC itself).
-    fn readIntRaw(self: *WalIn) WalError!i32 {
-        var r: i32 = 0;
-        var i: usize = 0;
-        while (i < 4) : (i += 1) {
-            r = (r << 8) | @as(i32, try self.readByteRaw());
-        }
-        return r;
-    }
-
-    fn crcValue(self: *const WalIn) u32 {
-        return self.crc.final();
-    }
-    fn crcReset(self: *WalIn) void {
-        self.crc = Crc32.init();
-    }
-};
-
-/// Decode+apply one CRC-verified section body into `inner` (O(1) memory).
-fn applySection(inner: *StoreDirect, win: *WalIn, start: u64, end: u64) WalError!void {
-    win.reset(start, end);
-    while (win.pos() < end) {
-        const ty = try win.readByteRaw();
-        switch (ty) {
-            T_PREALLOC => try inner.walPrealloc(try nzRes(try win.unpackLong())),
-            T_DELETE => try inner.delete(try nzRes(try win.unpackLong())),
-            T_RECORD => {
-                const recid = try nzRes(try win.unpackLong());
-                const cap = try win.unpackLong();
-                const len_plus = try win.unpackLong();
-                var data: ?[]u8 = null;
-                if (len_plus != 0) {
-                    const len = len_plus - 1;
-                    if (len > std.math.maxInt(i32) or len > win.remaining())
-                        return error.DataCorruption; // bad WAL record length
-                    const b = win.alloc.alloc(u8, try tainted.u64ToUsize(len)) catch return error.OutOfMemory;
-                    win.readFully(b) catch |e| {
-                        win.alloc.free(b);
-                        return e;
-                    };
-                    data = b;
-                }
-                defer if (data) |d| win.alloc.free(d);
-                if (!capValid(cap, data)) return error.DataCorruption; // bad WAL record capacity
-                try inner.walPut(recid, try tainted.u64ToUsize(cap), data);
-            },
-            T_APPEND => {
-                const recid = try nzRes(try win.unpackLong());
-                const len = try win.unpackLong();
-                if (len > std.math.maxInt(i32) or len > win.remaining())
-                    return error.DataCorruption; // bad WAL append length
-                const b = win.alloc.alloc(u8, try tainted.u64ToUsize(len)) catch return error.OutOfMemory;
-                defer win.alloc.free(b);
-                try win.readFully(b);
-                switch (try inner.append(recid, b)) {
-                    .refused => return error.DataCorruption, // WAL append refused
-                    .new_size => {},
-                }
-            },
-            else => return error.DataCorruption, // bad WAL entry tag
-        }
-    }
-}
-
-/// One legacy-format pending op (headerless trailing-seal format only).
-fn applyOps(inner: *StoreDirect, ops: []const WalOp) WalError!void {
-    for (ops) |op| {
-        const recid = try nzRes(op.recid);
-        switch (op.op) {
-            T_PREALLOC => try inner.walPrealloc(recid),
-            T_RECORD => try inner.walPut(recid, op.cap, op.data),
-            T_APPEND => {
-                const d = op.data.?;
-                switch (try inner.append(recid, d)) {
-                    .refused => return error.DataCorruption, // WAL append refused
-                    .new_size => {},
-                }
-            },
-            T_DELETE => try inner.delete(recid),
-            else => return error.DataCorruption, // bad WAL op
-        }
-    }
-}
-
-/// True when `[from, size)` holds >=1 fully valid section proving durable
-/// committed sections follow a bad one. `exact_next`: untrusted anchor requires
-/// exactly `last_lsn + 2`; else any strictly-future LSN (`> last_lsn + 1`).
-fn anyValidSectionFrom(
-    file: std.fs.File,
-    from: u64,
-    size: u64,
-    last_lsn: i64,
-    exact_next: bool,
-    bufsize: usize,
-    alloc: Allocator,
-) WalError!bool {
-    var pos = from;
-    while (pos + @as(u64, SEC_HDR) <= size) {
-        var hdr: [SEC_HDR]u8 = undefined;
-        readAt(file, &hdr, pos) catch |e| {
-            if (e == error.Torn) return false;
-            return e;
-        };
-        const h = parseSecHdr(&hdr);
-        const body_start = pos + @as(u64, SEC_HDR);
-        if (@as(i32, @bitCast(crc32(hdr[0..SEC_HDR_CRC_LEN]))) != h.hdr_crc or
-            (h.tag != TAG_SECTION and h.tag != TAG_CKPT) or
-            h.body_len < 0 or
-            @as(u64, @intCast(h.body_len)) > size - body_start)
-        {
-            return false;
-        }
-        // checked: overflow at the LSN ceiling means no such successor exists.
-        const lsn_ok = if (exact_next)
-            (std.math.add(i64, last_lsn, 2) catch null) != null and h.lsn == last_lsn + 2
-        else
-            (std.math.add(i64, last_lsn, 1) catch null) != null and h.lsn > last_lsn + 1;
-        const body_end = body_start + @as(u64, @intCast(h.body_len));
-        if (lsn_ok and (try bodyCrc(file, body_start, body_end, bufsize, alloc)) == @as(u32, @bitCast(h.body_crc)))
-            return true;
-        pos = body_end;
-    }
-    return false;
-}
-
-// ------------------------------------------------------------ snapshot writer
-
-/// Streaming snapshot body writer: buffers ~1 MiB chunks, tracks total body
-/// length (u64 — bodies may exceed 2 GiB) and a rolling CRC32. Serves as the
-/// `sink` for `StoreDirect.walSnapshot`.
-const SnapshotWriter = struct {
-    const FLUSH_AT: usize = 1 << 20;
-
-    file: std.fs.File,
-    at: u64,
-    out: DataOutput2,
-    crc: Crc32,
-    body_len: u64 = 0,
-
-    fn init(file: std.fs.File, at: u64, alloc: Allocator) SnapshotWriter {
-        return .{ .file = file, .at = at, .out = DataOutput2.init(alloc), .crc = Crc32.init() };
-    }
-    fn deinit(self: *SnapshotWriter) void {
-        self.out.deinit();
-    }
-
-    /// `StoreDirect.walSnapshot` sink entry point.
-    pub fn emit(self: *SnapshotWriter, recid: u64, is_prealloc: bool, cap_bytes: usize, content: ?[]const u8) DbError!void {
-        if (is_prealloc) return self.prealloc(recid);
-        return self.record(recid, cap_bytes, content);
-    }
-
-    fn prealloc(self: *SnapshotWriter, recid: u64) DbError!void {
-        try self.out.writeByte(T_PREALLOC);
-        try self.out.packLong(recid);
-        return self.maybeFlush();
-    }
-
-    fn record(self: *SnapshotWriter, recid: u64, cap_bytes: usize, content: ?[]const u8) DbError!void {
-        try self.out.writeByte(T_RECORD);
-        try self.out.packLong(recid);
-        try self.out.packLong(@as(u64, cap_bytes));
-        if (content) |d| {
-            try self.out.packLong(@as(u64, d.len) + 1);
-            try self.out.writeAll(d);
-        } else {
-            try self.out.packLong(0);
-        }
-        return self.maybeFlush();
-    }
-
-    fn maybeFlush(self: *SnapshotWriter) DbError!void {
-        if (self.out.pos() >= FLUSH_AT) try self.flush();
-    }
-
-    fn flush(self: *SnapshotWriter) DbError!void {
-        const b = self.out.bytes();
-        if (b.len == 0) return;
-        self.crc.update(b);
-        self.file.pwriteAll(b, self.at) catch return error.Io;
-        self.at += b.len;
-        self.body_len += b.len;
-        self.out.buf.clearRetainingCapacity();
-    }
+/// Options for [`StoreWAL.openCfg`]. The seam and diag fields are test
+/// surfaces rather than API: production opens pass null for both.
+pub const WalOptions = struct {
+    thread_safe: bool = true,
+    /// D7: INTERNAL read-only mode only — same scanner, no mutation. There is
+    /// no public read-only DB surface in this workstream.
+    read_only: bool = false,
+    segment_bytes: u64 = DEFAULT_SEGMENT_BYTES,
+    /// Streaming window for replay; a tiny value forces refill edges in tests.
+    replay_buf: usize = DEFAULT_REPLAY_BUF,
+    /// The durability-event seam, installed into the segment set — the ONE
+    /// store-owned pointer (`segs.io`); nothing else holds a copy. Borrowed
+    /// for the life of the store; the installer owns the lifetime.
+    io: ?*const WalIo = null,
+    /// Receives the recovery diagnostic on a refused open; the store's own
+    /// `Diag` starts empty either way.
+    diag: ?*Diag = null,
 };
 
 // -------------------------------------------------------------- WalState
@@ -559,205 +224,32 @@ const SnapshotWriter = struct {
 /// The lock-guarded mutable state (Java's single ReadWriteLock covers all of it).
 const WalState = struct {
     inner: StoreDirect,
-    file: std.fs.File,
+    segs: WalSegmentSet,
     staged: std.AutoHashMapUnmanaged(u64, Staged) = .empty,
+    /// The two per-recid identities, maintained atomically with the committed
+    /// apply of the entry that sets them — never before, never from staged
+    /// state. Replay rebuilds them; the commit classifier reads them.
+    ids: Identities = .{},
+    /// Next section LSN — exactly consecutive within a segment.
     next_lsn: i64,
-    checkpoint_basis: u64,
-    auto_checkpoint_bytes: i64,
-    /// Append position in the log (Java tracks this as `ch.position()`).
-    log_pos: u64,
-    replay_buf: usize,
-    /// Set when a durability-path step (e.g. the post-rename directory fsync)
-    /// failed after its visible effect: the store must not report any later
-    /// commit/checkpoint durable until reopened. Guarded by the state lock.
-    poisoned: bool = false,
+    segment_bytes: u64,
+    min_log_bytes: u64 = DEFAULT_MIN_LOG_BYTES,
+    space_amplification: u32 = DEFAULT_SPACE_AMPLIFICATION,
+    read_only: bool,
+    /// Committed self-contained entries over this store's lifetime — every one
+    /// of which can obsolete an earlier image, which is what makes it the
+    /// cleaner's (B3) futility-latch staleness clock.
+    committed_state_changes: i64 = 0,
+    /// The store-level diagnostic: cleared on entry to `commitLocked`, written
+    /// immediately before every error return that maps a writer or apply
+    /// failure, so it always describes the failure just returned or nothing.
+    diag: Diag = .{},
     alloc: Allocator,
 
     fn clearStaged(self: *WalState) void {
         var it = self.staged.valueIterator();
         while (it.next()) |s| s.deinit(self.alloc);
         self.staged.clearRetainingCapacity();
-    }
-
-    // ---------- open-time recovery ----------
-
-    fn recoverOpenedChannel(self: *WalState, created: bool, path: []const u8) DbError!void {
-        const size = (self.file.stat() catch return error.Io).size;
-        var legacy = false;
-        const valid_end: u64 = if (size == 0) blk: {
-            try writeFileHeader(self.file);
-            self.file.sync() catch return error.Io;
-            if (created) try fsyncDir(path);
-            break :blk FILE_HDR;
-        } else if (try isV1(self.file, size)) blk: {
-            break :blk try self.replayV1(size);
-        } else if (try hasFramedMagicPrefix(self.file, size)) {
-            return error.DataCorruption;
-        } else blk: {
-            legacy = true;
-            break :blk try self.replayLegacy(size);
-        };
-        self.file.setEndPos(valid_end) catch return error.Io;
-        self.log_pos = valid_end;
-        // replay of delete-then-reuse histories leaves stale free-list entries:
-        // rebuild the allocator's free list from the final index.
-        try self.inner.rebuildFreeRecids();
-        if (legacy) try self.checkpointLocked(path); // migrate to v1
-    }
-
-    /// Scans v1 sections; applies each CRC-valid one; returns the end offset of
-    /// the last valid section. Torn tail truncates; a CRC-failing section
-    /// FOLLOWED by a valid one is mid-log corruption and errors.
-    fn replayV1(self: *WalState, size: u64) DbError!u64 {
-        var win = try WalIn.init(self.file, self.alloc, self.replay_buf);
-        defer win.deinit();
-        var pos = FILE_HDR;
-        var last_lsn: i64 = 0;
-        while (pos + @as(u64, SEC_HDR) <= size) {
-            const StepResult = struct { lsn: i64, body_end: u64 };
-            // Returns the parsed section, `null` for a suspect (self-CRC-failing)
-            // header, `error.Torn` for a torn tail, else a fatal DbError.
-            const step: WalError!?StepResult = blk: {
-                var hdr: [SEC_HDR]u8 = undefined;
-                readAt(self.file, &hdr, pos) catch |e| break :blk e;
-                const h = parseSecHdr(&hdr);
-                const body_start = pos + @as(u64, SEC_HDR);
-                const hdr_ok = @as(i32, @bitCast(crc32(hdr[0..SEC_HDR_CRC_LEN]))) == h.hdr_crc and
-                    (h.tag == TAG_SECTION or h.tag == TAG_CKPT);
-                if (!hdr_ok) break :blk @as(?StepResult, null); // suspect
-                if (h.body_len < 0 or @as(u64, @intCast(h.body_len)) > size - body_start)
-                    break :blk error.Torn; // verified header, body past EOF: torn by construction
-                const body_end = body_start + @as(u64, @intCast(h.body_len));
-                const bcrc = bodyCrc(self.file, body_start, body_end, self.replay_buf, self.alloc) catch |e| break :blk e;
-                if (bcrc != @as(u32, @bitCast(h.body_crc))) {
-                    // bodyEnd TRUSTED (hdrCrc valid): anything valid after it = bit rot.
-                    const follows = anyValidSectionFrom(self.file, body_end, size, last_lsn, false, self.replay_buf, self.alloc) catch |e| break :blk e;
-                    if (follows) break :blk error.DataCorruption; // mid-log corruption: body CRC mismatch but valid sections follow
-                    break :blk error.Torn;
-                }
-                break :blk @as(?StepResult, .{ .lsn = h.lsn, .body_end = body_end });
-            };
-
-            const parsed: ?StepResult = step catch |e| {
-                if (e == error.Torn) return pos; // torn tail: truncate here
-                return fatalOnly(e);
-            };
-            const v = parsed orelse {
-                // suspect header: torn tail unless a later valid section proves rot.
-                return self.suspectSection(pos, size, last_lsn);
-            };
-            if (v.lsn <= last_lsn) return error.DataCorruption; // WAL LSN not increasing
-            applySection(&self.inner, &win, pos + @as(u64, SEC_HDR), v.body_end) catch |e| return fatalOnly(e);
-            last_lsn = v.lsn;
-            self.next_lsn = std.math.add(i64, v.lsn, 1) catch return error.DataCorruption; // WAL LSN space exhausted
-            pos = v.body_end;
-        }
-        return pos;
-    }
-
-    /// A section whose header fails its own CRC. The declared bodyLen is
-    /// untrusted, so calling it corruption needs the section at the declared end
-    /// to be fully valid AND carry EXACTLY the next expected LSN (`last_lsn + 2`).
-    fn suspectSection(self: *WalState, pos: u64, size: u64, last_lsn: i64) DbError!u64 {
-        var hdr: [SEC_HDR]u8 = undefined;
-        readAt(self.file, &hdr, pos) catch |e| {
-            if (e == error.Torn) return pos;
-            return fatalOnly(e);
-        };
-        const h = parseSecHdr(&hdr);
-        const body_start = pos + @as(u64, SEC_HDR);
-        if (h.body_len >= 0 and @as(u64, @intCast(h.body_len)) <= size - body_start) {
-            const follows = anyValidSectionFrom(self.file, body_start + @as(u64, @intCast(h.body_len)), size, last_lsn, true, self.replay_buf, self.alloc) catch |e| return fatalOnly(e);
-            if (follows) return error.DataCorruption; // mid-log corruption: header damaged but valid sections follow
-        }
-        return pos;
-    }
-
-    /// Legacy (headerless) log: trailing-COMMIT-seal sections. Returns end offset
-    /// of the last valid section.
-    fn replayLegacy(self: *WalState, size: u64) DbError!u64 {
-        if (size == 0) return 0;
-        var win = try WalIn.init(self.file, self.alloc, self.replay_buf);
-        defer win.deinit();
-        win.reset(0, size);
-        var valid_end: u64 = 0;
-        var pending: std.ArrayListUnmanaged(WalOp) = .empty;
-        defer {
-            for (pending.items) |op| if (op.data) |d| self.alloc.free(d);
-            pending.deinit(self.alloc);
-        }
-        const res: WalError!void = blk: {
-            while (win.remaining() > 0) {
-                const ty = win.readByteRaw() catch |e| break :blk e;
-                if (ty == T_COMMIT) {
-                    const computed = @as(i32, @bitCast(win.crcValue()));
-                    const stored = win.readIntRaw() catch |e| break :blk e;
-                    if (computed != stored) break :blk {}; // torn/corrupt tail
-                    applyOps(&self.inner, pending.items) catch |e| break :blk e;
-                    for (pending.items) |op| if (op.data) |d| self.alloc.free(d);
-                    pending.clearRetainingCapacity();
-                    valid_end = win.pos();
-                    win.crcReset();
-                    continue;
-                }
-                win.crcTag(ty);
-                switch (ty) {
-                    T_PREALLOC => {
-                        const recid = win.unpackLong() catch |e| break :blk e;
-                        pending.append(self.alloc, .{ .op = T_PREALLOC, .recid = recid, .cap = 0, .data = null }) catch break :blk error.OutOfMemory;
-                    },
-                    T_DELETE => {
-                        const recid = win.unpackLong() catch |e| break :blk e;
-                        pending.append(self.alloc, .{ .op = T_DELETE, .recid = recid, .cap = 0, .data = null }) catch break :blk error.OutOfMemory;
-                    },
-                    T_RECORD => {
-                        const recid = win.unpackLong() catch |e| break :blk e;
-                        const cap = win.unpackLong() catch |e| break :blk e;
-                        const len_plus = win.unpackLong() catch |e| break :blk e;
-                        var data: ?[]u8 = null;
-                        if (len_plus != 0) {
-                            const len = len_plus - 1;
-                            if (len > std.math.maxInt(i32) or len > win.remaining()) break :blk {}; // torn
-                            const b = self.alloc.alloc(u8, @intCast(len)) catch break :blk error.OutOfMemory;
-                            win.readFully(b) catch |e| {
-                                self.alloc.free(b);
-                                break :blk e;
-                            };
-                            data = b;
-                        }
-                        if (!capValid(cap, data)) {
-                            if (data) |d| self.alloc.free(d);
-                            break :blk {}; // garbage capacity: torn tail
-                        }
-                        pending.append(self.alloc, .{ .op = T_RECORD, .recid = recid, .cap = @intCast(cap), .data = data }) catch {
-                            if (data) |d| self.alloc.free(d);
-                            break :blk error.OutOfMemory;
-                        };
-                    },
-                    T_APPEND => {
-                        const recid = win.unpackLong() catch |e| break :blk e;
-                        const len = win.unpackLong() catch |e| break :blk e;
-                        if (len > std.math.maxInt(i32) or len > win.remaining()) break :blk {}; // torn
-                        const b = self.alloc.alloc(u8, @intCast(len)) catch break :blk error.OutOfMemory;
-                        win.readFully(b) catch |e| {
-                            self.alloc.free(b);
-                            break :blk e;
-                        };
-                        pending.append(self.alloc, .{ .op = T_APPEND, .recid = recid, .cap = 0, .data = b }) catch {
-                            self.alloc.free(b);
-                            break :blk error.OutOfMemory;
-                        };
-                    },
-                    else => break :blk {}, // unknown instruction: torn tail
-                }
-            }
-            break :blk {};
-        };
-        res catch |e| {
-            if (e == error.Torn) return valid_end;
-            return fatalOnly(e);
-        };
-        return valid_end;
     }
 
     // ---------- merged content ----------
@@ -804,48 +296,44 @@ const WalState = struct {
 
     // ---------- commit ----------
 
-    fn commitLocked(self: *WalState, path: []const u8) DbError!void {
-        if (self.poisoned) return error.DataCorruption; // WAL poisoned by an earlier durability failure
-        // Refuse before writing rather than overflow next_lsn (2^63 sections is infeasible).
-        if (self.next_lsn == std.math.maxInt(i64)) return error.DataCorruption; // WAL LSN space exhausted
-        if (self.staged.count() == 0) return;
-
-        // classify all ops BEFORE applying any (apply shifts inner state).
+    /// Classifies the staged set into the ops one commit section will carry.
+    /// Runs BEFORE any apply, because applying shifts the inner store's state.
+    /// The returned ops (and their payloads) are owned by the caller.
+    fn classify(self: *WalState) DbError!std.ArrayListUnmanaged(WalOp) {
         var recids: std.ArrayListUnmanaged(u64) = .empty;
         defer recids.deinit(self.alloc);
         {
             var it = self.staged.keyIterator();
             while (it.next()) |k| recids.append(self.alloc, k.*) catch return error.OutOfMemory;
         }
+        // Ascending recid order IS the on-disk entry order.
         std.mem.sort(u64, recids.items, {}, std.sort.asc(u64));
 
         var ops: std.ArrayListUnmanaged(WalOp) = .empty;
-        defer {
-            for (ops.items) |op| if (op.data) |d| self.alloc.free(d);
-            ops.deinit(self.alloc);
-        }
+        errdefer freeOps(self.alloc, &ops);
         for (recids.items) |recid| {
             const s = self.staged.getPtr(recid).?;
             if (s.deleted) {
-                const op: u8 = if (!s.created) T_DELETE else 0; // created+deleted: cleanup only
+                // created+deleted in one transaction: apply-only cleanup, not logged.
+                const op: u8 = if (s.created) T_TRANSIENT else T_DELETE;
                 ops.append(self.alloc, .{ .op = op, .recid = recid, .cap = 0, .data = null }) catch return error.OutOfMemory;
             } else if (!s.base_set and s.appends.items.len == 0) {
-                ops.append(self.alloc, .{ .op = T_PREALLOC, .recid = recid, .cap = 0, .data = null }) catch return error.OutOfMemory;
+                // T_PREALLOC exists to make a NEWLY ALLOCATED recid durable. On
+                // a record that was already committed, an empty staged entry
+                // means nothing was changed, so nothing is logged — structural
+                // defence in depth: no path that leaves an empty entry behind
+                // can turn it into a prealloc over a live record, which §4.2
+                // rejects on replay.
+                if (s.created) {
+                    ops.append(self.alloc, .{ .op = T_PREALLOC, .recid = recid, .cap = 0, .data = null }) catch return error.OutOfMemory;
+                }
             } else if (s.base_set or (try self.inner.recState(recid)) != STATE_LIVE) {
                 const m = try self.merged(recid, s);
                 errdefer if (m) |mm| self.alloc.free(mm);
-                // cap == 0 in a T_RECORD is valid ONLY for null content or a
-                // genuinely oversize (linked) record. A plain record whose
-                // content+headroom rounds past MAX_CAPACITY must NOT collapse to
-                // cap 0; reject it as RecordTooLarge instead.
-                const cap_l: u64 = if (m) |b| blk: {
-                    const base = @as(u64, b.len) + 4;
-                    if (base > @as(u64, iv.MAX_CAPACITY)) break :blk 0 // genuinely oversize → linked
-                    else break :blk try plainCap(b.len, s.headroom);
-                } else 0;
-                ops.append(self.alloc, .{ .op = T_RECORD, .recid = recid, .cap = @intCast(cap_l), .data = m }) catch return error.OutOfMemory;
+                const cap = recordCap(m, s.headroom);
+                ops.append(self.alloc, .{ .op = T_RECORD, .recid = recid, .cap = @intCast(cap), .data = m }) catch return error.OutOfMemory;
             } else {
-                // live base in inner: log only the appended tail.
+                // Live plain base in inner: log only the appended tail.
                 const m = self.alloc.alloc(u8, s.appends_len) catch return error.OutOfMemory;
                 errdefer self.alloc.free(m);
                 var p: usize = 0;
@@ -853,287 +341,328 @@ const WalState = struct {
                     @memcpy(m[p .. p + a.len], a);
                     p += a.len;
                 }
-                ops.append(self.alloc, .{ .op = T_APPEND, .recid = recid, .cap = 0, .data = m }) catch return error.OutOfMemory;
+                // This branch is reached only when the record is committed,
+                // content-bearing and plain, which is exactly the shape that
+                // has a content base — so the identity must be there. Its
+                // absence is a writer bug, and the design's weakest point is a
+                // WRONG stamp, so refuse to invent one: a delta with a
+                // fabricated base is a silent-loss channel. (Java raises an
+                // `AssertionError` here; zig aborts, which is the same "this
+                // store has a bug" verdict without the store-open caveat.)
+                const base_lsn = self.ids.content_base_lsn.get(recid) orelse
+                    std.debug.panic("no content base LSN for appended recid {d}", .{recid});
+                ops.append(self.alloc, .{ .op = T_APPEND, .recid = recid, .cap = 0, .data = m, .base_lsn = base_lsn }) catch return error.OutOfMemory;
+            }
+        }
+        return ops;
+    }
+
+    /// The LSN the next section may use, refusing BEFORE anything is written
+    /// when the space is exhausted.
+    ///
+    /// The reference advances `nextLsn` with an unchecked `long` add
+    /// (`StoreWAL.java:1838-1883`). The ports refuse instead — the adopted
+    /// divergence of §4 D6 / §7 Q8, already implemented on the recovery side —
+    /// and the check must happen HERE, before the write: advancing after the
+    /// force would durably land a section at `i64::MAX` with a wrapped
+    /// successor, which is neither the reference's ruling nor the port's.
+    fn reserveLsn(self: *const WalState) DbError!struct { lsn: i64, after: i64 } {
+        const lsn = self.next_lsn;
+        const after = std.math.add(i64, lsn, 1) catch return error.StoreFull;
+        return .{ .lsn = lsn, .after = after };
+    }
+
+    fn commitLocked(self: *WalState, closed: *std.atomic.Value(bool)) DbError!void {
+        if (self.staged.count() == 0) return;
+        // The Diag protocol: cleared on entry so it always describes THIS
+        // commit's failure or nothing.
+        self.diag = .{};
+        var ops = try self.classify();
+        defer freeOps(self.alloc, &ops);
+        const r = try self.reserveLsn();
+        // Validated BEFORE `appendSection` can roll over or write, so a
+        // mis-stamped delta fails with nothing on the device.
+        for (ops.items) |op| {
+            if (op.op == T_APPEND and r.lsn <= op.base_lsn) {
+                std.debug.panic("append base LSN {d} is not below its section LSN {d}, recid={d}", .{ op.base_lsn, r.lsn, op.recid });
             }
         }
 
-        // build the section body.
-        var body = DataOutput2.init(self.alloc);
-        defer body.deinit();
+        // The emitter runs TWICE (measure + write passes) over this immutable
+        // ops snapshot, so a commit staging more than 2 GiB emits one genuinely
+        // huge section instead of dying in a doubling buffer. Deterministic by
+        // construction: `ops`, their payloads and the section LSN are all
+        // fixed before the first pass.
+        var ectx = EmitCtx{ .ops = ops.items, .section_lsn = r.lsn, .alloc = self.alloc };
+        appendSection(&self.segs, self.segment_bytes, self.segs.io, TAG_SECTION, r.lsn, self.alloc, &ectx, emitEntries) catch |e| {
+            // W9: a failed or partial write/force fails the store CLOSED, so no
+            // retry can append a complete section after the partial bytes. The
+            // error keeps its identity (`OutOfMemory` stays operational — risk
+            // 14); the reason says which phase failed.
+            self.diag.note(W_COMMIT_WRITE, self.activeSeq(), 0, 0, 0);
+            self.failClosed(closed);
+            return e;
+        };
+        self.next_lsn = r.after;
+        // The cleaner's staleness clock: SELF-CONTAINED entries only. An append
+        // extends a record whose image is already the log's youngest, so it
+        // obsoletes nothing, while a record, a delete and a prealloc each
+        // supersede whatever stood before.
         for (ops.items) |op| {
             switch (op.op) {
-                T_PREALLOC, T_DELETE => {
-                    try body.writeByte(op.op);
-                    try body.packLong(op.recid);
-                },
-                T_RECORD => {
-                    try body.writeByte(T_RECORD);
-                    try body.packLong(op.recid);
-                    try body.packLong(@as(u64, op.cap));
-                    if (op.data) |d| {
-                        try body.packLong(@as(u64, d.len) + 1);
-                        try body.writeAll(d);
-                    } else {
-                        try body.packLong(0);
-                    }
-                },
-                T_APPEND => {
-                    try body.writeByte(T_APPEND);
-                    try body.packLong(op.recid);
-                    const d = op.data.?;
-                    try body.packLong(@as(u64, d.len));
-                    try body.writeAll(d);
-                },
-                else => {}, // op 0: not logged
-            }
-        }
-
-        // section header (tag, lsn, bodyLen) + CRCs; fsync = durability point (D1).
-        const body_bytes = body.bytes();
-        var hdr: [SEC_HDR]u8 = undefined;
-        hdr[0] = TAG_SECTION;
-        putI64Be(&hdr, 1, self.next_lsn);
-        putI64Be(&hdr, 9, @as(i64, @intCast(body_bytes.len)));
-        putI32Be(&hdr, 17, @as(i32, @bitCast(crc32(hdr[0..SEC_HDR_CRC_LEN]))));
-        putI32Be(&hdr, 21, @as(i32, @bitCast(crc32(body_bytes))));
-        self.file.pwriteAll(&hdr, self.log_pos) catch return error.Io;
-        self.file.pwriteAll(body_bytes, self.log_pos + @as(u64, SEC_HDR)) catch return error.Io;
-        self.file.sync() catch return error.Io;
-        self.log_pos += @as(u64, SEC_HDR) + body_bytes.len;
-        self.next_lsn += 1;
-
-        // apply to the inner volume.
-        for (ops.items) |op| {
-            switch (op.op) {
-                0 => try self.inner.delete(op.recid), // created+deleted: free the P recid
-                T_PREALLOC => {}, // already P in inner since op time
-                T_RECORD => try self.inner.walPut(op.recid, op.cap, op.data),
-                T_APPEND => {
-                    const d = op.data.?;
-                    switch (try self.inner.append(op.recid, d)) {
-                        .refused => return error.DataCorruption, // commit append refused
-                        .new_size => {},
-                    }
-                },
-                T_DELETE => try self.inner.delete(op.recid),
+                T_RECORD, T_DELETE, T_PREALLOC => self.committed_state_changes += 1,
                 else => {},
             }
         }
-        self.clearStaged();
-        try self.maybeAutoCheckpointLocked(path);
-    }
 
-    fn maybeAutoCheckpointLocked(self: *WalState, path: []const u8) DbError!void {
-        const limit = self.auto_checkpoint_bytes;
-        if (limit <= 0) return;
-        const doubled = self.checkpoint_basis *| 2;
-        if (self.log_pos >= @max(@as(u64, @intCast(limit)), doubled)) {
-            try self.checkpointLocked(path);
-        }
-    }
-
-    // ---------- checkpoint ----------
-
-    /// Rewrite the log as one snapshot section of the inner store's committed
-    /// state, atomically replacing the log. The rename is the commit point.
-    fn checkpointLocked(self: *WalState, path: []const u8) DbError!void {
-        if (self.poisoned) return error.DataCorruption; // WAL poisoned by an earlier durability failure
-        if (self.next_lsn == std.math.maxInt(i64)) return error.DataCorruption; // WAL LSN space exhausted
-        const tmp = try ckptTmp(self.alloc, path);
-        defer self.alloc.free(tmp);
-        std.fs.cwd().deleteFile(tmp) catch {};
-
-        // 1) stream the snapshot section to the temp file, make it durable. Keep
-        // `out` open PAST the rename so it installs directly as the new log
-        // handle (reopening `path` after the rename and failing would strand the
-        // store on the now-unlinked pre-checkpoint inode).
-        const out = std.fs.cwd().createFile(tmp, .{ .read = true, .exclusive = true }) catch return error.Io;
-        var keep_out = false;
-        errdefer if (!keep_out) out.close();
-        try writeFileHeader(out);
-        // placeholder section header, patched below.
-        out.pwriteAll(&[_]u8{0} ** SEC_HDR, FILE_HDR) catch return error.Io;
-
-        var hdr: [SEC_HDR]u8 = undefined;
-        var body_size: u64 = undefined;
-        {
-            var w = SnapshotWriter.init(out, FILE_HDR + @as(u64, SEC_HDR), self.alloc);
-            defer w.deinit();
-            try self.inner.walSnapshot(&w);
-            try w.flush();
-            const body_crc = @as(i32, @bitCast(w.crc.final()));
-            hdr[0] = TAG_CKPT;
-            putI64Be(&hdr, 1, self.next_lsn);
-            putI64Be(&hdr, 9, @as(i64, @intCast(w.body_len)));
-            putI32Be(&hdr, 17, @as(i32, @bitCast(crc32(hdr[0..SEC_HDR_CRC_LEN]))));
-            putI32Be(&hdr, 21, body_crc);
-            body_size = w.body_len;
-        }
-        out.pwriteAll(&hdr, FILE_HDR) catch return error.Io;
-        out.sync() catch return error.Io; // snapshot fully durable before it may replace the log
-        const size = FILE_HDR + @as(u64, SEC_HDR) + body_size;
-
-        // 2) atomic swap: the rename is the checkpoint's commit point. Install
-        // the retained handle and advance in-memory state BEFORE the (fallible)
-        // directory fsync, so the store is always consistent with the promoted
-        // file even if that final durability step returns an error.
-        std.posix.rename(tmp, path) catch return error.Io;
-        keep_out = true;
-        self.file.close();
-        self.file = out;
-        self.log_pos = size;
-        self.checkpoint_basis = size;
-        self.next_lsn += 1; // the snapshot section consumed one LSN
-        // The rename is visible but its directory-entry durability is unconfirmed
-        // if this fsync fails; POSIX does not guarantee a later file sync makes
-        // the rename durable. Poison so no subsequent commit/checkpoint can
-        // report false durability until the store is reopened.
-        fsyncDir(path) catch |e| {
-            self.poisoned = true;
+        // Apply to the inner volume. PAST THE DURABILITY POINT: the section is
+        // on disk and owns an LSN, so if any apply fails, memory and log have
+        // diverged and this handle can never be made consistent again — a
+        // retried commit would re-emit the same frames under a NEW section LSN
+        // and the forced one would be applied twice on reopen. Fail closed; the
+        // durable state on disk is intact and reopen replays it. The error
+        // keeps its identity (rust wraps it into a corruption MESSAGE, which
+        // `DbError` cannot carry — and reclassifying an operational failure as
+        // corruption is the lie the B1 review named); the phase travels in the
+        // Diag unless the apply already recorded a more specific reason.
+        self.applyCommitted(ops.items, r.lsn) catch |e| {
+            if (self.diag.reason.len == 0)
+                self.diag.note(W_COMMIT_APPLY, 0, 0, 0, 0);
+            self.failClosed(closed);
             return e;
         };
+        self.clearStaged();
+        try self.autoCleanLocked(closed);
+    }
+
+    /// Applies one committed section's ops and moves the identities by the SAME
+    /// §4.2 transition row replay would take for the entry just written — that
+    /// shared table is what keeps the live maps and a rebuilt-from-log copy
+    /// identical.
+    fn applyCommitted(self: *WalState, ops: []const WalOp, section_lsn: i64) DbError!void {
+        for (ops) |op| {
+            switch (op.op) {
+                T_TRANSIENT => {
+                    try self.inner.delete(op.recid); // created+deleted: free the P recid
+                    // Nothing was logged, so nothing established an identity
+                    // for this incarnation; clearing is defensive, not
+                    // load-bearing.
+                    self.ids.voided(op.recid);
+                },
+                T_PREALLOC => {
+                    // Already P in inner since op time.
+                    try self.ids.stateOnly(self.alloc, op.recid, section_lsn);
+                },
+                T_RECORD => {
+                    try self.inner.walPut(op.recid, op.cap, op.data);
+                    if (op.data == null) {
+                        try self.ids.stateOnly(self.alloc, op.recid, section_lsn);
+                    } else {
+                        try self.ids.content(self.alloc, op.recid, section_lsn);
+                    }
+                },
+                T_APPEND => {
+                    const d = op.data.?; // T_APPEND carries its payload
+                    switch (try self.inner.append(op.recid, d)) {
+                        .refused => {
+                            self.diag.note(W_COMMIT_APPEND_REFUSED, 0, 0, op.recid, 0);
+                            return error.DataCorruption;
+                        },
+                        .new_size => {},
+                    }
+                    // An append leaves both identities where they are: the base
+                    // image it extends is still the one a later append cites.
+                },
+                T_DELETE => {
+                    try self.inner.delete(op.recid);
+                    self.ids.voided(op.recid);
+                },
+                else => unreachable, // unknown classified op
+            }
+        }
+    }
+
+    /// The store cannot be made consistent again: close it rather than let a
+    /// caller retry into a segment holding partial bytes. Durable state on
+    /// disk is intact and reopen replays it.
+    fn failClosed(self: *WalState, closed: *std.atomic.Value(bool)) void {
+        closed.store(true, .release);
+        self.segs.close();
+        self.inner.close() catch {};
+    }
+
+    /// B3 STUB — the automatic cleaning hook inside commit (Java's
+    /// `cleanTickLocked` wrapper). The trigger (`logBytes > max(min_log_bytes,
+    /// space_amplification × liveDataBytes)`), the bounded foreground slice and
+    /// the futility latch all land with the cleaner. Until then commits never
+    /// clean, which is exactly why this branch does not merge before B3.
+    fn autoCleanLocked(self: *WalState, closed: *std.atomic.Value(bool)) DbError!void {
+        _ = self;
+        _ = closed;
+    }
+
+    fn activeSeq(self: *WalState) i64 {
+        return if (self.segs.active()) |a| a.seq else 0;
     }
 };
 
-/// Recover a store directly from a complete `<file>.ckpt` snapshot (crash after
-/// the snapshot was fsynced but before the atomic rename). Returns `null` if the
-/// temp is absent; `error` if present but not a complete v1 snapshot.
-fn tryRecoverFromCkptTemp(alloc: Allocator, path: []const u8, tmp: []const u8, thread_safe: bool, replay_buf: usize) DbError!?WalState {
-    if (!pathExists(tmp)) return null;
-    var inner = try StoreDirect.init(alloc, thread_safe);
-    var inner_ok = false;
-    errdefer if (!inner_ok) inner.deinit();
+fn freeOps(alloc: Allocator, ops: *std.ArrayListUnmanaged(WalOp)) void {
+    for (ops.items) |op| if (op.data) |d| alloc.free(d);
+    ops.deinit(alloc);
+}
 
-    const tmp_file = std.fs.cwd().openFile(tmp, .{ .mode = .read_write }) catch return error.Io;
-    var file_ok = false;
-    errdefer if (!file_ok) tmp_file.close();
+// ------------------------------------------------------------ entry framing
 
-    const size = (tmp_file.stat() catch return error.Io).size;
-    if (!try isV1(tmp_file, size)) return error.DataCorruption; // checkpoint temp is not a v1 WAL snapshot
-    if (size < FILE_HDR + @as(u64, SEC_HDR)) return error.DataCorruption; // missing snapshot section
-    var hdr: [SEC_HDR]u8 = undefined;
-    _ = tmp_file.preadAll(&hdr, FILE_HDR) catch return error.Io;
-    const h = parseSecHdr(&hdr);
-    const body_start = FILE_HDR + @as(u64, SEC_HDR);
-    const hdr_ok = @as(i32, @bitCast(crc32(hdr[0..SEC_HDR_CRC_LEN]))) == h.hdr_crc;
-    // LSN must be positive with an available successor; body must exactly fill.
-    if (h.tag != TAG_CKPT or
-        !hdr_ok or
-        h.lsn <= 0 or
-        h.lsn == std.math.maxInt(i64) or
-        h.body_len < 0 or
-        body_start + @as(u64, @intCast(h.body_len)) != size)
-        return error.DataCorruption; // checkpoint temp is not a complete snapshot
-    if ((bodyCrc(tmp_file, body_start, size, replay_buf, alloc) catch |e| return fatalOnly(e)) != @as(u32, @bitCast(h.body_crc)))
-        return error.DataCorruption; // checkpoint temp body CRC mismatch
-    {
-        var win = try WalIn.init(tmp_file, alloc, replay_buf);
-        defer win.deinit();
-        applySection(&inner, &win, body_start, size) catch |e| return fatalOnly(e);
+const EmitCtx = struct {
+    ops: []const WalOp,
+    section_lsn: i64,
+    alloc: Allocator,
+};
+
+/// Emits the §4.2 entry frames for one section body. Runs once per pass; both
+/// passes see the same immutable ops, so the output is identical by
+/// construction. Large payloads are written as their own sink calls, which the
+/// sink routes past its coalescing buffer.
+fn emitEntries(ctx: *const EmitCtx, sink: *BodySink) DbError!void {
+    for (ctx.ops) |op| {
+        var frame = DataOutput2.init(ctx.alloc);
+        defer frame.deinit();
+        switch (op.op) {
+            T_PREALLOC, T_DELETE => {
+                try frame.writeU8(op.op);
+                try frame.packLong(op.recid);
+            },
+            T_RECORD => {
+                try frame.writeU8(T_RECORD);
+                try frame.packLong(op.recid);
+                try frame.packLong(@as(u64, op.cap));
+                try frame.packLong(if (op.data) |d| @as(u64, d.len) + 1 else 0);
+            },
+            T_APPEND => {
+                try frame.writeU8(T_APPEND);
+                try frame.packLong(op.recid);
+                // Base identity, as a delta against this section's own LSN
+                // (§4.2): >= 1 by construction, because the base was
+                // established by a strictly earlier section, and typically one
+                // byte because a hot record's base is recent.
+                try frame.packLong(@as(u64, @intCast(ctx.section_lsn - op.base_lsn)));
+                try frame.packLong(@as(u64, op.data.?.len));
+            },
+            T_TRANSIENT => continue, // not logged
+            else => unreachable, // unknown classified op
+        }
+        try sink.write(frame.bytes());
+        if (op.op == T_RECORD or op.op == T_APPEND) {
+            if (op.data) |d| try sink.write(d);
+        }
     }
-    try inner.rebuildFreeRecids();
-
-    // promote temp → log (atomic), then reopen the log.
-    tmp_file.close();
-    file_ok = true; // tmp_file handle consumed; do not double-close on errdefer
-    std.posix.rename(tmp, path) catch return error.Io;
-    try fsyncDir(path);
-    const file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch return error.Io;
-    var log_ok = false;
-    errdefer if (!log_ok) file.close();
-    const log_pos = (file.stat() catch return error.Io).size;
-    const next_lsn = std.math.add(i64, h.lsn, 1) catch return error.DataCorruption; // WAL LSN space exhausted
-    log_ok = true;
-    inner_ok = true;
-    return WalState{
-        .inner = inner,
-        .file = file,
-        .next_lsn = next_lsn,
-        .checkpoint_basis = size,
-        .auto_checkpoint_bytes = DEFAULT_AUTO_CHECKPOINT_BYTES,
-        .log_pos = log_pos,
-        .replay_buf = replay_buf,
-        .alloc = alloc,
-    };
 }
 
 // ---------------------------------------------------------------- StoreWAL
 
-/// Transactional store. One global writer behind `rw`.
+/// Transactional store (spec 02 §7). One global writer behind `rw`.
 pub const StoreWAL = struct {
     const Self = @This();
 
     rw: std.Thread.RwLock = .{},
     state: WalState,
-    path: []u8,
+    /// The store's BASE path — `<base>.wal.<16 hex>` are its segments.
+    /// Absolutized by the namespace layer; this is the caller's spelling.
+    base: []u8,
     lease_table: LeaseTable,
     closed: std.atomic.Value(bool),
     /// Bumped on every `rollback` so open collections know their append-only
-    /// structural caches (e.g. the btree left-edge spine) may have been reverted
-    /// to a shorter tree and must be rebuilt before the next structural op.
+    /// structural caches (e.g. the btree left-edge spine) may have been
+    /// reverted to a shorter tree and must be rebuilt before the next
+    /// structural op.
     struct_gen: std.atomic.Value(u64),
+    /// D2: delete the whole namespace inside `close`, while the lock is still
+    /// held. Set by the DB layer's delete-after-close mode.
+    delete_on_close: std.atomic.Value(bool),
     alloc: Allocator,
-    /// TCK convenience: `init` created a temp file that `deinit` must remove.
-    tmp_owned: bool,
+    /// TCK convenience: `init` created a temp dir that `deinit` must remove.
+    tmp_dir: ?[]u8 = null,
 
     // ---------- construction ----------
 
-    /// Open (creating if absent) the WAL-backed store at `path` (relative cwd).
-    /// Replays any committed sections and recovers a crash-during-checkpoint
-    /// temp; a torn tail truncates, mid-log corruption fails `DataCorruption`.
-    /// `path` is copied (borrowed). The caller owns the returned store and must
-    /// `deinit` it. `thread_safe` selects the segment-lock bank of the inner
-    /// StoreDirect (the WAL itself is always single-writer under one RwLock).
-    pub fn open(alloc: Allocator, path: []const u8, thread_safe: bool) DbError!Self {
-        return openWith(alloc, path, thread_safe, DEFAULT_REPLAY_BUF, false);
+    /// Opens the store at `base` (creating a fresh namespace if absent); its
+    /// segments are `<base>.wal.<16 hex>`. Refuses (D1, deleting nothing) a
+    /// regular file at `<base>` or `<base>.wal` and anything at `<base>.ckpt`.
+    /// The caller owns the returned store and must `deinit` it. `thread_safe`
+    /// selects the segment-lock bank of the inner StoreDirect (the WAL itself
+    /// is always single-writer under one RwLock).
+    pub fn open(alloc: Allocator, base: []const u8, thread_safe: bool) DbError!Self {
+        return openCfg(alloc, base, .{ .thread_safe = thread_safe });
     }
 
-    /// `replay_buf` is a test hook: a tiny window forces refill edges in replay.
-    pub fn openWith(alloc: Allocator, path: []const u8, thread_safe: bool, replay_buf: usize, tmp_owned: bool) DbError!Self {
-        const path_owned = alloc.dupe(u8, path) catch return error.OutOfMemory;
-        errdefer alloc.free(path_owned);
-        const tmp = try ckptTmp(alloc, path);
-        defer alloc.free(tmp);
-        const created = !pathExists(path);
+    /// `replay_buf` is a test hook: a tiny window forces refill edges in
+    /// streaming replay.
+    pub fn openWith(alloc: Allocator, base: []const u8, thread_safe: bool, replay_buf: usize) DbError!Self {
+        return openCfg(alloc, base, .{ .thread_safe = thread_safe, .replay_buf = replay_buf });
+    }
 
-        // crash-during-checkpoint recovery: a complete temp snapshot wins.
-        if (created and pathExists(tmp)) {
-            if (try tryRecoverFromCkptTemp(alloc, path, tmp, thread_safe, replay_buf)) |state| {
-                return wrap(alloc, path_owned, state, tmp_owned);
-            }
+    /// Opens with a non-default segment size. Rollover happens at a section
+    /// boundary PAST this many bytes, so one section may exceed it.
+    pub fn openSegmentBytes(alloc: Allocator, base: []const u8, segment_bytes: u64) DbError!Self {
+        return openCfg(alloc, base, .{ .segment_bytes = segment_bytes });
+    }
+
+    pub fn openCfg(alloc: Allocator, base: []const u8, opts: WalOptions) DbError!Self {
+        if (opts.segment_bytes < MIN_SEGMENT_BYTES) {
+            return error.WrongConfiguration; // WAL segment size below the 61-byte minimum (a segment header plus one section header)
         }
-
-        var inner = try StoreDirect.init(alloc, thread_safe);
-        // `inner`/`file` are moved into `state` below; thereafter ONLY `state`'s
-        // copies are used or freed (a StoreDirect that has been operated on must
-        // never be freed through a stale copy — its Shared/index_pages diverge).
-        const file = std.fs.cwd().createFile(path, .{ .read = true, .truncate = false }) catch {
+        // D4, the platform gate: a durable writable open REQUIRES a working
+        // directory fsync — the acknowledgement rule is "the section is forced
+        // AND the directory entry of the segment holding it is durable" — and
+        // Windows cannot express one. Refused BY NAME at open, with no
+        // override: an escape hatch that skipped the fsync would make
+        // acknowledged commits undurable across a crash while appearing to
+        // work. The predicate is Java's exact one (an OS test, not a probe).
+        // Read-only opens are exempt — they unlink, truncate and rotate
+        // nothing, so they make no durability claim a missing directory fsync
+        // could break.
+        if (!opts.read_only and builtin.os.tag == .windows) {
+            return error.WrongConfiguration; // StoreWAL durable mode is unsupported on Windows
+        }
+        const base_owned = alloc.dupe(u8, base) catch return error.OutOfMemory;
+        errdefer alloc.free(base_owned);
+        var inner = try StoreDirect.init(alloc, opts.thread_safe);
+        var segs = WalSegmentSet.openWithIo(alloc, base, opts.read_only, opts.io) catch |e| {
             inner.deinit();
-            return error.Io;
-        };
-        var state = WalState{
-            .inner = inner,
-            .file = file,
-            .next_lsn = 1,
-            .checkpoint_basis = 0,
-            .auto_checkpoint_bytes = DEFAULT_AUTO_CHECKPOINT_BYTES,
-            .log_pos = FILE_HDR,
-            .replay_buf = replay_buf,
-            .alloc = alloc,
-        };
-        state.recoverOpenedChannel(created, path) catch |e| {
-            state.clearStaged();
-            state.staged.deinit(alloc);
-            state.inner.deinit();
-            state.file.close();
             return e;
         };
-        return wrap(alloc, path_owned, state, tmp_owned);
+        // A failed recovery closes and frees the set, which releases the store
+        // lock — Java's `finally { closeQuietly() }`.
+        var local_diag: Diag = .{};
+        const diag = opts.diag orelse &local_diag;
+        const rec = wr.recover(&segs, &inner, opts.replay_buf, alloc, diag) catch |e| {
+            segs.deinit();
+            inner.deinit();
+            return e;
+        };
+        return .{
+            .state = .{
+                .inner = inner,
+                .segs = segs,
+                .ids = rec.identities,
+                .next_lsn = rec.next_lsn,
+                .segment_bytes = opts.segment_bytes,
+                .read_only = opts.read_only,
+                .alloc = alloc,
+            },
+            .base = base_owned,
+            .lease_table = LeaseTable.init(alloc),
+            .closed = std.atomic.Value(bool).init(false),
+            .struct_gen = std.atomic.Value(u64).init(0),
+            .delete_on_close = std.atomic.Value(bool).init(false),
+            .alloc = alloc,
+        };
     }
 
     /// TCK / heap-signature convenience constructor (deviation — see PORT
-    /// PROGRESS). Opens a fresh WAL on a uniquely-named temp file in cwd; the
-    /// file is removed by `deinit`. `open`/`openWith` are the real constructors.
+    /// PROGRESS). Opens a fresh WAL namespace in a uniquely-named temp dir
+    /// under cwd; `deinit` removes the whole dir. `open`/`openCfg` are the
+    /// real constructors.
     pub fn init(alloc: Allocator, thread_safe: bool) DbError!Self {
         const N = struct {
             var counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
@@ -1141,42 +670,30 @@ pub const StoreWAL = struct {
         const n = N.counter.fetchAdd(1, .monotonic);
         const pid = std.os.linux.getpid();
         var buf: [128]u8 = undefined;
-        const name = std.fmt.bufPrint(&buf, "mapdb5_wal_tck_{d}_{d}.wal", .{ pid, n }) catch return error.OutOfMemory;
-        std.fs.cwd().deleteFile(name) catch {};
-        var ckbuf: [160]u8 = undefined;
-        const ck = std.fmt.bufPrint(&ckbuf, "{s}.ckpt", .{name}) catch return error.OutOfMemory;
-        std.fs.cwd().deleteFile(ck) catch {};
-        return openWith(alloc, name, thread_safe, DEFAULT_REPLAY_BUF, true);
-    }
-
-    fn wrap(alloc: Allocator, path_owned: []u8, state: WalState, tmp_owned: bool) Self {
-        return .{
-            .state = state,
-            .path = path_owned,
-            .lease_table = LeaseTable.init(alloc),
-            .closed = std.atomic.Value(bool).init(false),
-            .struct_gen = std.atomic.Value(u64).init(0),
-            .alloc = alloc,
-            .tmp_owned = tmp_owned,
-        };
+        const dir_name = std.fmt.bufPrint(&buf, "mapdb5_wal_tck_{d}_{d}.d", .{ pid, n }) catch unreachable;
+        std.fs.cwd().deleteTree(dir_name) catch {};
+        std.fs.cwd().makeDir(dir_name) catch return error.Io;
+        var base_buf: [160]u8 = undefined;
+        const base = std.fmt.bufPrint(&base_buf, "{s}/store", .{dir_name}) catch unreachable;
+        var s = try openCfg(alloc, base, .{ .thread_safe = thread_safe });
+        errdefer s.deinit();
+        s.tmp_dir = alloc.dupe(u8, dir_name) catch return error.OutOfMemory;
+        return s;
     }
 
     pub fn deinit(self: *Self) void {
         if (!self.closed.load(.acquire)) self.close() catch {};
         self.state.clearStaged();
         self.state.staged.deinit(self.alloc);
+        self.state.ids.deinit(self.alloc);
+        self.state.segs.deinit();
         self.state.inner.deinit();
-        self.state.file.close();
         self.lease_table.deinit();
-        if (self.tmp_owned) {
-            std.fs.cwd().deleteFile(self.path) catch {};
-            const tmp = ckptTmp(self.alloc, self.path) catch null;
-            if (tmp) |t| {
-                std.fs.cwd().deleteFile(t) catch {};
-                self.alloc.free(t);
-            }
+        if (self.tmp_dir) |d| {
+            std.fs.cwd().deleteTree(d) catch {};
+            self.alloc.free(d);
         }
-        self.alloc.free(self.path);
+        self.alloc.free(self.base);
     }
 
     // ---------- helpers ----------
@@ -1185,36 +702,24 @@ pub const StoreWAL = struct {
         if (self.closed.load(.acquire)) return error.StoreClosed;
     }
 
-    /// In-lock read gate: recheck `closed` AFTER acquiring the shared lock. A
-    /// `close` that completes between the pre-lock fast check and lock
-    /// acquisition otherwise lets a staged read return post-close content (the
-    /// staged branch never delegates to `inner`, so its result would be
-    /// race-dependent). Reads on a *poisoned* store are still permitted.
+    /// In-lock read gate: recheck `closed` AFTER acquiring the shared lock.
+    /// `close` publishes `closed` under the WRITE lock and tears the state
+    /// down there, so a check taken before acquiring can be overtaken — and
+    /// the result is observably wrong rather than untidy: a `get` of a record
+    /// staged with `base_set` answers from the staged base without touching
+    /// the (now closed) inner store, and `capacityRemaining` on it would
+    /// answer `maxInt(usize)`. Java takes the read lock first and checks under
+    /// it (`StoreWAL.java:1359-1386`).
     fn readGate(self: *Self) DbError!void {
         if (self.closed.load(.acquire)) return error.StoreClosed;
     }
 
     /// In-lock mutation gate: under the write lock, reject a closed store
-    /// (linearized close) OR a poisoned one. A poisoned
-    /// WAL's namespace durability is indeterminate, so it must accept no further
-    /// staged/inner mutation that could never commit; the error identity matches
-    /// what commit/checkpoint already return for a poisoned store (Rust
-    /// `DbError::corrupt`). Every mutation path calls this immediately after
-    /// acquiring `rw`. `close` is the intentional exception (it must retry the
-    /// directory fsync and release resources).
+    /// (linearized close) or a read-only one. Every mutation path calls this
+    /// immediately after acquiring `rw`. `close` is the intentional exception.
     fn writeGate(self: *Self) DbError!void {
         if (self.closed.load(.acquire)) return error.StoreClosed;
-        if (self.state.poisoned) return error.DataCorruption; // WAL poisoned by an earlier durability failure
-    }
-
-    /// Test-only: force the poison flag. The durability-failure state is
-    /// otherwise reachable only via a directory-fsync failure this environment
-    /// cannot inject; the poison-gating test uses this to prove
-    /// every mutation path is gated.
-    pub fn poisonForTest(self: *Self) void {
-        self.rw.lock();
-        defer self.rw.unlock();
-        self.state.poisoned = true;
+        if (self.state.read_only) return error.ReadOnly;
     }
 
     /// Serialize a value with the store's allocator (outside any lock, Java/Rust).
@@ -1223,6 +728,115 @@ pub const StoreWAL = struct {
         errdefer out.deinit();
         try ser.serialize(&out, value);
         return out.toOwnedSlice();
+    }
+
+    // ---------- config (D8) ----------
+
+    /// Floor under the cleaning trigger (D8): a log smaller than this is never
+    /// cleaned automatically, however small the live data is. 0 disables
+    /// automatic cleaning.
+    pub fn setMinLogBytes(self: *Self, bytes: u64) DbError!void {
+        // Lock FIRST, then re-check under it: `close` publishes `closed` while
+        // holding this same lock, so a check taken before acquiring it can be
+        // overtaken and the setter would then mutate a torn-down state and
+        // report success (Java holds the write lock across its check,
+        // StoreWAL.java:2107-2135).
+        self.rw.lock();
+        defer self.rw.unlock();
+        try self.writeGate();
+        self.state.min_log_bytes = bytes;
+        // B3: a configuration change also abandons the cleaning episode in
+        // progress, latch included (`abandon_episode`).
+    }
+
+    /// Size past which the writer seals the active segment and rolls to the
+    /// next one (D8). Tuning knob and test hook, exactly as in the reference
+    /// (`StoreWAL.java:2171-2181`): the rollover itself always happens at a
+    /// section boundary (W3), so a single section larger than this simply gets
+    /// a segment of its own.
+    ///
+    /// The same floor as the open-time option — a segment below it cannot hold
+    /// one section — and, like Java, the floor is checked BEFORE the lock, so
+    /// a bad argument is refused identically on an open and on a closed store.
+    pub fn setSegmentBytes(self: *Self, bytes: u64) DbError!void {
+        if (bytes < MIN_SEGMENT_BYTES) return error.WrongConfiguration;
+        // See `setMinLogBytes`: lock first, re-check under it. (Java does not
+        // abandon the cleaning episode here, and neither do the ports — the
+        // omission is faithful.)
+        self.rw.lock();
+        defer self.rw.unlock();
+        try self.writeGate();
+        self.state.segment_bytes = bytes;
+    }
+
+    /// Space-amplification target (D8): clean once the log exceeds this
+    /// multiple of the live data.
+    pub fn setSpaceAmplification(self: *Self, factor: u32) DbError!void {
+        if (factor == 0) return error.WrongConfiguration; // must be at least 1
+        // See `setMinLogBytes`: lock first, re-check under it.
+        self.rw.lock();
+        defer self.rw.unlock();
+        try self.writeGate();
+        self.state.space_amplification = factor;
+        // B3: also `abandon_episode`.
+    }
+
+    /// D2: delete this base's whole segment namespace inside [`close`], while
+    /// the store lock is still held. Used by the DB layer's delete-after-close
+    /// and temporary-store modes.
+    pub fn setDeleteOnClose(self: *Self, on: bool) void {
+        self.delete_on_close.store(on, .release);
+    }
+
+    // ---------- observers ----------
+
+    /// Bytes the log currently costs on the device.
+    pub fn logBytes(self: *Self) DbError!u64 {
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
+        try self.readGate();
+        return self.state.segs.logBytes();
+    }
+
+    /// Sequence numbers of the live segments, ascending. Caller frees.
+    pub fn segmentSeqs(self: *Self, alloc: Allocator) DbError![]i64 {
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
+        const segs = self.state.segs.segmentsSlice();
+        const out = alloc.alloc(i64, segs.len) catch return error.OutOfMemory;
+        for (segs, 0..) |s, i| out[i] = s.seq;
+        return out;
+    }
+
+    /// The LSN the next section will carry.
+    pub fn nextLsn(self: *Self) i64 {
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
+        return self.state.next_lsn;
+    }
+
+    /// How many segment files this store currently holds open. The steady
+    /// state is at most ONE — the active segment — and that bound is the
+    /// point, so it is observable rather than merely intended.
+    pub fn openSegmentFiles(self: *Self) usize {
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
+        return self.state.segs.openFileCount();
+    }
+
+    /// The store's base path: its segments are `<base>.wal.<16 hex>`.
+    pub fn basePath(self: *const Self) []const u8 {
+        return self.base;
+    }
+
+    /// The store-level diagnostic (a copy): describes the most recent commit
+    /// failure this handle mapped, or nothing. Post-close reads are permitted
+    /// — the diag is exactly what a caller wants to inspect after W9 closed
+    /// the store.
+    pub fn lastDiag(self: *Self) Diag {
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
+        return self.state.diag;
     }
 
     // ---------- Store API ----------
@@ -1261,7 +875,6 @@ pub const StoreWAL = struct {
     pub fn get(self: *Self, comptime R: type, alloc: Allocator, recid: u64, ser: anytype) DbError!?R {
         comptime mod.checkSer(R, @TypeOf(ser));
         mod.assertNotInAction("get");
-        try self.checkClosed();
         self.rw.lockShared();
         defer self.rw.unlockShared();
         try self.readGate();
@@ -1279,7 +892,6 @@ pub const StoreWAL = struct {
 
     pub fn read(self: *Self, recid: u64, action: mod.RecordRead) DbError!i64 {
         mod.assertNotInAction("read");
-        try self.checkClosed();
         self.rw.lockShared();
         defer self.rw.unlockShared();
         try self.readGate();
@@ -1288,10 +900,8 @@ pub const StoreWAL = struct {
         if (s.deleted) return error.GetVoid;
         const m = try self.state.merged(recid, s);
         defer if (m) |mm| self.alloc.free(mm);
-        // ONE ActionGuard covers BOTH dispatch branches: the staged-null branch
-        // dispatched `callOnNull` without a guard, so a reentrant `on_null`
-        // action deadlocked on the shared lock instead of tripping the Debug
-        // assert.
+        // ONE ActionGuard covers BOTH dispatch branches: a reentrant `on_null`
+        // action must trip the Debug assert, not deadlock on the shared lock.
         var ag = mod.ActionGuard.enter();
         defer ag.exit();
         const mm = m orelse return action.callOnNull();
@@ -1310,10 +920,17 @@ pub const StoreWAL = struct {
         try self.checkClosed();
         const bytes: ?[]u8 = if (value) |v| try self.serializeVal(R, v, ser) else null;
         errdefer if (bytes) |b| self.alloc.free(b);
-        // Fail fast when a plain-sized content plus its headroom would exceed
-        // MAX_CAPACITY, rather than staging it and only failing at commit.
+        // Fail at update time, not commit time. Oversize CONTENT is fine
+        // (stored linked at commit) — but content that fits a plain record
+        // must also fit with its headroom, because linked records take no
+        // appends and silently going linked would break the guarantee the
+        // headroom was asked for.
         if (bytes) |b| {
-            if (@as(u64, b.len) + 4 <= @as(u64, iv.MAX_CAPACITY)) _ = try plainCap(b.len, headroom);
+            const plain = 4 +| @as(u64, b.len);
+            const max = @as(u64, iv.MAX_CAPACITY);
+            if (plain <= max and ((plain +| @as(u64, headroom) +| 15) & ~@as(u64, 15)) > max) {
+                return error.RecordTooLarge;
+            }
         }
         self.rw.lock();
         defer self.rw.unlock();
@@ -1354,13 +971,12 @@ pub const StoreWAL = struct {
             have_current = current != null;
         }
 
-        // Every remaining serializer callback made while `rw` is held — `equals`,
-        // the CAS-side `serialize(new)`, and the `deinitElem` cleanup — runs under
-        // ONE ActionGuard, so a reentrant callback trips the Debug assert instead
-        // of deadlocking on the global write lock (see
-        // the direct.zig:1382 pattern). Serialization stays under the lock. The
-        // `deinitElem` defer is registered AFTER entering, so LIFO frees it while
-        // the guard is still active.
+        // Every remaining serializer callback made while `rw` is held —
+        // `equals`, the CAS-side `serialize(new)`, and the `deinitElem`
+        // cleanup — runs under ONE ActionGuard, so a reentrant callback trips
+        // the Debug assert instead of deadlocking on the global write lock.
+        // The `deinitElem` defer is registered AFTER entering, so LIFO frees
+        // it while the guard is still active.
         var ag = mod.ActionGuard.enter();
         defer ag.exit();
         defer if (have_current) {
@@ -1399,64 +1015,53 @@ pub const StoreWAL = struct {
 
     pub fn commit(self: *Self) DbError!void {
         mod.assertNotInAction("commit");
+        // writeGate re-checks `closed` under the lock: otherwise a commit of a
+        // pure staged preallocation could append+force a section after `close`
+        // completed, since applying it does not touch the inner store.
         self.rw.lock();
         defer self.rw.unlock();
         try self.writeGate();
-        return self.state.commitLocked(self.path);
+        return self.state.commitLocked(&self.closed);
     }
 
+    /// B3 STUB — the whole-log clean (Java's `checkpoint()`: roll first, then
+    /// retire every segment below the fresh one by re-emitting a
+    /// self-contained image of every record they still own, a forced `'K'`
+    /// mark, and the unlink). Until the cleaner lands this is a no-op: the
+    /// log is unbounded on this branch, which is why the branch does not
+    /// reach `main` before B3. The v1 whole-file rewrite, its `.ckpt` temp
+    /// and its rename commit point are gone.
     pub fn checkpoint(self: *Self) DbError!void {
         mod.assertNotInAction("checkpoint");
         self.rw.lock();
         defer self.rw.unlock();
         try self.writeGate();
-        return self.state.checkpointLocked(self.path);
+        // B3: `cleanWholeLog(&self.closed)`.
     }
 
     pub fn compact(self: *Self) DbError!void {
         return self.checkpoint();
     }
 
-    pub fn setAutoCheckpointBytes(self: *Self, bytes: i64) DbError!void {
-        self.rw.lock();
-        defer self.rw.unlock();
-        // A mutating config path: gate on closed AND poisoned under the lock.
-        // Previously it checked `closed` only before acquiring.
-        try self.writeGate();
-        self.state.auto_checkpoint_bytes = bytes;
-    }
-
     pub fn close(self: *Self) DbError!void {
         // Acquire the write lock BEFORE publishing `closed`, so an in-flight
-        // commit/checkpoint that rechecks `closed` under the lock observes the
-        // close atomically (no append after close).
+        // commit that rechecks `closed` under the lock observes the close
+        // atomically (no append after close). Any op still runs to completion
+        // first (it holds the lock); we then win it and shut down.
         self.rw.lock();
         defer self.rw.unlock();
-        if (self.closed.swap(true, .acq_rel)) {
-            // Already closed — but if the first close's directory-fsync retry
-            // failed, the checkpoint rename's durability is STILL unconfirmed
-            // (`poisoned` stays set). Re-enter and retry the fsync (mirrors
-            // StoreDirect close re-entering while poisoned).
-            if (!self.state.poisoned) return;
-            fsyncDir(self.path) catch |e| return e;
-            self.state.poisoned = false;
-            return;
+        if (self.closed.swap(true, .acq_rel)) return; // double close is a no-op
+        // D2: the namespace deletion runs while the store lock is STILL HELD —
+        // close-then-delete would let a second opener acquire the namespace
+        // and have its live segments deleted underneath it. The deletion error
+        // is captured, both teardowns always run, and it takes precedence.
+        var deleted: DbError!void = {};
+        if (self.delete_on_close.load(.acquire) and !self.state.read_only) {
+            deleted = self.state.segs.deleteNamespace();
         }
-        // If a prior checkpoint left the rename's directory durability
-        // unconfirmed (poisoned), retry the directory fsync now.
-        var poison_err: ?DbError = null;
-        if (self.state.poisoned) {
-            if (fsyncDir(self.path)) {
-                self.state.poisoned = false;
-            } else |e| {
-                poison_err = e;
-            }
-        }
-        // Always release resources, then surface the durability error (if any).
-        const sync_res = self.state.file.sync();
+        self.state.segs.close();
         const inner_res = self.state.inner.close();
-        if (poison_err) |e| return e;
-        sync_res catch return error.Io;
+        try deleted;
         try inner_res;
     }
 
@@ -1465,7 +1070,6 @@ pub const StoreWAL = struct {
     }
 
     pub fn verify(self: *Self) DbError!void {
-        try self.checkClosed();
         self.rw.lockShared();
         defer self.rw.unlockShared();
         try self.readGate();
@@ -1473,7 +1077,6 @@ pub const StoreWAL = struct {
     }
 
     pub fn getAllRecids(self: *Self, alloc: Allocator) DbError![]u64 {
-        try self.checkClosed();
         self.rw.lockShared();
         defer self.rw.unlockShared();
         try self.readGate();
@@ -1538,8 +1141,34 @@ pub const StoreWAL = struct {
         self.rw.lock();
         defer self.rw.unlock();
         try self.writeGate();
-        // establishes GetVoid on deleted/void recids.
+        const was_staged = self.state.staged.contains(recid);
+        // Runs for its GetVoid validation even when nothing will be staged.
         _ = try self.state.stagedForWrite(recid);
+        if (data.len == 0) {
+            // A zero-length append stages NOTHING — not even the empty
+            // `Staged` entry `stagedForWrite` just left behind, which would
+            // turn a contract-defined no-op into a section at commit:
+            // T_PREALLOC on an untouched record (burning an LSN, and naming a
+            // content-live recid in a prealloc, which §4.2 rejects on replay),
+            // or a zero-length T_APPEND that `inner.append` REFUSES on a
+            // linked record — after the section is durable, so the refusal
+            // arrives on the post-durability path and fails the store closed.
+            if (!was_staged) self.removeStaged(recid);
+            const base_len: usize = blk: {
+                if (self.state.staged.getPtr(recid)) |s| {
+                    if (s.base_set) break :blk if (s.base) |b| b.len else 0;
+                }
+                if ((try self.state.inner.recState(recid)) == STATE_LIVE) {
+                    if (try self.state.inner.rawGet(self.alloc, recid)) |b| {
+                        defer self.alloc.free(b);
+                        break :blk b.len;
+                    }
+                }
+                break :blk 0;
+            };
+            const appends_len: usize = if (self.state.staged.getPtr(recid)) |s| s.appends_len else 0;
+            return .{ .new_size = base_len + appends_len };
+        }
         const base_live = blk: {
             const s = self.state.staged.getPtr(recid).?;
             break :blk !s.base_set and (try self.state.inner.recState(recid)) == STATE_LIVE;
@@ -1547,7 +1176,14 @@ pub const StoreWAL = struct {
         if (base_live) {
             const cap_rem = try self.state.inner.capacityRemaining(recid);
             const appends_len = self.state.staged.getPtr(recid).?.appends_len;
-            if (appends_len + data.len > cap_rem) return .refused;
+            if (appends_len + data.len > cap_rem) {
+                // REFUSED is a no-op, so it must stage NOTHING. An empty
+                // `Staged` left behind here would be classified as T_PREALLOC
+                // at commit: it burns an LSN, and a prealloc naming a
+                // content-live record is exactly what §4.2 rejects on replay.
+                if (!was_staged) self.removeStaged(recid);
+                return .refused;
+            }
         }
         const base_len: usize = blk: {
             if (base_live) {
@@ -1568,8 +1204,14 @@ pub const StoreWAL = struct {
         return .{ .new_size = base_len + s.appends_len };
     }
 
+    fn removeStaged(self: *Self, recid: u64) void {
+        if (self.state.staged.fetchRemove(recid)) |kv| {
+            var s = kv.value;
+            s.deinit(self.alloc);
+        }
+    }
+
     pub fn capacityRemaining(self: *Self, recid: u64) DbError!usize {
-        try self.checkClosed();
         self.rw.lockShared();
         defer self.rw.unlockShared();
         try self.readGate();
@@ -1604,6 +1246,12 @@ pub const StoreWAL = struct {
         }
         for (created.items) |recid| try self.state.inner.delete(recid); // free the P recid
         self.state.clearStaged();
+        // NEITHER IDENTITY MOVES ON ROLLBACK, and that is the whole rule: both
+        // are set only by a committed apply, so a transaction that never
+        // committed established nothing to undo. The `created` recids deleted
+        // just above were preallocated in inner at op time but never logged,
+        // so they hold no identity either.
+        //
         // Signal open collections their append-only structural caches may now
         // describe a taller-than-real tree (a reverted uncommitted grow).
         _ = self.struct_gen.fetchAdd(1, .release);

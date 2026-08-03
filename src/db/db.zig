@@ -1277,11 +1277,30 @@ fn uniqueTempPath(alloc: Allocator, dir: []const u8) DbError![]u8 {
 }
 
 /// A file-backed WAL/transactional DB (Java `fileDB(f).transactionEnable()`).
+/// `path` is the store's BASE: the log lives in `<path>.wal.<16 hex>` segment
+/// files beside it (WAL format v3), with `<path>.lock` as the store lock. A
+/// regular file at `<path>` or `<path>.wal`, or anything at `<path>.ckpt`,
+/// refuses the open — those are pre-v3 artifacts and there is no migration.
 pub fn fileWalDb(alloc: Allocator, path: []const u8) DbError!Db(StoreWAL) {
     const s = try alloc.create(StoreWAL);
     errdefer alloc.destroy(s);
     s.* = try StoreWAL.open(alloc, path, true);
     errdefer s.deinit();
+    return Db(StoreWAL).init(alloc, s, true);
+}
+
+/// A file-backed WAL DB whose whole segment namespace is deleted inside the
+/// store's close (Java `fileDB(f).transactionEnable().fileDeleteAfterClose()`).
+/// D2, lock-owning: the store unlinks exactly its own `<base>.wal.<hex>`
+/// segments plus `<base>.lock` while the store lock is still held, so no
+/// second opener can acquire the namespace mid-delete. The DB layer registers
+/// no cleanup paths of its own — the store owns the deletion.
+pub fn fileWalDbDeleteAfterClose(alloc: Allocator, base: []const u8) DbError!Db(StoreWAL) {
+    const s = try alloc.create(StoreWAL);
+    errdefer alloc.destroy(s);
+    s.* = try StoreWAL.open(alloc, base, true);
+    errdefer s.deinit();
+    s.setDeleteOnClose(true);
     return Db(StoreWAL).init(alloc, s, true);
 }
 

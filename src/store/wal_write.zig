@@ -59,6 +59,7 @@ const wal_io = @import("wal_io.zig");
 const WalIo = wal_io.WalIo;
 const WalOpKind = wal_io.WalOpKind;
 const walIoEvent = wal_io.walIoEvent;
+const walIoPwrite = wal_io.walIoPwrite;
 
 const wr = @import("wal_recover.zig");
 const sealSecHdr = wr.sealSecHdr;
@@ -86,13 +87,16 @@ pub const BodySink = struct {
     /// buffers because it never writes.
     buf: []u8 = &.{},
     used: usize = 0,
+    /// The seam the write pass's raw writes route through (a test can inject
+    /// a genuine PARTIAL write); null in the measure pass, which never writes.
+    io: ?*const WalIo = null,
 
     fn measure(crc: Crc32) BodySink {
         return .{ .crc = crc };
     }
 
-    fn writer(file: std.fs.File, body_start: u64, crc: Crc32, buf: []u8) BodySink {
-        return .{ .file = file, .crc = crc, .pos = body_start, .buf = buf };
+    fn writer(file: std.fs.File, body_start: u64, crc: Crc32, buf: []u8, io: ?*const WalIo) BodySink {
+        return .{ .file = file, .crc = crc, .pos = body_start, .buf = buf, .io = io };
     }
 
     /// Emits `b` into this pass. The CRC and the length advance in BOTH passes;
@@ -103,7 +107,7 @@ pub const BodySink = struct {
         const file = self.file orelse return;
         if (b.len >= SINK_BUF) {
             try self.flush();
-            file.pwriteAll(b, self.pos) catch return error.Io;
+            try walIoPwrite(self.io, file, b, self.pos);
             self.pos += b.len;
             return;
         }
@@ -115,7 +119,7 @@ pub const BodySink = struct {
     fn flush(self: *BodySink) DbError!void {
         if (self.used == 0) return;
         const file = self.file orelse unreachable; // the measure pass never buffers
-        file.pwriteAll(self.buf[0..self.used], self.pos) catch return error.Io;
+        try walIoPwrite(self.io, file, self.buf[0..self.used], self.pos);
         self.pos += self.used;
         self.used = 0;
     }
@@ -212,7 +216,7 @@ pub fn appendSection(
     const file = active.handle().?;
 
     try walIoEvent(io, WalOpKind.sec_header, seq, off, SEC_HDR, tag);
-    file.pwriteAll(&hdr, off) catch return error.Io;
+    try walIoPwrite(io, file, &hdr, off);
     const body_start = off + SEC_HDR;
     try walIoEvent(io, WalOpKind.sec_body, seq, body_start, body_len, tag);
 
@@ -221,7 +225,7 @@ pub fn appendSection(
     defer alloc.free(buf);
     var wcrc = Crc32.init();
     crcDomainOf(&wcrc, &seg_header, off);
-    var w = BodySink.writer(file, body_start, wcrc, buf);
+    var w = BodySink.writer(file, body_start, wcrc, buf, io);
     try emit(ctx, &w);
     try w.flush();
     if (w.count != body_len or @as(i32, @bitCast(w.crc.final())) != body_crc) {

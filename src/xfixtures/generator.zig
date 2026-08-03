@@ -12,6 +12,14 @@
 //! zig build fixtures -- --out <dir> [--force] [--commit <hash>]
 //! ```
 //!
+//! **STALE at the WAL v3 cutover (B2), like rust's generator at its A2:** the
+//! W-fixture half drives `StoreWAL`, which now writes format v3 into a
+//! segment NAMESPACE — running it would not reproduce the published
+//! `wal-v1-zig-*` single-file fixtures, and its own section-tag self-checks
+//! would refuse the output. The v1 fixture rows retire family-wide at
+//! Stage C (D6), when this generator learns the `wal3-namespace` bundle kind;
+//! until then it compiles but must not be run for the W fixtures.
+//!
 //! Performs the Stage-1 D workload through the PUBLIC StoreDirect API and the
 //! Stage-2 W workloads through the PUBLIC StoreWAL API, writes
 //! `<out>/direct-v1-zig.db`, `<out>/wal-v1-zig-tail.wal`,
