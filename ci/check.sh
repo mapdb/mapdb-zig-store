@@ -36,23 +36,24 @@ echo "== WAL sync probe (the real syscalls, not just seam events) =="
 #   rollover seal (fsync) . create seg 2 (file fsync, dir fsync) .
 #   final append (fdatasync)
 # Deleting either of the writer's syncs, or swapping one flavour for the other,
-# changes this sequence. strace is required locally; if it is genuinely absent,
-# the step is skipped LOUDLY and the gate cannot claim the discriminator ran.
-if command -v strace >/dev/null 2>&1; then
-  zig build sync-probe
-  probe_trace="$(mktemp)"
-  strace -e trace=fsync,fdatasync -o "$probe_trace" ./zig-out/bin/wal-sync-probe
-  got="$(grep -oE '^(fsync|fdatasync)' "$probe_trace" | tr '\n' ' ')"
-  rm -f "$probe_trace"
-  want="fsync fsync fdatasync fdatasync fdatasync fsync fsync fsync fdatasync "
-  if [ "$got" != "$want" ]; then
-    echo "sync probe MISMATCH:"
-    echo "  want: $want"
-    echo "  got:  $got"
-    exit 1
-  fi
-else
-  echo "SKIPPED: strace not installed — the sync-site discriminator DID NOT run"
+# changes this sequence. strace is REQUIRED: a gate that skips this step passes
+# on seam events alone, which is the exact defect the step exists to catch
+# (B2p1 r2 review, blocking finding 1).
+command -v strace >/dev/null 2>&1 || {
+  echo "strace not installed — the sync-site discriminator cannot run; gate FAILED"
+  exit 1
+}
+zig build sync-probe
+probe_trace="$(mktemp)"
+strace -e trace=fsync,fdatasync -o "$probe_trace" ./zig-out/bin/wal-sync-probe
+got="$(grep -oE '^(fsync|fdatasync)' "$probe_trace" | tr '\n' ' ')"
+rm -f "$probe_trace"
+want="fsync fsync fdatasync fdatasync fdatasync fsync fsync fsync fdatasync "
+if [ "$got" != "$want" ]; then
+  echo "sync probe MISMATCH:"
+  echo "  want: $want"
+  echo "  got:  $got"
+  exit 1
 fi
 
 echo "== package (.paths allowlist covers what a consumer is entitled to) =="

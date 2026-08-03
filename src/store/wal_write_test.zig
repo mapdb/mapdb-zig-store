@@ -630,8 +630,9 @@ test "wal3 B2: allocation failure after the header is on disk is OutOfMemory, no
         defer f.deinit();
         // The sink buffer is allocated AFTER the section header is written (pass 1
         // allocates nothing at all), so its failure is the zig-only crash shape
-        // rust cannot produce: durable bytes exist that the acknowledgement path
-        // never reached. Risk 14 classifies it: operational, never corruption.
+        // rust cannot produce: bytes are on disk that the acknowledgement path
+        // never reached — written and visible to a reopen, though nothing has
+        // been forced yet. Risk 14 classifies it: operational, never corruption.
         var fa = FailingAllocator{ .inner = a, .fail_at = 0 };
         var calls: usize = 0;
         const ctx = Fixed{ .body = "abc", .calls = &calls };
