@@ -214,20 +214,34 @@ test "wal3 D1: a v1 artifact at any of the three names refuses the open and is n
     }
 }
 
-test "wal3 D1: a directory at a legacy name is not a legacy artifact" {
+test "wal3 D1: a directory or symlink at a legacy name is not a legacy artifact" {
     const a = testing.allocator;
+    // Both regular-file rows (`<base>.wal` and bare `<base>`) are no-follow
+    // REGULAR-FILE tests: a directory is an ordinary acceptable layout (the
+    // namespace lives in `<base>.wal.<hex>` sibling names), and a symlink —
+    // even one pointing at a regular file — is not a legacy log either.
+    const Kind = enum { dir, symlink };
     for ([_][]const u8{ ".wal", "" }) |suffix| {
-        var sc = try Scratch.init(a, "d1dir");
-        defer sc.deinit();
-        const at = try std.fmt.allocPrint(a, "{s}{s}", .{ sc.base, suffix });
-        defer a.free(at);
-        // A directory at `<base>` shadows the base name itself, which makes
-        // the namespace unusable for OTHER reasons; only the `.wal` row can
-        // assert a successful open.
-        if (suffix.len == 0) continue;
-        try std.fs.cwd().makePath(at);
-        var s = try StoreWAL.open(a, sc.base, true);
-        s.deinit();
+        for ([_]Kind{ .dir, .symlink }) |kind| {
+            var sc = try Scratch.init(a, "d1dir");
+            defer sc.deinit();
+            const at = try std.fmt.allocPrint(a, "{s}{s}", .{ sc.base, suffix });
+            defer a.free(at);
+            switch (kind) {
+                .dir => try std.fs.cwd().makePath(at),
+                .symlink => {
+                    const target = try std.fmt.allocPrint(a, "{s}/target.file", .{sc.dir});
+                    defer a.free(target);
+                    try std.fs.cwd().writeFile(.{ .sub_path = target, .data = "regular" });
+                    try std.fs.cwd().symLink("target.file", at, .{});
+                },
+            }
+            var s = try StoreWAL.open(a, sc.base, true);
+            _ = try putLong(&s, a, 1);
+            try s.commit();
+            try s.close();
+            s.deinit();
+        }
     }
 }
 
@@ -559,6 +573,9 @@ test "wal3: ops after close return StoreClosed; double close is a no-op" {
     try testing.expectError(error.StoreClosed, s.verify());
     try testing.expectError(error.StoreClosed, s.getAllRecids(a));
     try testing.expectError(error.StoreClosed, s.logBytes());
+    // `segs.close` cleared the segment list: an ungated answer here would be
+    // an allocated EMPTY namespace, which is a lie, not a snapshot.
+    try testing.expectError(error.StoreClosed, s.segmentSeqs(a));
     try testing.expect(s.isClosed());
 }
 
@@ -1036,6 +1053,7 @@ test "wal3 W9: a failure at ANY seam point during commit fails the store closed,
         const first = try putLong(&s, a, 1);
         try s.commit();
         const second = try putLong(&s, a, 2);
+        const lsn_before = s.nextLsn();
         rec.fail_at = rec.calls + k; // the k-th seam call of THIS commit
         const res = s.commit();
         if (res) |_| {
@@ -1050,8 +1068,11 @@ test "wal3 W9: a failure at ANY seam point during commit fails the store closed,
             try testing.expect(s.isClosed());
             try testing.expectError(error.StoreClosed, s.commit());
             try testing.expectError(error.StoreClosed, getLong(&s, a, first));
-            // ...with the store Diag carrying the static write reason.
+            // ...with the store Diag carrying the static write reason, and
+            // `next_lsn` NOT advanced: only a successfully forced section
+            // moves it (the reservation only read it).
             try testing.expectEqual(wal.W_COMMIT_WRITE.ptr, s.lastDiag().reason.ptr);
+            try testing.expectEqual(lsn_before, s.nextLsn());
         }
         s.deinit();
         deinited = true;
@@ -1076,7 +1097,7 @@ test "wal3 W9: a PARTIAL raw write fails the store closed and reopen truncates t
     // (which pwrite of the second commit fails, bytes let through)
     const cases = [_]RecordingIo.PwriteFail{
         .{ .at = 2, .partial = 10 }, // mid-HEADER tear
-        .{ .at = 3, .partial = 3 }, // mid-BODY tear (header durable)
+        .{ .at = 3, .partial = 3 }, // mid-BODY tear (header written/visible; nothing forced yet)
     };
     for (cases) |pf| {
         var sc = try Scratch.init(a, "partial");
@@ -1090,13 +1111,16 @@ test "wal3 W9: a PARTIAL raw write fails the store closed and reopen truncates t
         const first = try putLong(&s, a, 1);
         try s.commit(); // pwrites 0 (header) and 1 (body flush)
         const second = try putLong(&s, a, 2);
+        const lsn_before = s.nextLsn();
         rec.pwrite_fail = pf;
         try testing.expectError(error.Io, s.commit());
         // The shorter-retry refusal: after a partial write NOTHING can append
-        // into this segment through this handle again.
+        // into this segment through this handle again — and the failed
+        // section's reservation never advanced `next_lsn`.
         try testing.expect(s.isClosed());
         try testing.expectError(error.StoreClosed, s.commit());
         try testing.expectEqual(wal.W_COMMIT_WRITE.ptr, s.lastDiag().reason.ptr);
+        try testing.expectEqual(lsn_before, s.nextLsn());
         s.deinit();
         deinited = true;
         // The partial bytes are a torn tail — the crash shape recovery
@@ -1186,11 +1210,30 @@ test "wal3: a transaction that creates and deletes one recid logs nothing for it
 
 // ------------------------------------------------------- zig crash shapes
 
+/// Stages the OOM sweep's second commit so the post-durability apply half
+/// allocates at EVERY identity site, not just in the writer half. Apply runs
+/// in ascending-recid order == allocation order here, and both maps hold one
+/// entry (capacity 8) from the first commit, so with 5 fresh content puts
+/// first, the map GROWTH (the 7th insert, at the default load factor) lands
+/// exactly inside the
+/// `stateOnly` call (the prealloc) for `state_lsn` and inside the `content`
+/// call (the linked put) for `content_base_lsn` — a swallowed failure at
+/// either site is a swallowed real allocation, not a no-op.
+fn stageOomCommit(s: *StoreWAL, alloc: Allocator, base: u64, big2: []const u8) !struct { second: u64, small: u64 } {
+    var small: u64 = 0;
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        const r = try s.put(i64, alloc, @as(i64, @intCast(i)), L);
+        if (i == 0) small = r;
+    }
+    _ = try s.preallocate();
+    const second = try s.put([]const u8, alloc, big2, R);
+    _ = try s.append(base, "-tail");
+    return .{ .second = second, .small = small };
+}
+
 test "wal3: allocator failure at EVERY index of a commit is OutOfMemory and all-or-nothing" {
     const a = testing.allocator;
-    // A LINKED payload, so the post-durability apply half (walPut's chain
-    // allocation, the identity maps) allocates too — without it the sweep
-    // never reaches past the force and the apply assertions are vacuous.
     const big2 = try bytes(a, 42, @as(usize, iv.MAX_CAPACITY) + 4096);
     defer a.free(big2);
     // Counting run: how many allocations one commit costs.
@@ -1203,18 +1246,17 @@ test "wal3: allocator failure at EVERY index of a commit is OutOfMemory and all-
         defer s.deinit();
         const base = try s.put([]const u8, fa.allocator(), "base", R);
         try s.commit();
-        _ = try s.put([]const u8, fa.allocator(), big2, R);
-        _ = try s.append(base, "-tail");
+        _ = try stageOomCommit(&s, fa.allocator(), base, big2);
         const c0 = fa.calls;
         try s.commit();
         commit_allocs = fa.calls - c0;
     }
     try testing.expect(commit_allocs > 4);
-    // Injected runs: the k-th allocation of the SAME commit fails. Whatever
-    // the index — classify, the frame, the sink buffer (after the header is
-    // on disk), the identity maps in apply — the answer is exactly
-    // `OutOfMemory` (risk 14: operational, NEVER corruption), and the store
-    // reopens to an all-or-nothing image.
+    // Injected runs: the k-th allocation of the SAME commit fails, and the
+    // commit MUST report exactly `OutOfMemory` — never success (a swallowed
+    // failure), never another error class (risk 14: operational, NEVER
+    // corruption). The workload is identical run to run, so every index is
+    // genuinely reached. Reopen must show an all-or-nothing image.
     var durable_errors: usize = 0;
     var k: usize = 0;
     while (k < commit_allocs) : (k += 1) {
@@ -1226,29 +1268,23 @@ test "wal3: allocator failure at EVERY index of a commit is OutOfMemory and all-
         defer if (!deinited) s.deinit();
         const base = try s.put([]const u8, fa.allocator(), "base", R);
         try s.commit();
-        const second = try s.put([]const u8, fa.allocator(), big2, R);
-        _ = try s.append(base, "-tail");
+        const staged = try stageOomCommit(&s, fa.allocator(), base, big2);
+        const lsn_before = s.nextLsn();
         fa.fail_at = fa.calls + k;
-        var errored = false;
-        if (s.commit()) |_| {
-            // This index was only reached on the counting run's exact path;
-            // a hit is not guaranteed once earlier frees shift reuse — but a
-            // success must be a REAL one.
-            try testing.expect(!s.isClosed());
-        } else |e| {
-            try testing.expectEqual(error.OutOfMemory, e);
-            errored = true;
-        }
+        try testing.expectError(error.OutOfMemory, s.commit());
         const closed_after = s.isClosed();
+        // A failure BEFORE the durability point leaves the store open with
+        // the reservation unconsumed; `next_lsn` moves only on success.
+        if (!closed_after) try testing.expectEqual(lsn_before, s.nextLsn());
         s.deinit();
         deinited = true;
         var s2 = try StoreWAL.open(a, sc.base, true);
         defer s2.deinit();
         // All-or-nothing, never torn, never corrupt: base always present,
-        // and the second commit's two effects appear together or not at all.
+        // and the second commit's effects appear together or not at all.
         const b = (try getRaw(&s2, a, base)).?;
         defer a.free(@constCast(b));
-        const second_state: ?[]const u8 = s2.get([]const u8, a, second, R) catch |e| blk: {
+        const second_state: ?[]const u8 = s2.get([]const u8, a, staged.second, R) catch |e| blk: {
             try testing.expectEqual(error.GetVoid, e);
             break :blk null;
         };
@@ -1256,21 +1292,21 @@ test "wal3: allocator failure at EVERY index of a commit is OutOfMemory and all-
             defer a.free(@constCast(v));
             try testing.expectEqualStrings("base-tail", b);
             try testing.expectEqualSlices(u8, big2, v);
-            // The section was DURABLE, so an error can only have come from
+            try testing.expectEqual(@as(?i64, 0), try getLong(&s2, a, staged.small));
+            // The section was DURABLE, so the error can only have come from
             // the post-durability half — and every failure there must have
             // closed the store (memory and log had diverged).
-            if (errored) {
-                try testing.expect(closed_after);
-                durable_errors += 1;
-            }
+            try testing.expect(closed_after);
+            durable_errors += 1;
         } else {
             try testing.expectEqualStrings("base", b);
+            try testing.expectError(error.GetVoid, getLong(&s2, a, staged.small));
         }
         _ = try putLong(&s2, a, 3);
         try s2.commit();
     }
     // The post-durability arm was actually exercised — the sweep's apply-half
-    // assertion is not vacuously green.
+    // assertions are not vacuously green.
     try testing.expect(durable_errors > 0);
 }
 

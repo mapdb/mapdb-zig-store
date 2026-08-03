@@ -673,11 +673,18 @@ pub const StoreWAL = struct {
         const dir_name = std.fmt.bufPrint(&buf, "mapdb5_wal_tck_{d}_{d}.d", .{ pid, n }) catch unreachable;
         std.fs.cwd().deleteTree(dir_name) catch {};
         std.fs.cwd().makeDir(dir_name) catch return error.Io;
+        // The directory is OURS to remove on every failure window until its
+        // ownership has actually moved into `tmp_dir` — `deinit` deletes only
+        // through that field, so an error before the handoff would otherwise
+        // strand the directory.
+        var dir_owned = false;
+        errdefer if (!dir_owned) std.fs.cwd().deleteTree(dir_name) catch {};
         var base_buf: [160]u8 = undefined;
         const base = std.fmt.bufPrint(&base_buf, "{s}/store", .{dir_name}) catch unreachable;
         var s = try openCfg(alloc, base, .{ .thread_safe = thread_safe });
         errdefer s.deinit();
         s.tmp_dir = alloc.dupe(u8, dir_name) catch return error.OutOfMemory;
+        dir_owned = true;
         return s;
     }
 
@@ -802,6 +809,10 @@ pub const StoreWAL = struct {
     pub fn segmentSeqs(self: *Self, alloc: Allocator) DbError![]i64 {
         self.rw.lockShared();
         defer self.rw.unlockShared();
+        // Lock-then-check like every fallible read: `segs.close` clears the
+        // segment list, so an ungated call queued behind `close` would answer
+        // an allocated EMPTY namespace rather than `StoreClosed`.
+        try self.readGate();
         const segs = self.state.segs.segmentsSlice();
         const out = alloc.alloc(i64, segs.len) catch return error.OutOfMemory;
         for (segs, 0..) |s, i| out[i] = s.seq;
