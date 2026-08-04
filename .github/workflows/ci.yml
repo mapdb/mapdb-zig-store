@@ -21,6 +21,22 @@ jobs:
       - run: zig fmt --check src build.zig
       - run: zig build
       - run: zig build test
+      - run: |
+          zig build sync-probe
+          strace -y -e trace=fsync,fdatasync -o /tmp/probe.trace ./zig-out/bin/wal-sync-probe
+          got="$(awk 'match($0, /^(fsync|fdatasync)\([0-9]+<[^>]+>/) {
+            call = substr($0, 1, index($0, "(") - 1)
+            rest = substr($0, index($0, "<") + 1)
+            path = substr(rest, 1, index(rest, ">") - 1)
+            n = split(path, parts, "/")
+            name = parts[n]
+            if (name ~ /^mapdb5_syncprobe_[0-9]+$/) name = "DIR"
+            printf "%s:%s ", call, name
+          }' /tmp/probe.trace)"
+          want="fsync:store.db.wal.0000000000000001 fsync:DIR fdatasync:store.db.wal.0000000000000001 fdatasync:store.db.wal.0000000000000001 fdatasync:store.db.wal.0000000000000001 fsync:store.db.wal.0000000000000001 fsync:store.db.wal.0000000000000002 fsync:DIR fdatasync:store.db.wal.0000000000000002 fdatasync:store.db.wal.0000000000000002 "
+          [ "$got" = "$want" ] || { echo "sync probe mismatch: $got"; exit 1; }
+
+
 
   # Release modes exercise different code: safety checks are removed in
   # ReleaseFast, and the store's internal invariants are expressed as
