@@ -139,8 +139,11 @@ fn forceData(io: ?*const WalIo, file: std.fs.File, seq: i64, end: u64, tag: u8) 
 
 /// The sealing force (W3) — force(true), never a data-only sync: the sealed
 /// segment's SIZE is the payload (D5). One operation, like [forceData], and
-/// pinned by the same probe.
-fn forceFull(io: ?*const WalIo, file: std.fs.File, seq: i64, len: u64) DbError!void {
+/// pinned by the same probe. Public because the cleaner's episode roll (B3,
+/// `wal.zig`) seals the active segment through exactly this function — a second
+/// spelling of "event + fsync" would reintroduce the drift the one-function
+/// rule exists to prevent.
+pub fn forceFull(io: ?*const WalIo, file: std.fs.File, seq: i64, len: u64) DbError!void {
     try walIoEvent(io, WalOpKind.force_full, seq, len, 0, 0);
     std.posix.fsync(file.handle) catch return error.Io;
 }

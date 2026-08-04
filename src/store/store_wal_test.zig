@@ -1440,6 +1440,412 @@ test "wal3 D2: delete on close refuses when it cannot read the namespace" {
     try testing.expectError(error.Io, s.close());
 }
 
+// ---------------------------------------------------------------------------
+// checkpoint(): the incremental cleaner with its budget set to "everything"
+// (B3). Roll, re-emit every record the range below still owns as 'C' images,
+// verify (W10), write the forced 'K', unlink. The v1 whole-file rewrite is
+// gone. Port of rust `tests/store_wal.rs`'s five cleaner tests.
+// ---------------------------------------------------------------------------
+
+/// Total on-device bytes of the base's segments — read from the FILESYSTEM,
+/// not from the store's own accounting, so the two can disagree and be caught.
+fn logLen(sc: *const Scratch) !u64 {
+    const names = try sc.dirNames(sc.alloc);
+    defer freeNames(sc.alloc, names);
+    var total: u64 = 0;
+    for (names) |name| {
+        if (std.mem.indexOf(u8, name, ".wal.") == null) continue;
+        const path = try std.fmt.allocPrint(sc.alloc, "{s}/{s}", .{ sc.dir, name });
+        defer sc.alloc.free(path);
+        total += try fileLen(path);
+    }
+    return total;
+}
+
+test "wal3 B3: checkpoint compacts the log and preserves state" {
+    const a = testing.allocator;
+    var sc = try Scratch.init(a, "ckptcompact");
+    defer sc.deinit();
+    var recids: std.ArrayListUnmanaged(u64) = .empty;
+    defer recids.deinit(a);
+    var s = try StoreWAL.openSegmentBytes(a, sc.base, 200);
+    defer s.deinit();
+    var i: i64 = 0;
+    while (i < 60) : (i += 1) {
+        const r = try putLong(&s, a, i);
+        try s.commit();
+        try recids.append(a, r);
+        // keep rewriting one record so the log holds superseded images
+        try s.update(i64, a, recids.items[0], i, L);
+        try s.commit();
+    }
+    const before = try logLen(&sc);
+    const segs_before = try segCount(&sc);
+    try testing.expect(segs_before > 5); // expected a multi-segment log
+    try s.checkpoint();
+    const after = try logLen(&sc);
+    try testing.expect(after < before); // checkpoint must compact the log
+    try testing.expect((try segCount(&sc)) < segs_before); // and retire segments
+    const cb = s.cleanerBytes();
+    try testing.expect(cb.retired > cb.written); // it must pay for itself
+
+    // State preserved live, and across a reopen that replays only what is
+    // left.
+    for (recids.items, 0..) |r, idx| {
+        const want: i64 = if (idx == 0) 59 else @intCast(idx);
+        try testing.expectEqual(@as(?i64, want), try getLong(&s, a, r));
+    }
+    try s.verify();
+    try s.close();
+
+    var s2 = try StoreWAL.open(a, sc.base, true);
+    defer s2.deinit();
+    for (recids.items, 0..) |r, idx| {
+        const want: i64 = if (idx == 0) 59 else @intCast(idx);
+        try testing.expectEqual(@as(?i64, want), try getLong(&s2, a, r));
+    }
+    try s2.verify();
+    // still writable after a clean
+    const r = try putLong(&s2, a, 777);
+    try s2.commit();
+    try testing.expectEqual(@as(?i64, 777), try getLong(&s2, a, r));
+}
+
+test "wal3 B3: checkpoint on an empty log is a no-op" {
+    const a = testing.allocator;
+    var sc = try Scratch.init(a, "ckptempty");
+    defer sc.deinit();
+    var s = try StoreWAL.open(a, sc.base, true);
+    defer s.deinit();
+    try s.checkpoint();
+    {
+        const segs = try s.segmentSeqs(a);
+        defer a.free(segs);
+        // nothing to roll, nothing to retire
+        try testing.expectEqualSlices(i64, &.{1}, segs);
+    }
+    const rec = try putLong(&s, a, 5);
+    try s.commit();
+    // One nonempty segment: the roll creates its successor and the cycle then
+    // retires the original behind a mark.
+    try s.checkpoint();
+    {
+        const segs = try s.segmentSeqs(a);
+        defer a.free(segs);
+        try testing.expectEqualSlices(i64, &.{2}, segs);
+    }
+    try testing.expectEqual(@as(?i64, 5), try getLong(&s, a, rec));
+    try s.close();
+    var s2 = try StoreWAL.open(a, sc.base, true);
+    defer s2.deinit();
+    // the image replays from the 'C'
+    try testing.expectEqual(@as(?i64, 5), try getLong(&s2, a, rec));
+    try s2.verify();
+}
+
+test "wal3 B3: a deleted record is not re-emitted by a clean" {
+    const a = testing.allocator;
+    var sc = try Scratch.init(a, "ckptdel");
+    defer sc.deinit();
+    var s = try StoreWAL.openSegmentBytes(a, sc.base, 200);
+    defer s.deinit();
+    var live: std.ArrayListUnmanaged(struct { r: u64, v: i64 }) = .empty;
+    defer live.deinit(a);
+    var gone: std.ArrayListUnmanaged(u64) = .empty;
+    defer gone.deinit(a);
+    var i: i64 = 0;
+    while (i < 20) : (i += 1) {
+        const r = try putLong(&s, a, i);
+        try s.commit();
+        if (@mod(i, 2) == 0) {
+            try live.append(a, .{ .r = r, .v = i });
+        } else {
+            try gone.append(a, r);
+        }
+    }
+    for (gone.items) |r| try s.delete(r);
+    try s.commit();
+    try s.checkpoint();
+    try s.close();
+
+    var s2 = try StoreWAL.open(a, sc.base, true);
+    defer s2.deinit();
+    for (live.items) |lv| {
+        try testing.expectEqual(@as(?i64, lv.v), try getLong(&s2, a, lv.r));
+    }
+    for (gone.items) |r| {
+        try testing.expectError(error.GetVoid, getLong(&s2, a, r));
+    }
+    try s2.verify();
+}
+
+test "wal3 B3: a base in the retired range is re-emitted with its delta folded in" {
+    // The worry a clean has to answer: a delta ABOVE the retiring range whose
+    // base image lies INSIDE it. It cannot survive as a dangling reference,
+    // because the recid's state entry is in the range too — so it is a
+    // candidate, and its image is re-emitted with the delta already folded in.
+    const a = testing.allocator;
+    var sc = try Scratch.init(a, "ckptfold");
+    defer sc.deinit();
+    var want: std.ArrayListUnmanaged(u8) = .empty;
+    defer want.deinit(a);
+    var recid: u64 = 0;
+    {
+        var s = try StoreWAL.openSegmentBytes(a, sc.base, 200);
+        defer s.deinit();
+        {
+            const b = try bytes(a, 21, 60);
+            defer a.free(b);
+            try want.appendSlice(a, b);
+            recid = try s.put([]const u8, a, b, R);
+        }
+        try s.commit();
+        try s.updateWithHeadroom([]const u8, a, recid, want.items, R, 200);
+        try s.commit();
+        // deltas, each in a later section (and, at this segment size, later
+        // segments) than the image they extend
+        var i: u8 = 0;
+        while (i < 6) : (i += 1) {
+            const tail = [_]u8{i} ** 8;
+            _ = try s.append(recid, &tail);
+            try s.commit();
+            try want.appendSlice(a, &tail);
+        }
+        {
+            const segs = try s.segmentSeqs(a);
+            defer a.free(segs);
+            try testing.expect(segs.len > 1);
+        }
+        try s.checkpoint();
+        {
+            const got = (try getRaw(&s, a, recid)).?;
+            defer a.free(@constCast(got));
+            try testing.expectEqualSlices(u8, want.items, got);
+        }
+        // The re-emitted 'C' image is now the record's content BASE: a
+        // further append must stamp its delta against the C section's LSN
+        // (live identity continuity through a clean — replay then folds the
+        // delta onto the image the cleaner wrote).
+        _ = try s.append(recid, &[_]u8{0xEE} ** 8);
+        try s.commit();
+        try want.appendSlice(a, &[_]u8{0xEE} ** 8);
+        {
+            const got = (try getRaw(&s, a, recid)).?;
+            defer a.free(@constCast(got));
+            try testing.expectEqualSlices(u8, want.items, got);
+        }
+        try s.close();
+    }
+    var s2 = try StoreWAL.open(a, sc.base, true);
+    defer s2.deinit();
+    const got = (try getRaw(&s2, a, recid)).?;
+    defer a.free(@constCast(got));
+    try testing.expectEqualSlices(u8, want.items, got);
+    try s2.verify();
+}
+
+test "wal3 B3 W9: a seam failure at EVERY event of a checkpoint fails the store closed, durable state intact" {
+    // The cleaner's half of W9, swept the same way as commit's: the k-th
+    // durability event of an identical checkpoint fails, and every failing
+    // index must close the store with the cleaner's own diag reason — never
+    // leave a handle that could append after partial bytes. The durable image
+    // is intact at every index: reopen replays it, and the interrupted clean
+    // is simply re-runnable.
+    const a = testing.allocator;
+    var k: usize = 0;
+    while (true) : (k += 1) {
+        try testing.expect(k < 300); // a checkpoint is a bounded event sequence
+        var sc = try Scratch.init(a, "ckptsweep");
+        defer sc.deinit();
+        var rec = RecordingIo.init(a);
+        defer rec.deinit();
+        const seam = rec.io();
+        var s = try StoreWAL.openCfg(a, sc.base, .{ .segment_bytes = TINY, .io = &seam });
+        var deinited = false;
+        defer if (!deinited) s.deinit();
+        var recids: [4]u64 = undefined;
+        for (&recids, 0..) |*r, i| {
+            r.* = try putLong(&s, a, @intCast(i));
+            try s.commit();
+        }
+        rec.fail_at = rec.calls + k;
+        if (s.checkpoint()) |_| {
+            // The sweep walked past the last event a checkpoint performs.
+            try testing.expect(!s.isClosed());
+            break;
+        } else |e| {
+            try testing.expectEqual(error.Io, e);
+            try testing.expect(s.isClosed());
+            const d = s.lastDiag();
+            try testing.expect(d.reason.ptr == wal.W_CLEAN_WRITE.ptr or
+                d.reason.ptr == wal.W_CLEAN_IO.ptr);
+        }
+        const lsn_at_close = s.nextLsn(); // readable post-close, deliberately
+        s.deinit();
+        deinited = true;
+        var s2 = try StoreWAL.open(a, sc.base, true);
+        defer s2.deinit();
+        // Only a successfully forced section advances the handle's LSN, so
+        // the closed handle can never sit ABOVE what recovery re-derives — a
+        // reservation consumed by a FAILED append would. (Strict equality
+        // would over-claim: a failed FORCE leaves a fully written section the
+        // reopen legitimately accepts from the page cache, so recovery may
+        // derive one higher than the unadvanced handle.)
+        try testing.expect(lsn_at_close <= s2.nextLsn());
+        for (recids, 0..) |r, i| {
+            try testing.expectEqual(@as(?i64, @intCast(i)), try getLong(&s2, a, r));
+        }
+        try s2.verify();
+        try s2.checkpoint(); // the interrupted clean is re-runnable
+        for (recids, 0..) |r, i| {
+            try testing.expectEqual(@as(?i64, @intCast(i)), try getLong(&s2, a, r));
+        }
+    }
+}
+
+fn buildCkptOomStore(fa: *FailingAllocator, sc: *const Scratch, big: []const u8) !StoreWAL {
+    // Shapes the retiring range must re-home: plain content, LINKED content
+    // (its snapshot allocates), a prealloc, an explicit null, and a delete —
+    // plus superseded images so the C batch is nontrivial.
+    const a = fa.allocator();
+    var s = try StoreWAL.openCfg(a, sc.base, .{ .segment_bytes = TINY });
+    errdefer s.deinit();
+    _ = try s.put([]const u8, a, "plain", R);
+    try s.commit();
+    _ = try s.put([]const u8, a, big, R); // linked (oversize)
+    try s.commit();
+    _ = try s.preallocate();
+    try s.commit();
+    const nulled = try s.put(i64, a, 7, L);
+    try s.commit();
+    try s.update(i64, a, nulled, null, L);
+    try s.commit();
+    const dead = try s.put(i64, a, 8, L);
+    try s.commit();
+    try s.delete(dead);
+    try s.commit();
+    return s;
+}
+
+test "wal3 B3: allocator failure at EVERY index of a checkpoint answers OutOfMemory, and cleaning remains re-runnable" {
+    // B1's/B2p2's recurring lesson, applied to the cleaner: the sweep's claim
+    // is only as good as the workload's reach, so the range holds every
+    // record shape whose snapshot or framing allocates. Every index must
+    // answer exactly `OutOfMemory` (risk 14 — operational, never corruption).
+    // A pre-durability refusal leaves the handle OPEN with the cycle rewound
+    // and the same handle retries to success; an allocation inside
+    // `appendSection` fails after the section header is on the device, which
+    // is a genuine W9 partial write and must close the store.
+    const a = testing.allocator;
+    const big = try bytes(a, 99, @as(usize, iv.MAX_CAPACITY) + 512);
+    defer a.free(big);
+    var ckpt_allocs: usize = 0;
+    {
+        var sc = try Scratch.init(a, "ckptoomcount");
+        defer sc.deinit();
+        var fa = FailingAllocator{ .inner = a, .fail_at = null };
+        var s = try buildCkptOomStore(&fa, &sc, big);
+        defer s.deinit();
+        const c0 = fa.calls;
+        try s.checkpoint();
+        ckpt_allocs = fa.calls - c0;
+    }
+    try testing.expect(ckpt_allocs > 4);
+    var closed_seen: usize = 0;
+    var open_seen: usize = 0;
+    var k: usize = 0;
+    while (k < ckpt_allocs) : (k += 1) {
+        var sc = try Scratch.init(a, "ckptoomsweep");
+        defer sc.deinit();
+        var fa = FailingAllocator{ .inner = a, .fail_at = null };
+        var s = try buildCkptOomStore(&fa, &sc, big);
+        var deinited = false;
+        defer if (!deinited) s.deinit();
+        fa.fail_at = fa.calls + k;
+        try testing.expectError(error.OutOfMemory, s.checkpoint());
+        if (s.isClosed()) {
+            closed_seen += 1;
+            // Two closed arms: `appendSection`'s own allocation (after the
+            // header pwrite — a W9 partial), and `unlinkThrough`'s capacity
+            // reservation (after the mark is durable).
+            const d = s.lastDiag();
+            try testing.expect(d.reason.ptr == wal.W_CLEAN_WRITE.ptr or
+                d.reason.ptr == wal.W_CLEAN_IO.ptr);
+            s.deinit();
+            deinited = true;
+            var s2 = try StoreWAL.open(a, sc.base, true);
+            defer s2.deinit();
+            try s2.verify();
+            try s2.checkpoint();
+        } else {
+            open_seen += 1;
+            try s.checkpoint(); // the rewound cycle retries to success
+            try s.verify();
+        }
+    }
+    // Both arms really ran: refusals that keep the handle, and the W9 close
+    // behind `appendSection`'s own allocation.
+    try testing.expect(open_seen > 0);
+    try testing.expect(closed_seen > 0);
+}
+
+test "wal3 B3: automatic cleaning bounds log growth" {
+    // A small live set overwritten many times: the log fills with superseded
+    // images while the store's footprint stays flat, which is the shape the
+    // trigger exists for. The footprint is page-granular (it reports ~2 MiB
+    // for a store holding a few hundred bytes), so the amplification term —
+    // not the floor — is what decides here; that bias is documented on
+    // `cleaningTarget`.
+    const a = testing.allocator;
+    var sc = try Scratch.init(a, "autoclean");
+    defer sc.deinit();
+    var s = try StoreWAL.openSegmentBytes(a, sc.base, 64 << 10);
+    defer s.deinit();
+    try s.setMinLogBytes(4096);
+    try s.setSpaceAmplification(1);
+    var recids: std.ArrayListUnmanaged(u64) = .empty;
+    defer recids.deinit(a);
+    var i: u64 = 0;
+    while (i < 20) : (i += 1) {
+        const b = try bytes(a, i, 4000);
+        defer a.free(b);
+        try recids.append(a, try s.put([]const u8, a, b, R));
+        try s.commit();
+    }
+    i = 0;
+    while (i < 1200) : (i += 1) {
+        const victim = recids.items[@intCast(i % recids.items.len)];
+        const b = try bytes(a, 10_000 + i, 4000);
+        defer a.free(b);
+        try s.update([]const u8, a, victim, b, R);
+        try s.commit();
+    }
+    const cb = s.cleanerBytes();
+    try testing.expect(cb.retired > 0); // automatic cleaning must have retired segments
+    const unbounded: u64 = 1220 * 4100;
+    // the log must stay well below its unbounded size
+    try testing.expect((try logLen(&sc)) < unbounded / 2);
+    try s.verify();
+    var snapshot: std.ArrayListUnmanaged(?[]const u8) = .empty;
+    defer {
+        for (snapshot.items) |sv| if (sv) |v| a.free(@constCast(v));
+        snapshot.deinit(a);
+    }
+    for (recids.items) |r| try snapshot.append(a, try getRaw(&s, a, r));
+    try s.close();
+
+    var s2 = try StoreWAL.open(a, sc.base, true);
+    defer s2.deinit();
+    for (recids.items, snapshot.items) |r, wantv| {
+        const got = try getRaw(&s2, a, r);
+        defer if (got) |g| a.free(@constCast(g));
+        // state survives the retirement
+        try testing.expect((wantv == null) == (got == null));
+        if (wantv) |w| try testing.expectEqualSlices(u8, w, got.?);
+    }
+    try s2.verify();
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

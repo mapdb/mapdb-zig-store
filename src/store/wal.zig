@@ -33,16 +33,19 @@
 //! returns; the error returns here are the entire surface, and the mutation
 //! suite pins that every one of them closes the store.
 //!
-//! # The cleaner is B3
+//! # The cleaner (B3)
 //!
-//! `checkpoint()`/`compact()` and the automatic cleaning hook inside commit are
-//! STUBS on this branch: the incremental cleaner (Java's re-home / W10 audit /
-//! forced-`'K'` + unlink cycle) is slice B3, which joins this branch before it
-//! reaches `main` — a cutover without the cleaner would be an unbounded-log
-//! regression, which is why the branch does not merge without it. D8's three
-//! config knobs land HERE (they are part of the public surface and the crash
-//! harness needs them); the fields the cleaner consumes are maintained from
-//! this slice on.
+//! The incremental cleaner — Java's re-home / W10 audit / forced-`'K'` +
+//! unlink cycle, ported from rust's A3 (`wal.rs`, the cleaner block). An
+//! EPISODE (seal the active segment, take its successor as the floor) is
+//! driven in budgeted CYCLES (retire the oldest `cycle_width` segments), each
+//! a publish walk ('C' images of every record whose state still lives in the
+//! retiring range), a verify walk (W10: refuse the mark while anything is
+//! un-re-homed), then the forced `'K'` and the unlink. `checkpoint()` is the
+//! same machinery with an unbounded budget; commit's automatic hook pays
+//! `FOREGROUND_BUDGET` per commit, or loops at the hard ceiling. The
+//! futility latch stops a healthy-but-uncompactable log from being re-cleaned
+//! on every commit.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -63,6 +66,7 @@ const LeaseTable = mod.LeaseTable;
 const segments = @import("wal_segments.zig");
 const WalSegmentSet = segments.WalSegmentSet;
 const SEG_HDR = segments.SEG_HDR;
+const FIRST_SEQ = segments.FIRST_SEQ;
 
 const wal_io = @import("wal_io.zig");
 const WalIo = wal_io.WalIo;
@@ -70,11 +74,18 @@ const WalIo = wal_io.WalIo;
 const wr = @import("wal_recover.zig");
 const Diag = wr.Diag;
 const Identities = wr.Identities;
+const SecIn = wr.SecIn;
+const parseSecHdr = wr.parseSecHdr;
+const buildMarkBody = wr.buildMarkBody;
 const SEC_HDR = wr.SEC_HDR;
+const MARK_BODY_LEN = wr.MARK_BODY_LEN;
 const TAG_SECTION = wr.TAG_SECTION;
+const TAG_IMAGE = wr.TAG_IMAGE;
+const TAG_MARK = wr.TAG_MARK;
 
 const wal_write = @import("wal_write.zig");
 const appendSection = wal_write.appendSection;
+const forceFull = wal_write.forceFull;
 const BodySink = wal_write.BodySink;
 
 // ------------------------------------------------------------------ constants
@@ -128,6 +139,49 @@ pub const W_COMMIT_APPLY: []const u8 =
 /// surfacing after the durability point, never an operational condition.
 pub const W_COMMIT_APPEND_REFUSED: []const u8 =
     "wal commit: inner store refused a committed append after the durability point";
+/// A cleaner section ('C' image, 'K' mark, or the episode's sealing roll)
+/// failed to reach the device (W9): the store is closed, the durable log is
+/// intact, reopen replays it.
+pub const W_CLEAN_WRITE: []const u8 =
+    "wal cleaner: section write/force failed; store closed (W9), reopen to recover";
+/// Moving the identities after a DURABLE 'C' image failed: memory and log have
+/// diverged (a half-moved identity map could stamp a wrong append base), the
+/// store is closed, reopen rebuilds the identities from the log.
+pub const W_CLEAN_APPLY: []const u8 =
+    "wal cleaner: identity update failed after a durable image; store closed, reopen to recover";
+/// Retiring-range I/O failed (a scan read, or the post-mark unlink): the
+/// store's I/O is broken and it says so once — closed, reopen to recover.
+pub const W_CLEAN_IO: []const u8 =
+    "wal cleaner: I/O failed while cleaning; store closed, reopen to recover";
+/// A recid is BOTH committed-live and allocated by an in-flight transaction —
+/// impossible through the allocator, so re-emitting either way would be a
+/// guess. Refused; nothing deleted. `recid` names it, `detail` its state LSN.
+pub const W_CLEAN_INFLIGHT: []const u8 =
+    "wal cleaner: recid has committed state and is also allocated by an in-flight transaction";
+/// The identity map attests committed state for a recid the inner store holds
+/// nothing for. Refused rather than retiring a segment whose contents were
+/// not re-homed. `recid` names it, `detail` its state LSN.
+pub const W_CLEAN_MISSING: []const u8 =
+    "wal cleaner: recid has committed state but the inner store holds nothing for it";
+/// W10: the cycle would retire a segment while a recid still has its only
+/// self-contained entry inside the retiring range — an under-re-emission that
+/// must fail loudly BEFORE the data is destroyed. Nothing has been deleted;
+/// the durable log is intact. `seq` is the target segment, `recid` the record
+/// being protected, `detail` its stranded state LSN.
+pub const W_CLEAN_UNREHOMED: []const u8 =
+    "wal cleaner: a record was not re-homed above the retiring range; refusing to write the clean mark (W10)";
+/// The cleaner scan met a section header that does not fit before the
+/// segment's validated end — the walk verifies no CRC (the section was
+/// verified whole at open), so it says what it trusts.
+pub const W_CLEAN_SCAN_HDR: []const u8 =
+    "wal cleaner scan: section header does not fit before the segment's validated end";
+/// The cleaner scan met a section whose claimed body runs past the segment's
+/// validated end.
+pub const W_CLEAN_SCAN_BODY: []const u8 =
+    "wal cleaner scan: section body runs past the segment's validated end";
+/// The cleaner scan met an entry tag outside the §4.2 set.
+pub const W_CLEAN_SCAN_TAG: []const u8 =
+    "wal cleaner scan: bad entry tag";
 
 // --------------------------------------------------------------- staged state
 
@@ -238,13 +292,75 @@ const WalState = struct {
     read_only: bool,
     /// Committed self-contained entries over this store's lifetime — every one
     /// of which can obsolete an earlier image, which is what makes it the
-    /// cleaner's (B3) futility-latch staleness clock.
+    /// cleaner's futility-latch staleness clock.
     committed_state_changes: i64 = 0,
-    /// The store-level diagnostic: cleared on entry to `commitLocked`, written
-    /// immediately before every error return that maps a writer or apply
-    /// failure, so it always describes the failure just returned or nothing.
+    /// The store-level diagnostic: cleared on entry to `commitLocked` and
+    /// `checkpoint`, written immediately before every error return that maps a
+    /// writer, apply or cleaner failure, so it always describes the failure
+    /// just returned or nothing.
     diag: Diag = .{},
     alloc: Allocator,
+
+    // ---- the cleaner (B3). Every field is touched under the write lock.
+    /// The cycle in progress, or `null` when idle.
+    cleaner: ?Cleaner = null,
+    /// The active segment when the log first became due; no cycle may select
+    /// at or above it, so reaching it means the whole log has been rewritten
+    /// once. 0 = no episode in progress.
+    clean_floor_seq: i64 = 0,
+    /// The lifetime retired/written counters as the current episode began. Its
+    /// achievement is `retired - written` over the episode — NET PROGRESS, not
+    /// the change in log size, because concurrent commits move the log for
+    /// reasons that have nothing to do with whether cleaning is working.
+    episode_retired: i64 = 0,
+    episode_written: i64 = 0,
+    /// Images this episode has re-emitted, and the segments below the floor
+    /// when its FIRST cycle opened — the range it set out to rewrite. The
+    /// terminal is qualified against that range, not against what is left: a
+    /// completed episode retires prefixes until nothing remains, so its final
+    /// cycle is always as wide as the remainder.
+    episode_records: i64 = 0,
+    episode_segments: usize = 0,
+    /// Segments the NEXT cycle may retire in one go. A cycle that retires one
+    /// segment pays for one mark, and a mark can cost more than a small
+    /// segment holds: at the minimum segment size a cycle retires ~61 bytes
+    /// and appends ~107, so one-at-a-time cleaning grows the log forever on a
+    /// log a single wide pass would collapse.
+    cycle_width: usize = 1,
+    cycle_retired_at: i64 = 0,
+    cycle_written_at: i64 = 0,
+    /// The cycle now open runs at the WIDEST width available to it. Only an
+    /// episode whose last cycle was saturated may arm the latch: a futile
+    /// narrow cycle is evidence about the width, not about the log.
+    cycle_saturated: bool = false,
+    last_cycle_saturated: bool = false,
+    /// Log size when an episode completed its whole range WITHOUT shrinking
+    /// the log — the configured ratio is unachievable. Latched so it is not
+    /// retried on every commit. 0 = not latched.
+    futile_at_bytes: u64 = 0,
+    /// The target when the latch armed; a materially LOWER one re-arms
+    /// cleaning.
+    futile_at_target: u64 = 0,
+    /// `committed_state_changes` when the latch armed, and the images the
+    /// futile episode re-emitted. A latch is a proof about the log as it
+    /// stood, and commits invalidate proofs: a mass delete of null-content or
+    /// preallocated records obsoletes every image in the log while moving
+    /// neither the log's size nor the target.
+    futile_at_changes: i64 = 0,
+    futile_records: i64 = 0,
+    /// Lifetime cleaner accounting, both halves — bytes re-emitted, bytes
+    /// retired.
+    cleaner_bytes_written: i64 = 0,
+    cleaner_bytes_retired: i64 = 0,
+    /// Fault injection, and the only reason it exists: W10 is a check on phase
+    /// 1's loop, so a suite that cannot make that loop DROP a record cannot
+    /// tell a working W10 from one that passes because nothing ever fails it.
+    /// Dropping a recid here is precisely the under-re-emission W10 is for.
+    /// Test-only by convention (rust gates it `cfg(test)`; zig cannot
+    /// conditionally declare a field without forking the struct layout, which
+    /// is the same reason `SecIn.reads` is unconditional). 0 = disabled, and
+    /// recid 0 is refused by every decoder, so no production entry matches.
+    drop_recid_from_publish: u64 = 0,
 
     fn clearStaged(self: *WalState) void {
         var it = self.staged.valueIterator();
@@ -491,14 +607,722 @@ const WalState = struct {
         self.inner.close() catch {};
     }
 
-    /// B3 STUB — the automatic cleaning hook inside commit (Java's
-    /// `cleanTickLocked` wrapper). The trigger (`logBytes > max(min_log_bytes,
-    /// space_amplification × liveDataBytes)`), the bounded foreground slice and
-    /// the futility latch all land with the cleaner. Until then commits never
-    /// clean, which is exactly why this branch does not merge before B3.
+    /// Seals the active segment and starts a successor, if the active one
+    /// holds any section. W3's force flavour applies: the seal persists SIZE.
+    fn rollActiveIfNonempty(self: *WalState, closed: *std.atomic.Value(bool)) DbError!void {
+        const roll = if (self.segs.active()) |a| !a.empty() else false;
+        if (!roll) return;
+        self.rollActiveInner() catch |e| {
+            // A half-created segment is not recoverable in place.
+            if (self.diag.reason.len == 0)
+                self.diag.note(W_CLEAN_WRITE, self.activeSeq(), 0, 0, 0);
+            self.failClosed(closed);
+            return e;
+        };
+    }
+
+    fn rollActiveInner(self: *WalState) DbError!void {
+        const a = self.segs.active().?; // checked by the caller
+        try a.ensureOpen();
+        try forceFull(self.segs.io, a.handle().?, a.seq, a.file_len);
+        a.release();
+        // `a` is DEAD from here: `createSegment` may reallocate the list.
+        _ = try self.segs.createSegment(self.next_lsn);
+    }
+
+    // ---------------------------------------------------------- the trigger
+
+    /// The size the log is allowed to reach.
+    ///
+    /// `live` is the inner store's `getCurrentSize()` — allocated bytes minus
+    /// reclaimed — which is PAGE-GRANULAR: it includes the header and rounds
+    /// to slices, so it reports about 2 MiB for a store holding 200 bytes. The
+    /// ratio is therefore a log-versus-footprint ratio, exact at scale and
+    /// conservative below a few MiB, where it DELAYS cleaning rather than
+    /// hastening it. That direction is the safe one, but it means
+    /// `setMinLogBytes` is not an absolute cap on a tiny store: below ~2 MiB
+    /// of footprint the amplification term, not the floor, decides.
+    fn cleaningTarget(self: *WalState) u64 {
+        const live = self.inner.getCurrentSize();
+        const scaled = live *| @as(u64, self.space_amplification);
+        return @max(self.min_log_bytes, scaled);
+    }
+
+    /// It bounds SPACE, not WRITE amplification, and the difference is not
+    /// academic: cleaning strictly the oldest segment is FIFO, not
+    /// cost-benefit, so for a cold-head workload that segment is ~100% live
+    /// and re-emitting it buys nothing this cycle. Oldest-first is kept as an
+    /// explicit trade-off with the pathological case named rather than hidden.
+    fn cleaningDue(self: *WalState) bool {
+        return self.min_log_bytes > 0 and self.segs.logBytes() > self.cleaningTarget();
+    }
+
+    /// The hard ceiling: the log is past TWICE what the trigger allows, so
+    /// bounding the pause has stopped being the priority and the committing
+    /// writer participates until it is back under.
+    fn cleaningUrgent(self: *WalState) bool {
+        return self.min_log_bytes > 0 and self.segs.logBytes() > self.cleaningTarget() *| 2;
+    }
+
+    /// Whether the futility latch is armed — a healthy, fully compacted log
+    /// that cannot meet the configured ratio.
+    fn cleaningExhausted(self: *const WalState) bool {
+        return self.futile_at_bytes > 0;
+    }
+
+    /// Releases the futility latch, whatever armed it.
+    fn clearLatch(self: *WalState) void {
+        self.futile_at_bytes = 0;
+        self.futile_at_target = 0;
+        self.futile_at_changes = 0;
+        self.futile_records = 0;
+    }
+
+    /// Abandons the episode WITHOUT judging it — for a configuration change or
+    /// an explicit `checkpoint()`, after which nothing it observed is still
+    /// about the same store.
+    fn abandonEpisode(self: *WalState) void {
+        self.clearLatch();
+        self.clean_floor_seq = 0;
+        self.episode_retired = 0;
+        self.episode_written = 0;
+        self.episode_records = 0;
+        self.episode_segments = 0;
+        self.cycle_width = 1;
+        self.last_cycle_saturated = false;
+    }
+
+    /// Ends the episode, having walked its whole range. Called ONLY on
+    /// completion, because only a completed episode says anything: it is the
+    /// bounded window the no-net-progress terminal is measured over.
+    fn endEpisode(self: *WalState) void {
+        const futile = self.clean_floor_seq != 0 and
+            !paidForItself(
+                self.cleaner_bytes_retired - self.episode_retired,
+                self.cleaner_bytes_written - self.episode_written,
+            );
+        if (futile and self.last_cycle_saturated) {
+            self.futile_at_bytes = @max(self.segs.logBytes(), 1);
+            self.futile_at_target = self.cleaningTarget();
+            self.futile_at_changes = self.committed_state_changes;
+            self.futile_records = @max(self.episode_records, 1);
+        }
+        self.clean_floor_seq = 0;
+        self.episode_retired = 0;
+        self.episode_written = 0;
+        self.episode_records = 0;
+        self.episode_segments = 0;
+        // Reset WITH the episode, not across it: a guard that outlives what it
+        // describes would let an episode that did NO work (nothing below its
+        // floor, so `futile` is trivially true) arm the terminal on the
+        // strength of a PREVIOUS episode's wide last cycle. `cycle_width`
+        // does persist deliberately — the width a log needs is a property of
+        // the log.
+        self.last_cycle_saturated = false;
+    }
+
+    /// Opens a cycle over the oldest retirable segments IF the trigger is
+    /// live. Returns whether a cycle is now open.
+    ///
+    /// An EPISODE begins by SEALING the active segment and taking its fresh
+    /// successor as the floor. No cycle may select at or above that floor, so
+    /// everything that existed when the episode began is retirable and nothing
+    /// the episode itself writes is: once the lowest present segment reaches
+    /// the floor, the episode has rewritten the whole log exactly once.
+    /// Sealing is what makes that true — using the PRE-EXISTING active segment
+    /// as the floor leaves it untouched, and it also subsumes the
+    /// single-segment case, where a `segment_bytes` above the trigger would
+    /// otherwise leave a log growing forever with no candidate at all.
+    ///
+    /// The terminal is FUTILITY, not reaching the floor. An episode that
+    /// reclaimed bytes and ended is a success, and the right response is
+    /// another episode; latching on "reached the floor" suppresses cleaning
+    /// after every SUCCESSFUL one — including above the hard ceiling, where
+    /// the writer is supposed to be made to participate, so the ceiling would
+    /// not be one.
+    fn beginCycleIfDue(self: *WalState, closed: *std.atomic.Value(bool)) DbError!bool {
+        if (!self.cleaningDue()) {
+            // The trigger went quiet. The EPISODE is not over: keeping its
+            // floor across a dip is what stops a workload hovering around the
+            // target paying a fresh seal, create and directory fsync every few
+            // commits. Only the latch is released, because a quiet trigger
+            // means the situation changed.
+            self.clearLatch();
+            return false;
+        }
+        if (self.futile_at_bytes > 0) {
+            const room = self.cleaningTarget();
+            const retry = self.futile_at_bytes +| room;
+            // A MATERIAL drop, not any drop: the target is the inner store's
+            // footprint, and an ordinary update moves it by a couple of
+            // hundred bytes in either direction as the allocator reuses
+            // extents.
+            const dropped = self.futile_at_target - (self.futile_at_target >> 3);
+            const grew = self.segs.logBytes() >= retry;
+            const shrank = room <= dropped;
+            // ...and neither of those can see a state-only mass delete, which
+            // obsoletes every image in the log while moving neither number.
+            const churned =
+                self.committed_state_changes - self.futile_at_changes >= self.futile_records;
+            if (!grew and !shrank and !churned) return false;
+            self.clearLatch();
+        }
+        if (self.clean_floor_seq == 0) {
+            // The seal is CLEANING's cost, not the writer's: this rollover
+            // exists only to give the episode a floor, and its 36-byte
+            // successor header would otherwise be invisible to every tick.
+            const log_before = self.segs.logBytes();
+            const retired_before = self.cleaner_bytes_retired;
+            try self.rollActiveIfNonempty(closed);
+            _ = self.chargeCleaner(log_before, retired_before);
+            self.clean_floor_seq = self.segs.active().?.seq; // writable store
+            self.episode_retired = self.cleaner_bytes_retired;
+            self.episode_written = self.cleaner_bytes_written;
+        }
+        // BINARY search for the floor, not a walk: the walk is O(segments
+        // below the floor) and runs at every cycle start, which is every
+        // commit or two.
+        const all = self.segs.segmentsSlice();
+        const below = std.sort.partitionPoint(segments.Segment, all, self.clean_floor_seq, struct {
+            fn belowFloor(floor: i64, s: segments.Segment) bool {
+                return s.seq < floor;
+            }
+        }.belowFloor);
+        if (below == 0 or below >= all.len) {
+            self.endEpisode(); // the episode has rewritten everything it could
+            return false;
+        }
+        if (self.episode_segments == 0) self.episode_segments = below;
+        // One segment per cycle, or as many as the width search has reached.
+        // A wide cycle is not a wider PAUSE — it is still driven in budgeted
+        // ticks — and it is the only way to amortise one mark over many
+        // segments.
+        const width = @min(@min(@max(self.cycle_width, 1), CYCLE_WIDTH_CAP), below);
+        // SATURATED = as wide as this episode is ever allowed to go, measured
+        // against the range it STARTED with. Against the remainder it would be
+        // vacuous: a completed episode's final cycle always covers what is
+        // left.
+        self.cycle_saturated = width >= @min(CYCLE_WIDTH_CAP, self.episode_segments);
+        const target = all[width - 1].seq;
+        self.startCycle(target);
+        return true;
+    }
+
+    /// Opens a cycle retiring everything at or below `target_seq`. The caller
+    /// must have established that a segment above it exists.
+    ///
+    /// **O(1).** Candidates are discovered by WALKING THE RETIRING RANGE
+    /// itself, one bounded unit at a time — computing them from the
+    /// `state_lsn` map would be O(live recids) under the write lock, and for a
+    /// large store far more work than the segment being retired even contains.
+    ///
+    /// The walk finds every candidate and no others: a recid needs re-emission
+    /// exactly when `state_lsn[R] <= boundary_lsn`, that value IS the LSN of
+    /// its newest self-contained entry, and the retained log begins at
+    /// `boundary_lsn + 1` — so that entry is inside the range and the recid
+    /// appears in the walk. The FILTER stays over `state_lsn`, which is what
+    /// keeps a recid merely allocated by an in-flight transaction out of the
+    /// set: it has no committed entry and so no `state_lsn` at all.
+    ///
+    /// No surviving `T_APPEND` can be orphaned by this. The worry is a delta
+    /// ABOVE the range whose base lies INSIDE it; it is unreachable, because
+    /// `content_base_lsn[R] <= boundary < state_lsn[R]` cannot happen — every
+    /// entry that raises `state_lsn` either moves `content_base_lsn` to the
+    /// SAME LSN or clears it. So a delta whose base is in the range belongs to
+    /// a candidate, which is re-emitted with that delta already folded into
+    /// its content; replay then skips the stranded delta and the image
+    /// supersedes it, which is what the skip audit is built to tolerate.
+    fn startCycle(self: *WalState, target_seq: i64) void {
+        self.cycle_retired_at = self.cleaner_bytes_retired;
+        self.cycle_written_at = self.cleaner_bytes_written;
+        const successor = for (self.segs.segmentsSlice()) |*s| {
+            if (s.seq > target_seq) break s;
+            // K4: a mark may not authorize removing its own segment, so a
+            // cycle retiring everything has nowhere to record itself.
+        } else unreachable; // a cycle always leaves a segment above its target
+        self.cleaner = Cleaner.init(target_seq, successor.headerFirstLsn());
+    }
+
+    /// Charges one unit of cleaning and returns what it charged: what the log
+    /// grew by, plus what the unit retired (which shrank it).
+    ///
+    /// Both halves of the accounting must be in the SAME unit, and the unit is
+    /// FILE bytes. The sections a tick appends are not what it costs the log:
+    /// an append that rolls over creates a segment header, and the mark that
+    /// closes a cycle usually lands in a segment of its own. Charging section
+    /// bytes against `retired`, which sums whole file lengths, reports
+    /// progress on an episode that is growing the log — a treadmill that never
+    /// reaches its terminal because it never stops "progressing".
+    fn chargeCleaner(self: *WalState, log_before: u64, retired_before: i64) i64 {
+        // Charges NOTHING once the store is closed: a section append can fail
+        // the store from inside a unit, after which the segment set is empty
+        // and the delta would be a large negative charge.
+        if (self.segs.segmentsSlice().len == 0 and self.cleaner == null) return 0;
+        const charge = @as(i64, @intCast(self.segs.logBytes())) - @as(i64, @intCast(log_before)) +
+            (self.cleaner_bytes_retired - retired_before);
+        self.cleaner_bytes_written += charge;
+        return charge;
+    }
+
+    // ------------------------------------------------------------ the phases
+
+    /// Phase 1, one bounded unit: walk the retiring range and publish, as a
+    /// single `'C'` section, an image of every record met whose state still
+    /// lives inside it. Returns the steps walked.
+    ///
+    /// **Check, copy and publish are one serialized unit** — the whole method
+    /// runs under the WAL write lock — and that is correctness, not style.
+    /// Split them and the cleaner sees R live, copies image I, a committer
+    /// writes update U, and the cleaner then appends a stale `C(R, I)` AFTER
+    /// U: replay resurrects the old value.
+    ///
+    /// One section per unit, and every section is forced before the next is
+    /// appended: recovery infers mid-log rot from "a valid section follows an
+    /// invalid one", which is sound only while that holds.
+    fn publishUnit(
+        self: *WalState,
+        closed: *std.atomic.Value(bool),
+        budget: *const Budget,
+        written_so_far: i64,
+        records_so_far: usize,
+    ) DbError!usize {
+        const byte_room: u64 = if (budget.max_bytes > 0)
+            @intCast(@max(@as(i64, @intCast(budget.max_bytes)) - written_so_far, 1))
+        else
+            1 << 20;
+        const rec_room: usize = if (budget.max_records > 0)
+            @max(budget.max_records -| records_so_far, 1)
+        else
+            SCAN_UNIT_ENTRIES;
+        const cap = @min(byte_room, 1 << 20);
+        var out = DataOutput2.init(self.alloc);
+        defer out.deinit();
+        const r = try self.reserveLsn();
+
+        // (recid, carries content) per emitted image, applied to the
+        // identities only after the section is durable.
+        const Emitted = struct { recid: u64, content: bool };
+        var emitted: std.ArrayListUnmanaged(Emitted) = .empty;
+        defer emitted.deinit(self.alloc);
+        // Recids already encoded into THIS section. A recid met again in a
+        // later section of the range is normally filtered by its own raised
+        // `state_lsn` — but the identities move only once the section is
+        // durable, so within one unfinished batch that filter has not fired
+        // yet, and the decoder's one-entry-per-recid-per-section rule would be
+        // violated. Replay refuses such a section outright.
+        var in_batch: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer in_batch.deinit(self.alloc);
+
+        const boundary = self.cleaner.?.boundary_lsn;
+        const Visit = struct {
+            st: *WalState,
+            out: *DataOutput2,
+            emitted: *std.ArrayListUnmanaged(Emitted),
+            in_batch: *std.AutoHashMapUnmanaged(u64, void),
+            boundary: i64,
+            cap: u64,
+
+            const Sink = struct {
+                out: *DataOutput2,
+                recid: u64,
+                content_seen: *bool,
+                pub fn emit(sk: @This(), prealloc: bool, cap_bytes: usize, content: ?[]u8) DbError!void {
+                    if (prealloc) {
+                        try sk.out.writeU8(T_PREALLOC);
+                        try sk.out.packLong(sk.recid);
+                    } else {
+                        try sk.out.writeU8(T_RECORD);
+                        try sk.out.packLong(sk.recid);
+                        try sk.out.packLong(@as(u64, cap_bytes));
+                        if (content) |d| {
+                            try sk.out.packLong(@as(u64, d.len) + 1);
+                            try sk.out.writeAll(d);
+                            sk.content_seen.* = true;
+                        } else {
+                            try sk.out.packLong(0);
+                        }
+                    }
+                }
+            };
+
+            fn visit(v: @This(), recid: u64) DbError!bool {
+                // Fault injection (test-only): dropping a recid from phase 1
+                // is precisely the under-re-emission W10 exists to catch.
+                if (recid == v.st.drop_recid_from_publish and recid != 0) return true;
+                if (v.in_batch.contains(recid)) return true;
+                // Across units no dedup is needed: a recid re-emitted by an
+                // earlier unit has a `state_lsn` above the boundary, exactly
+                // like one a concurrent commit re-homed. Both are simply not
+                // candidates.
+                const sl = v.st.ids.state_lsn.get(recid) orelse return true;
+                if (sl > v.boundary) return true;
+                if (v.st.staged.getPtr(recid)) |s| {
+                    if (s.created) {
+                        // A recid an in-flight transaction allocated has no
+                        // committed entry and therefore no `state_lsn`; the
+                        // allocator cannot hand out a recid that is
+                        // committed-live. Both at once would mean inner's slot
+                        // has been overwritten with a preallocation while
+                        // committed content is still attested — re-emitting
+                        // either way would be a guess.
+                        v.st.diag.note(W_CLEAN_INFLIGHT, 0, 0, recid, sl);
+                        return error.DataCorruption;
+                    }
+                }
+                var content_seen = false;
+                const live = try v.st.inner.walSnapshotOne(recid, Sink{
+                    .out = v.out,
+                    .recid = recid,
+                    .content_seen = &content_seen,
+                });
+                if (!live) {
+                    // `state_lsn` present means "committed non-void", and
+                    // inner IS the committed state, so this cannot happen
+                    // without the identity map having diverged from the store.
+                    // Refuse rather than retire a segment whose contents were
+                    // not re-homed.
+                    v.st.diag.note(W_CLEAN_MISSING, 0, 0, recid, sl);
+                    return error.DataCorruption;
+                }
+                v.emitted.append(v.st.alloc, .{ .recid = recid, .content = content_seen }) catch
+                    return error.OutOfMemory;
+                v.in_batch.put(v.st.alloc, recid, {}) catch return error.OutOfMemory;
+                // An image larger than one unit's allowance still goes whole:
+                // a record cannot be split across sections.
+                return @as(u64, v.out.bytes().len) < v.cap;
+            }
+        };
+        const steps = try scanUnit(
+            &self.cleaner.?,
+            &self.segs,
+            &self.diag,
+            self.alloc,
+            rec_room,
+            Visit{
+                .st = self,
+                .out = &out,
+                .emitted = &emitted,
+                .in_batch = &in_batch,
+                .boundary = boundary,
+                .cap = cap,
+            },
+            Visit.visit,
+        );
+
+        if (emitted.items.len != 0) {
+            var bctx = RawBodyCtx{ .body = out.bytes() };
+            appendSection(&self.segs, self.segment_bytes, self.segs.io, TAG_IMAGE, r.lsn, self.alloc, &bctx, emitRawBody) catch |e| {
+                // W9, the cleaner's half: partial bytes may be on the device.
+                if (self.diag.reason.len == 0)
+                    self.diag.note(W_CLEAN_WRITE, self.activeSeq(), 0, 0, 0);
+                self.failClosed(closed);
+                return e;
+            };
+            self.next_lsn = r.after;
+            // IMAGES, not entries walked: the staleness clock compares the
+            // store's committed self-contained entries against the live set
+            // the futile episode had to preserve, and entries walked is
+            // neither — it counts the garbage too.
+            self.episode_records += @intCast(emitted.items.len);
+            // Identities move by the §4.2 row of each entry the section
+            // contains, AFTER it is durable and atomically with it. An
+            // allocator failure here is a crash shape rust cannot produce
+            // (its map inserts are infallible): the image is durable but the
+            // maps may now be half-moved, and a half-moved identity could
+            // stamp a wrong append base — the design's weakest point — so it
+            // fails CLOSED with its error identity kept (risk 14), exactly
+            // like a post-durability apply failure in commit. Reopen rebuilds
+            // the identities from the log.
+            //
+            // Whether this arm is REACHABLE is a property of other rules, and
+            // the workstream declines to leave that implicit: every emitted
+            // recid passed the candidate filter, so it already occupies
+            // `state_lsn` (and, when content-bearing in inner, `content_base_
+            // lsn` — content is set by exactly the applies that populate it),
+            // and a put over a present key never grows the map. The guard is
+            // defence in depth for the day an invariant above it moves.
+            for (emitted.items) |em| {
+                const move = if (em.content)
+                    self.ids.content(self.alloc, em.recid, r.lsn)
+                else
+                    self.ids.stateOnly(self.alloc, em.recid, r.lsn);
+                move catch |e| {
+                    if (self.diag.reason.len == 0)
+                        self.diag.note(W_CLEAN_APPLY, 0, 0, em.recid, 0);
+                    self.failClosed(closed);
+                    return e;
+                };
+            }
+        }
+        const c = &self.cleaner.?;
+        if (c.range_done) {
+            c.published = true;
+            c.rewind(); // also clears range_done, for the verify walk
+        }
+        return steps;
+    }
+
+    /// Phase 2 — W10, one bounded unit: re-walk the retiring range and assert
+    /// that every recid it mentions has been re-homed above it.
+    ///
+    /// **A mark cannot be made self-verifying after the unlink**, because the
+    /// evidence is exactly what is being deleted: a manifest of what was
+    /// re-homed cannot prove completeness, since an omitted recid is omitted
+    /// from the manifest too. The verifiable moment is here, while the
+    /// segments still exist. What it buys is that an under-re-emission — a
+    /// dropped `T_PREALLOC`, a dropped null-content record — fails loudly
+    /// BEFORE the data is destroyed, instead of silently until the free-recid
+    /// rebuild re-issues the recid and a later allocation collides with it.
+    /// The skip audit cannot see this class at all: a record wholly contained
+    /// in the range with no surviving append leaves no entry to skip.
+    ///
+    /// Chunking it across ticks is sound because the predicate is MONOTONE:
+    /// once `state_lsn[R]` is absent-or-above, only a new self-contained entry
+    /// at a still higher LSN can change it.
+    ///
+    /// Its boundary, stated so it is not over-trusted: W10 is sufficient for
+    /// OMISSION, not for image FIDELITY. It asks "was this recid re-homed?",
+    /// and a cleaner that emitted a CRC-valid but semantically wrong image
+    /// raises `state_lsn` just the same and passes.
+    fn verifyUnit(self: *WalState, budget: *const Budget, records_so_far: usize) DbError!usize {
+        const rec_room: usize = if (budget.max_records > 0)
+            @max(budget.max_records -| records_so_far, 1)
+        else
+            SCAN_UNIT_ENTRIES;
+        const c = &self.cleaner.?;
+        const Verify = struct {
+            st: *WalState,
+            boundary: i64,
+            target: i64,
+            fn visit(v: @This(), recid: u64) DbError!bool {
+                if (v.st.ids.state_lsn.get(recid)) |sl| {
+                    if (sl <= v.boundary) {
+                        v.st.diag.note(W_CLEAN_UNREHOMED, v.target, 0, recid, sl);
+                        return error.DataCorruption;
+                    }
+                }
+                return true;
+            }
+        };
+        const steps = try scanUnit(
+            c,
+            &self.segs,
+            &self.diag,
+            self.alloc,
+            rec_room,
+            Verify{ .st = self, .boundary = c.boundary_lsn, .target = c.target_seq },
+            Verify.visit,
+        );
+        if (c.range_done) c.verified = true;
+        return steps;
+    }
+
+    /// Closes a cycle: append the forced `'K'`, then unlink.
+    ///
+    /// **Ordering is the whole content of this method.** Every re-emitted
+    /// image was forced as it was written and every rollover sealed its
+    /// predecessor with a size-persisting force, so no mark ever attests
+    /// bytes that were not forced (W1). The `'K'` is forced before the unlink
+    /// (W5): a failed unlink is a leak the next open retries, never
+    /// permission to advance an unproven mark. Every crash point in between
+    /// is state-preserving — before the mark the retiring segments replay and
+    /// cleaning simply re-runs, after it they are already superseded.
+    fn finishCycle(self: *WalState, closed: *std.atomic.Value(bool)) DbError!void {
+        const target = self.cleaner.?.target_seq;
+        const log_start = self.cleaner.?.log_start_lsn;
+        try self.appendMark(closed, target, log_start);
+        var retired: u64 = 0;
+        for (self.segs.segmentsSlice()) |*s| {
+            if (s.seq > target) break;
+            retired += s.file_len;
+        }
+        self.segs.unlinkThrough(target) catch |e| {
+            if (self.diag.reason.len == 0)
+                self.diag.note(W_CLEAN_IO, target, 0, 0, 0);
+            self.failClosed(closed);
+            return e;
+        };
+        self.cleaner_bytes_retired += @intCast(retired);
+        self.cleaner = null;
+    }
+
+    /// One cleaning tick: re-emit, then verify (W10), then close the cycle —
+    /// as far as `budget` allows, stopping at the first limit reached. Returns
+    /// the bytes written. At most ONE cycle is closed per tick, so a caller
+    /// driving this in a loop always sees the cycle boundary and can
+    /// re-decide.
+    fn cleanTick(self: *WalState, closed: *std.atomic.Value(bool), budget: *const Budget) DbError!i64 {
+        var timer: ?std.time.Timer = if (budget.max_nanos > 0)
+            std.time.Timer.start() catch null
+        else
+            null;
+        var written: i64 = 0;
+        var records: usize = 0;
+        var closed_cycle = false;
+        var pending: ?DbError = null;
+        while (self.cleaner != null) {
+            const log_before = self.segs.logBytes();
+            const retired_before = self.cleaner_bytes_retired;
+            const published = self.cleaner.?.published;
+            const verified = self.cleaner.?.verified;
+            var step_err: ?DbError = null;
+            if (!published) {
+                if (self.publishUnit(closed, budget, written, records)) |n| records += n else |e| step_err = e;
+            } else if (!verified) {
+                if (self.verifyUnit(budget, records)) |n| records += n else |e| step_err = e;
+            } else {
+                if (self.finishCycle(closed)) |_| {
+                    closed_cycle = true;
+                    written += self.chargeCleaner(log_before, retired_before);
+                    break;
+                } else |e| step_err = e;
+            }
+            if (step_err) |e| {
+                // The two error classes part company HERE, and the reference
+                // separates them explicitly: `IOException` goes through
+                // `failClosed`, and only a `DBException` — a W10 refusal or an
+                // identity disagreement — rewinds and keeps the handle
+                // (StoreWAL.java:2628-2660).
+                //
+                // Collapsing them is not cosmetic. Automatic cleaning runs
+                // INSIDE commit, after the section is forced and applied and
+                // the staged transaction cleared, so a read error while
+                // reopening a retiring segment would return an error from
+                // `commit()` with the store still open and later writes still
+                // admitted — the store's I/O is broken and it says so once,
+                // then carries on.
+                //
+                // Zig's third class — an allocator refusal (risk 14,
+                // operational) — takes the rewind arm: nothing durable
+                // happened (the post-durability halves fail the store closed
+                // inside their own units before returning), the LSN is
+                // unmoved, and a retry under less pressure is legitimate.
+                if (e == error.Io) {
+                    if (self.diag.reason.len == 0)
+                        self.diag.note(W_CLEAN_IO, 0, 0, 0, 0);
+                    self.failClosed(closed);
+                    pending = e;
+                    break;
+                }
+                // A unit refused — W10 caught an under-re-emission, or an
+                // identity map disagreed with the inner store. The cursor has
+                // ALREADY stepped past the entry that refused (it advances
+                // before the visitor runs), so a later tick would resume
+                // beyond it, find nothing wrong in what remains, and write the
+                // mark: the loud refusal would become exactly the silent loss
+                // it exists to prevent. Rewind, so any retry re-walks the
+                // range from the bottom and reaches the same verdict — or a
+                // genuinely different one, if a commit has since re-homed the
+                // recid, which makes the retirement safe for real.
+                if (self.cleaner) |*cc| cc.rewind();
+                pending = e;
+                break;
+            }
+            written += self.chargeCleaner(log_before, retired_before);
+            if (budget.max_records > 0 and records >= budget.max_records) break;
+            if (budget.max_bytes > 0 and written >= @as(i64, @intCast(budget.max_bytes))) break;
+            if (timer) |*t| {
+                if (t.read() >= budget.max_nanos) break;
+            }
+        }
+        if (pending) |e| return e;
+        if (closed_cycle) {
+            // The cycle is closed and its whole cost is now charged, so this
+            // is the first moment its net is knowable. THREE bands, not two:
+            // halving on any gain oscillates around the break-even width,
+            // because a cycle that barely pays is not evidence the width is
+            // too big. Widen when it does not pay, hold when it pays modestly,
+            // and give width back only when it pays HANDSOMELY.
+            const cost = self.cleaner_bytes_written - self.cycle_written_at;
+            const gain = self.cleaner_bytes_retired - self.cycle_retired_at - cost;
+            if (gain <= cost >> 3) {
+                self.cycle_width = @min(CYCLE_WIDTH_CAP, @max(self.cycle_width, 1) * 2);
+            } else if (gain > cost >> 1) {
+                self.cycle_width = @max(self.cycle_width / 2, 1);
+            }
+            self.last_cycle_saturated = self.cycle_saturated;
+        }
+        return written;
+    }
+
+    /// Commit's inline clean. Gated on the TRIGGER alone, never on "a cycle is
+    /// open": continuing an open cycle here regardless would mean the first
+    /// commit after a background tick started one dragged it to completion
+    /// synchronously, moving the work back onto the commit path. An abandoned
+    /// cycle costs nothing durable — its images are forced and its retired
+    /// segments simply stay, so the log carries duplicates until someone
+    /// finishes it.
     fn autoCleanLocked(self: *WalState, closed: *std.atomic.Value(bool)) DbError!void {
-        _ = self;
-        _ = closed;
+        if (!self.cleaningDue()) {
+            self.clearLatch(); // the floor outlives a dip; see beginCycleIfDue
+            return;
+        }
+        // ONE bounded slice per commit. This runs inside commit's write-lock
+        // hold and cannot release it, so a loop here would be one
+        // uninterrupted hold for the whole pass: the per-tick budget would
+        // bound an internal iteration while the commit that triggered it
+        // still paid for all of them, consecutively, with every reader and
+        // writer waiting.
+        if (self.cleaner != null or try self.beginCycleIfDue(closed)) {
+            _ = try self.cleanTick(closed, &FOREGROUND_BUDGET);
+        }
+        // The exception is the hard ceiling. Once the log has run away — past
+        // twice its target — the writer participates until it is back under,
+        // and the pause is accepted deliberately: an unbounded pause is the
+        // lesser evil against an unbounded log.
+        while (self.cleaningUrgent() and
+            (self.cleaner != null or try self.beginCycleIfDue(closed)))
+        {
+            _ = try self.cleanTick(closed, &FOREGROUND_BUDGET);
+        }
+    }
+
+    /// `checkpoint()`'s body: clean the log all the way down.
+    ///
+    /// Rolling first is what makes this a WHOLE-log clean — every
+    /// section-bearing segment is then strictly below the active one, so a
+    /// single cycle whose target is `active.seq - 1` retires all of them and
+    /// its re-emission set is the whole committed store. One cycle, one mark,
+    /// one unlink, through exactly the machinery a budgeted tick uses.
+    fn cleanWholeLog(self: *WalState, closed: *std.atomic.Value(bool)) DbError!void {
+        while (self.cleaner != null) {
+            _ = try self.cleanTick(closed, &UNBOUNDED_BUDGET); // finish a partial cycle
+        }
+        const log_before = self.segs.logBytes();
+        const retired_before = self.cleaner_bytes_retired;
+        try self.rollActiveIfNonempty(closed);
+        _ = self.chargeCleaner(log_before, retired_before);
+        const target = self.segs.active().?.seq - 1;
+        // Below the first sequence number there is nothing to retire: the
+        // active segment is the store's first and it is empty, so the log is
+        // already as small as it can be.
+        if (target < FIRST_SEQ or self.segs.segmentsSlice().len < 2) return;
+        self.startCycle(target);
+        while (self.cleaner != null) {
+            _ = try self.cleanTick(closed, &UNBOUNDED_BUDGET);
+        }
+        self.abandonEpisode(); // an explicit full clean re-arms the automatic one
+    }
+
+    /// Writes a `'K'` mark: the fact that everything at or below
+    /// `cleaned_through_seq` may be removed, and where the retained log
+    /// begins. Forced before any unlink (W5).
+    fn appendMark(
+        self: *WalState,
+        closed: *std.atomic.Value(bool),
+        cleaned_through_seq: i64,
+        log_start_lsn: i64,
+    ) DbError!void {
+        var body = buildMarkBody(cleaned_through_seq, log_start_lsn);
+        const r = try self.reserveLsn();
+        var bctx = RawBodyCtx{ .body = &body };
+        appendSection(&self.segs, self.segment_bytes, self.segs.io, TAG_MARK, r.lsn, self.alloc, &bctx, emitRawBody) catch |e| {
+            if (self.diag.reason.len == 0)
+                self.diag.note(W_CLEAN_WRITE, self.activeSeq(), 0, 0, 0);
+            self.failClosed(closed);
+            return e;
+        };
+        self.next_lsn = r.after;
     }
 
     fn activeSeq(self: *WalState) i64 {
@@ -506,9 +1330,287 @@ const WalState = struct {
     }
 };
 
+/// A pre-built section body ('C' image batch or 'K' mark), emitted verbatim.
+/// Both passes see the same immutable slice, so the output is identical by
+/// construction.
+const RawBodyCtx = struct { body: []const u8 };
+
+fn emitRawBody(ctx: *const RawBodyCtx, sink: *BodySink) DbError!void {
+    try sink.write(ctx.body);
+}
+
 fn freeOps(alloc: Allocator, ops: *std.ArrayListUnmanaged(WalOp)) void {
     for (ops.items) |op| if (op.data) |d| alloc.free(d);
     ops.deinit(alloc);
+}
+
+// ============================== the cleaner (B3) =============================
+// Port of rust's A3 (`wal.rs`, the cleaner block), which is itself Java
+// `StoreWAL`'s incremental cleaner. Every constant is the reference's exact
+// number — the budget values are a measured deliverable, not a detail.
+
+/// One cleaning tick's allowance. `0` means "no limit" in every field, which is
+/// what an explicit `checkpoint()` runs under.
+const Budget = struct {
+    max_records: usize,
+    max_bytes: u64,
+    max_nanos: u64,
+};
+
+/// The budget a COMMIT pays (D8, adopted from the reference verbatim).
+///
+/// These numbers are the deliverable, not a detail. Java measured the
+/// store-size sweep that produced them: against the previous `(4096 records,
+/// 8 MiB, no time bound)`, commits over 1 ms went 326 -> 1 and p99.9
+/// 744 µs -> 176 µs, for ~1% of log high-water and ZERO extra device bytes.
+/// `max_nanos` is a SOFT ceiling — checked between work units, so a single
+/// oversize image still runs whole — which makes it a bound on how much work
+/// is STARTED, not a deadline.
+const FOREGROUND_BUDGET = Budget{
+    .max_records = 256,
+    .max_bytes = 512 << 10,
+    .max_nanos = 500_000,
+};
+
+/// What `checkpoint()` runs under: no limit, because the caller asked for all
+/// of it.
+const UNBOUNDED_BUDGET = Budget{ .max_records = 0, .max_bytes = 0, .max_nanos = 0 };
+
+/// Entries one scan unit walks when the budget names no record limit.
+const SCAN_UNIT_ENTRIES: usize = 256;
+
+/// Window for the two scans. Small on purpose: they read entry HEADERS and
+/// seek over payloads, so a replay-sized window would read a megabyte to
+/// decode ten bytes whenever entries are far apart, and the "bounded unit"
+/// would not be bounded in device reads at all.
+const SCAN_BUF: usize = 4096;
+
+/// Ceiling on `WalState.cycle_width`. A cycle's CLOSE is not budgeted —
+/// summing the retiring prefix, then closing, deleting and fsyncing every file
+/// in it, all under the write lock — so an uncapped width buys mark
+/// amortisation with an unbounded pause, which is the trade the incremental
+/// cleaner exists to refuse.
+const CYCLE_WIDTH_CAP: usize = 64;
+
+/// A cleaning cycle in progress: retire every segment with `seq <= target_seq`
+/// by re-emitting, above them, a self-contained image of every record whose
+/// state still lives inside them. Resumable across ticks with any budget.
+const Cleaner = struct {
+    /// `cleanedThroughSeq` the closing `'K'` will attest.
+    target_seq: i64,
+    /// `logStartLsn` the closing `'K'` will attest — the successor's STATED
+    /// start, read from its header rather than computed, so the number
+    /// recovery compares against is the number the writer recorded.
+    log_start_lsn: i64,
+    /// The last LSN the retiring range accounts for, `log_start_lsn - 1`.
+    ///
+    /// Deriving the re-emission boundary from the number the mark will record
+    /// — rather than from the retiring segment's own `last_lsn` — makes the
+    /// writer's obligation and recovery's check two readings of ONE value, and
+    /// it is total over the empty-segment case, where a `last_lsn` of 0 says
+    /// nothing.
+    boundary_lsn: i64,
+    /// Phase 1 (re-emit) has walked the whole range.
+    published: bool = false,
+    /// Phase 2 (W10) has walked it again.
+    verified: bool = false,
+
+    // ---- the scan cursor: phase 1 uses it, then rewinds and phase 2 reuses it
+    /// Index into the segment list; the retiring range is a prefix of it.
+    seg: usize = 0,
+    /// Offset of the next SECTION to enter within `seg`.
+    offset: u64 = 0,
+    /// Offset of the next ENTRY inside the section being walked, or `null`
+    /// between sections.
+    entry_pos: ?u64 = null,
+    /// End of the section body being walked.
+    body_end: u64 = 0,
+    /// The current walk has reached the top of the retiring range.
+    range_done: bool = false,
+
+    fn init(target_seq: i64, log_start_lsn: i64) Cleaner {
+        return .{
+            .target_seq = target_seq,
+            .log_start_lsn = log_start_lsn,
+            .boundary_lsn = log_start_lsn - 1,
+        };
+    }
+
+    /// Rewinds the cursor to the bottom of the range, for the second walk.
+    /// Deliberately does NOT reset `published`/`verified` — the reference's
+    /// `rewind` leaves them alone (`StoreWAL.java:2546-2552`), so a retry of a
+    /// refused cycle resumes past phase 1 and re-reaches the same verdict in
+    /// VERIFY rather than re-publishing. Do not "fix" this.
+    fn rewind(self: *Cleaner) void {
+        self.seg = 0;
+        self.offset = 0;
+        self.entry_pos = null;
+        self.range_done = false;
+    }
+};
+
+/// Did re-emitting `written` bytes to retire `retired` pay for itself? A GAIN
+/// OF AN EIGHTH of what was written, not merely a positive one.
+///
+/// Epsilon progress is not progress. At the minimum segment size, one-at-a-time
+/// cleaning was measured re-emitting 174 KB to reclaim 179 KB — a 33x write
+/// amplification for a 3% gain — and a strictly-positive test calls that
+/// success, so the cleaner runs forever, the log grows at traffic rate, and
+/// the terminal is never reached.
+fn paidForItself(retired: i64, written: i64) bool {
+    return retired - written > (written >> 3);
+}
+
+/// Walks up to `max_steps` entries of the retiring range, handing each entry's
+/// recid to `visit`, and stops early when `visit` returns `false`. Returns the
+/// steps taken; sets `c.range_done` once the range is exhausted.
+///
+/// The unit is **an entry**, not a section. A section may be arbitrarily large
+/// — a rollover happens only at a section boundary, so one commit can exceed
+/// `segment_bytes` on its own — so "one section per tick" would hold the write
+/// lock for an unbounded time, which is exactly the pause this cleaner
+/// removes. Payloads are SEEKED over, not read, so the cost is proportional to
+/// the number of entries rather than to the bytes they carry.
+///
+/// The reader is rebuilt per unit rather than carried in [`Cleaner`], which is
+/// a deliberate difference from the reference: a `SecIn` borrows its segment's
+/// file handle, and a cursor that owned one would make the WAL state
+/// self-referential. It costs one window refill per unit — 256 entries — not
+/// per section.
+fn scanUnit(
+    c: *Cleaner,
+    segs: *WalSegmentSet,
+    diag: *Diag,
+    alloc: Allocator,
+    max_steps: usize,
+    ctx: anytype,
+    comptime visit: fn (@TypeOf(ctx), u64) DbError!bool,
+) DbError!usize {
+    var steps: usize = 0;
+    outer: while (steps < max_steps) {
+        {
+            const list = segs.segmentsSlice();
+            if (c.seg >= list.len or list[c.seg].seq > c.target_seq) {
+                c.range_done = true;
+                return steps;
+            }
+            try list[c.seg].ensureOpen();
+        }
+        const seg = &segs.segmentsSlice()[c.seg];
+        const valid_end = seg.valid_end;
+        const seq = seg.seq;
+        var r = try SecIn.init(seg.handle().?, alloc, SCAN_BUF, diag);
+        defer r.deinit();
+        // The HARD bound is the segment, set once; `rebound` then narrows the
+        // soft bound per section without dropping the window.
+        r.resetHard(SEG_HDR, valid_end);
+        if (c.offset < SEG_HDR) c.offset = SEG_HDR;
+        var leave_segment = false;
+        var stop = false;
+        while (true) {
+            if (steps >= max_steps) break;
+            if (c.entry_pos == null) {
+                if (c.offset >= valid_end) {
+                    leave_segment = true;
+                    steps += 1;
+                    break;
+                }
+                // The header is read THROUGH the window, and both bounds are
+                // checked BEFORE the bytes are: this walk verifies no CRC —
+                // the section was verified whole at open — so it says what it
+                // trusts, and a header or body running past the validated end
+                // would otherwise surface as a bare overrun out of a scan that
+                // catches none.
+                if (valid_end - c.offset < SEC_HDR) {
+                    diag.note(W_CLEAN_SCAN_HDR, seq, c.offset, 0, 0);
+                    return error.DataCorruption;
+                }
+                r.rebound(c.offset, valid_end);
+                var hdr: [@as(usize, SEC_HDR)]u8 = undefined;
+                try r.readFully(&hdr);
+                const h = parseSecHdr(&hdr);
+                const body_start = c.offset + SEC_HDR;
+                if (h.body_len < 0 or @as(u64, @intCast(h.body_len)) > valid_end - body_start) {
+                    diag.note(W_CLEAN_SCAN_BODY, seq, c.offset, 0, h.body_len);
+                    return error.DataCorruption;
+                }
+                c.body_end = body_start + @as(u64, @intCast(h.body_len));
+                c.offset = c.body_end; // where the NEXT section begins
+                // Entering a section costs a header read and is charged like
+                // an entry. Without that, a range of mark-only or empty
+                // sections is walked ENTIRELY within one unit at no budgeted
+                // cost — the same unbounded-work-under-the-lock defect as a
+                // per-section unit, with metadata instead of payload.
+                steps += 1;
+                if (h.tag == TAG_MARK) continue; // a 'K' body carries no entries
+                c.entry_pos = body_start;
+            }
+            r.rebound(c.entry_pos.?, c.body_end); // the section bound, window kept
+            while (r.pos() < c.body_end and steps < max_steps) {
+                const recid = try nextEntryRecid(&r, seq, diag);
+                c.entry_pos = r.pos();
+                steps += 1;
+                if (!try visit(ctx, recid)) {
+                    stop = true;
+                    break;
+                }
+            }
+            if (c.entry_pos) |p| {
+                if (p >= c.body_end) c.entry_pos = null; // section done
+            }
+            if (stop) break;
+        }
+        if (leave_segment) {
+            // Released the moment the walk leaves it: what keeps the
+            // descriptor count O(1) rather than O(segments in the range).
+            segs.segmentsSlice()[c.seg].release();
+            c.seg += 1;
+            c.offset = 0;
+            c.entry_pos = null;
+            continue;
+        }
+        if (stop) break :outer;
+    }
+    return steps;
+}
+
+/// Decodes one entry for its recid alone, seeking over the payload.
+fn nextEntryRecid(r: *SecIn, seq: i64, diag: *Diag) DbError!u64 {
+    const ty = try r.readByte();
+    const recid = try r.unpackLong();
+    switch (ty) {
+        T_PREALLOC, T_DELETE => {},
+        T_RECORD => {
+            _ = try r.unpackLong(); // capacity
+            const len_plus = try r.unpackLong();
+            if (len_plus != 0) {
+                // Checked, unlike rust's bare add: `len_plus` is a disk value,
+                // and a wrapped seek target would walk BACKWARDS through a
+                // section instead of refusing (the overrun itself is caught
+                // by the reader's soft limit either way — this pins the
+                // refusing path).
+                const to = std.math.add(u64, r.pos(), len_plus - 1) catch {
+                    diag.note(wr.R_ENTRY_OVERRUN, seq, r.pos(), recid, 0);
+                    return error.DataCorruption;
+                };
+                r.seek(to);
+            }
+        },
+        T_APPEND => {
+            _ = try r.unpackLong(); // base delta
+            const len = try r.unpackLong();
+            const to = std.math.add(u64, r.pos(), len) catch {
+                diag.note(wr.R_ENTRY_OVERRUN, seq, r.pos(), recid, 0);
+                return error.DataCorruption;
+            };
+            r.seek(to);
+        },
+        else => {
+            diag.note(W_CLEAN_SCAN_TAG, seq, r.pos(), recid, ty);
+            return error.DataCorruption;
+        },
+    }
+    return recid;
 }
 
 // ------------------------------------------------------------ entry framing
@@ -752,8 +1854,9 @@ pub const StoreWAL = struct {
         defer self.rw.unlock();
         try self.writeGate();
         self.state.min_log_bytes = bytes;
-        // B3: a configuration change also abandons the cleaning episode in
-        // progress, latch included (`abandon_episode`).
+        // A configuration change invalidates every observation the current
+        // episode made, latch included.
+        self.state.abandonEpisode();
     }
 
     /// Size past which the writer seals the active segment and rolls to the
@@ -785,7 +1888,8 @@ pub const StoreWAL = struct {
         defer self.rw.unlock();
         try self.writeGate();
         self.state.space_amplification = factor;
-        // B3: also `abandon_episode`.
+        // See `setMinLogBytes`: the episode's observations are stale now.
+        self.state.abandonEpisode();
     }
 
     /// D2: delete this base's whole segment namespace inside [`close`], while
@@ -838,6 +1942,29 @@ pub const StoreWAL = struct {
     /// The store's base path: its segments are `<base>.wal.<16 hex>`.
     pub fn basePath(self: *const Self) []const u8 {
         return self.base;
+    }
+
+    /// Whether the futility latch is armed: the log is fully compacted and
+    /// still cannot meet the configured space-amplification ratio, so
+    /// automatic cleaning has stopped retrying it. Released by a quiet
+    /// trigger, a configuration change, a further target's worth of growth, a
+    /// materially lower target, or enough committed churn. Ungated like
+    /// `nextLsn`: the post-close answer is a truthful snapshot.
+    pub fn cleaningExhausted(self: *Self) bool {
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
+        return self.state.cleaningExhausted();
+    }
+
+    /// Lifetime cleaner accounting: bytes re-emitted, bytes retired. Ungated
+    /// like `nextLsn`: the post-close answer is a truthful snapshot.
+    pub fn cleanerBytes(self: *Self) struct { written: i64, retired: i64 } {
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
+        return .{
+            .written = self.state.cleaner_bytes_written,
+            .retired = self.state.cleaner_bytes_retired,
+        };
     }
 
     /// The store-level diagnostic (a copy): describes the most recent commit
@@ -1035,19 +2162,28 @@ pub const StoreWAL = struct {
         return self.state.commitLocked(&self.closed);
     }
 
-    /// B3 STUB — the whole-log clean (Java's `checkpoint()`: roll first, then
-    /// retire every segment below the fresh one by re-emitting a
-    /// self-contained image of every record they still own, a forced `'K'`
-    /// mark, and the unlink). Until the cleaner lands this is a no-op: the
-    /// log is unbounded on this branch, which is why the branch does not
-    /// reach `main` before B3. The v1 whole-file rewrite, its `.ckpt` temp
-    /// and its rename commit point are gone.
+    /// Cleans the log all the way down: retire every segment below a freshly
+    /// rolled one by re-emitting, above them, a self-contained image of every
+    /// record they still own, then a forced `'K'` mark authorizing their
+    /// removal, then the unlink.
+    ///
+    /// Rolling first is what makes it a whole-log clean; the cycle then runs
+    /// unbudgeted, because the caller asked for all of it. This is the
+    /// incremental cleaner with its budget set to "everything" — the only
+    /// sense in which a whole-store checkpoint still exists. The v1 whole-file
+    /// rewrite, its `.ckpt` temp and its rename commit point are gone.
+    ///
+    /// Staged (uncommitted) mutations are untouched: they exist only in
+    /// memory and are not part of any log.
     pub fn checkpoint(self: *Self) DbError!void {
         mod.assertNotInAction("checkpoint");
         self.rw.lock();
         defer self.rw.unlock();
         try self.writeGate();
-        // B3: `cleanWholeLog(&self.closed)`.
+        // The Diag protocol: cleared on entry so it always describes THIS
+        // checkpoint's failure or nothing.
+        self.state.diag = .{};
+        return self.state.cleanWholeLog(&self.closed);
     }
 
     pub fn compact(self: *Self) DbError!void {
@@ -1271,4 +2407,296 @@ pub const StoreWAL = struct {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+// ------------------------------------------------- in-module cleaner tests
+// Port of rust's seven A3-only in-module tests (`wal.rs`, "the cleaner"
+// section). In-module for the same reason rust's are: they poke `WalState`
+// internals no public surface reaches. The black-box cleaner tests live in
+// `store_wal_test.zig` with the rest of the public suite.
+
+const testing = std.testing;
+const sers = @import("../ser/serializers.zig");
+const TestL = sers.LongSer.instance;
+const TestB = sers.ByteArraySer.instance;
+
+var wal_test_scratch_n: std.atomic.Value(u64) = .init(0);
+
+/// A unique scratch dir with a base path inside it (test-section local; the
+/// black-box suite has its own richer twin).
+const TestScratch = struct {
+    alloc: Allocator,
+    dir: []u8,
+    base: []u8,
+
+    fn init(alloc: Allocator, tag: []const u8) !TestScratch {
+        const n = wal_test_scratch_n.fetchAdd(1, .monotonic);
+        const dir = try std.fmt.allocPrint(
+            alloc,
+            "/tmp/mapdb5_wal_cleaner_{d}_{s}_{d}",
+            .{ std.os.linux.getpid(), tag, n },
+        );
+        errdefer alloc.free(dir);
+        std.fs.cwd().deleteTree(dir) catch {};
+        try std.fs.cwd().makePath(dir);
+        const base = try std.fmt.allocPrint(alloc, "{s}/store.db", .{dir});
+        return .{ .alloc = alloc, .dir = dir, .base = base };
+    }
+
+    fn deinit(self: *TestScratch) void {
+        std.fs.cwd().deleteTree(self.dir) catch {};
+        self.alloc.free(self.base);
+        self.alloc.free(self.dir);
+    }
+};
+
+fn testPut(s: *StoreWAL, v: i64) !u64 {
+    return s.put(i64, testing.allocator, v, TestL);
+}
+
+fn testGet(s: *StoreWAL, recid: u64) !?i64 {
+    return s.get(i64, testing.allocator, recid, TestL);
+}
+
+test "wal3 B3: a gain of an eighth is what counts as paying for itself" {
+    // Epsilon progress is not progress: re-emitting 174 KB to reclaim 179 KB
+    // is a 33x write amplification for a 3% gain, and a strictly-positive
+    // test calls that success — so the cleaner runs forever and the terminal
+    // is never reached.
+    try testing.expect(!paidForItself(179_000, 174_000));
+    try testing.expect(!paidForItself(100, 100));
+    try testing.expect(!paidForItself(112, 100)); // exactly an eighth is not enough
+    try testing.expect(paidForItself(113, 100));
+    try testing.expect(paidForItself(1000, 100));
+}
+
+test "wal3 B3 W10: the mark is refused when a record was not re-homed" {
+    // The check that cannot be deferred past the unlink: the evidence is
+    // exactly what would be deleted. Fault injection drops one recid from
+    // phase 1, which is the under-re-emission W10 exists for.
+    var sc = try TestScratch.init(testing.allocator, "w10");
+    defer sc.deinit();
+    var s = try StoreWAL.openSegmentBytes(testing.allocator, sc.base, MIN_SEGMENT_BYTES);
+    defer s.deinit();
+    const victim = try testPut(&s, 1);
+    try s.commit();
+    var i: i64 = 0;
+    while (i < 6) : (i += 1) {
+        _ = try testPut(&s, i);
+        try s.commit();
+    }
+    const segs_before = try s.segmentSeqs(testing.allocator);
+    defer testing.allocator.free(segs_before);
+    try testing.expect(segs_before.len > 2);
+    s.state.drop_recid_from_publish = victim;
+
+    try testing.expectError(error.DataCorruption, s.checkpoint());
+    // The refusal names the record it is protecting, by identity.
+    const d = s.lastDiag();
+    try testing.expectEqual(W_CLEAN_UNREHOMED.ptr, d.reason.ptr);
+    try testing.expectEqual(victim, d.recid);
+    // Nothing was deleted and the durable log is intact.
+    {
+        const segs_after = try s.segmentSeqs(testing.allocator);
+        defer testing.allocator.free(segs_after);
+        try testing.expect(segs_after.len >= segs_before.len); // a refused cycle must not retire anything
+    }
+    try testing.expect(!s.isClosed()); // a refusal is not a store failure
+    try testing.expectEqual(@as(?i64, 1), try testGet(&s, victim));
+
+    // Removing the fault is NOT enough, and that is the reference's behaviour
+    // rather than a port defect. `rewind` resets the cursor and deliberately
+    // does not reset `published` (StoreWAL.java:2546-2552), so the partial
+    // cycle a retry resumes is still past phase 1: it re-walks the range in
+    // VERIFY, finds the same record un-re-homed, and refuses again. Java
+    // reaches the identical state — its `checkpoint` also finishes the
+    // partial cycle first (StoreWAL.java:2476) — so a port that "fixed" this
+    // by re-publishing would diverge.
+    s.state.drop_recid_from_publish = 0;
+    try testing.expectError(error.DataCorruption, s.checkpoint());
+
+    // The documented escape is the one the rewind comment names: a COMMIT
+    // that re-homes the recid, which makes the retirement safe for real
+    // rather than merely re-attempted. Then the same cycle completes.
+    try s.update(i64, testing.allocator, victim, 1, TestL);
+    try s.commit();
+    try s.checkpoint();
+    {
+        const segs_after = try s.segmentSeqs(testing.allocator);
+        defer testing.allocator.free(segs_after);
+        try testing.expect(segs_after.len < segs_before.len);
+    }
+    try testing.expectEqual(@as(?i64, 1), try testGet(&s, victim));
+    try s.close();
+    var s2 = try StoreWAL.open(testing.allocator, sc.base, true);
+    defer s2.deinit();
+    try testing.expectEqual(@as(?i64, 1), try testGet(&s2, victim));
+    try s2.verify();
+}
+
+test "wal3 B3 W5: the mark is forced before any unlink" {
+    // A failed unlink is a leak the next open retries; an unlink before the
+    // mark is durable is permission the log never gave.
+    var sc = try TestScratch.init(testing.allocator, "w5");
+    defer sc.deinit();
+    var rec = wal_io.RecordingIo.init(testing.allocator);
+    defer rec.deinit();
+    const seam = rec.io();
+    var s = try StoreWAL.openCfg(testing.allocator, sc.base, .{
+        .segment_bytes = MIN_SEGMENT_BYTES,
+        .io = &seam,
+    });
+    defer s.deinit();
+    var i: i64 = 0;
+    while (i < 4) : (i += 1) {
+        _ = try testPut(&s, i);
+        try s.commit();
+    }
+    const from = rec.events.items.len;
+    try s.checkpoint();
+    const kinds = try rec.kinds(testing.allocator);
+    defer testing.allocator.free(kinds);
+    const tail = kinds[from..];
+    var mark_force: ?usize = null;
+    var first_unlink: ?usize = null;
+    for (tail, 0..) |k, idx| {
+        if (k == .force_data) mark_force = idx; // last one wins (rposition)
+        if (k == .unlink and first_unlink == null) first_unlink = idx;
+    }
+    try testing.expect(mark_force != null); // the mark is forced
+    try testing.expect(first_unlink != null); // segments are retired
+    try testing.expect(mark_force.? < first_unlink.?); // the 'K' before the first unlink
+    try testing.expectEqual(wal_io.WalOpKind.dir_sync, tail[tail.len - 1]); // and the unlinks are made durable
+}
+
+test "wal3 B3: the closing mark states the successor's own first LSN" {
+    // logStartLsn is READ from the successor's header, never computed, so the
+    // number recovery compares against is the number the writer recorded.
+    var sc = try TestScratch.init(testing.allocator, "mark");
+    defer sc.deinit();
+    var s = try StoreWAL.openSegmentBytes(testing.allocator, sc.base, MIN_SEGMENT_BYTES);
+    defer s.deinit();
+    var i: i64 = 0;
+    while (i < 4) : (i += 1) {
+        _ = try testPut(&s, i);
+        try s.commit();
+    }
+    var local_closed = std.atomic.Value(bool).init(false);
+    try s.state.rollActiveIfNonempty(&local_closed);
+    const target = s.state.segs.active().?.seq - 1;
+    s.state.startCycle(target);
+    const c = s.state.cleaner.?;
+    const want = for (s.state.segs.segmentsSlice()) |*seg| {
+        if (seg.seq > target) break seg.headerFirstLsn();
+    } else unreachable;
+    try testing.expectEqual(want, c.log_start_lsn);
+    try testing.expectEqual(want - 1, c.boundary_lsn);
+    s.state.cleaner = null;
+    try s.close();
+}
+
+test "wal3 B3: the futility latch arms only on a saturated completed episode" {
+    var sc = try TestScratch.init(testing.allocator, "latch");
+    defer sc.deinit();
+    var s = try StoreWAL.open(testing.allocator, sc.base, true);
+    defer s.deinit();
+    const st = &s.state;
+    // An episode that gained nothing, from a cycle that was NOT as wide as
+    // the episode allows, says something about the width — not about the log.
+    st.clean_floor_seq = 1;
+    st.episode_retired = 0;
+    st.episode_written = 0;
+    st.cleaner_bytes_retired = 100;
+    st.cleaner_bytes_written = 100;
+    st.last_cycle_saturated = false;
+    st.endEpisode();
+    try testing.expect(!st.cleaningExhausted());
+    // The same episode, concluded from a saturated cycle, is evidence.
+    st.clean_floor_seq = 1;
+    st.episode_retired = 0;
+    st.episode_written = 0;
+    st.last_cycle_saturated = true;
+    st.endEpisode();
+    try testing.expect(st.cleaningExhausted());
+    // The guard is reset WITH the episode: an episode that did no work must
+    // not arm the terminal on a previous one's wide cycle.
+    try testing.expect(!st.last_cycle_saturated);
+    // A quiet trigger releases it — the situation changed.
+    st.min_log_bytes = std.math.maxInt(u64);
+    var local_closed = std.atomic.Value(bool).init(false);
+    try testing.expect(!(try st.beginCycleIfDue(&local_closed)));
+    try testing.expect(!st.cleaningExhausted());
+}
+
+test "wal3 B3: an in-flight allocation over committed state refuses rather than guesses" {
+    var sc = try TestScratch.init(testing.allocator, "inflight");
+    defer sc.deinit();
+    var s = try StoreWAL.openSegmentBytes(testing.allocator, sc.base, MIN_SEGMENT_BYTES);
+    defer s.deinit();
+    const r = try testPut(&s, 1);
+    try s.commit();
+    var i: i64 = 0;
+    while (i < 4) : (i += 1) {
+        _ = try testPut(&s, i);
+        try s.commit();
+    }
+    // A recid that is BOTH committed-live and allocated by an in-flight
+    // transaction cannot happen through the allocator; forge it, because the
+    // cleaner's response to it is the point.
+    s.state.staged.put(testing.allocator, r, Staged{ .created = true }) catch unreachable;
+    try testing.expectError(error.DataCorruption, s.checkpoint());
+    const d = s.lastDiag();
+    try testing.expectEqual(W_CLEAN_INFLIGHT.ptr, d.reason.ptr);
+    try testing.expectEqual(r, d.recid);
+    s.state.clearStaged();
+}
+
+test "wal3 B3: the scan seeks over payloads instead of reading them" {
+    // The cost of a cleaning pass is proportional to the number of ENTRIES,
+    // not to the bytes they carry: a scan that read payloads would make the
+    // "bounded unit" unbounded in device reads.
+    var sc = try TestScratch.init(testing.allocator, "scancost");
+    defer sc.deinit();
+    // The segment must hold all twenty: at 1 MiB the log rolls over after ~10
+    // and the walk below, which only ever enters the first segment, sees half
+    // of them — the test then measures the read cost of a walk it did not
+    // perform.
+    var s = try StoreWAL.openSegmentBytes(testing.allocator, sc.base, 8 << 20);
+    defer s.deinit();
+    // Twenty big records in one segment: 20 entries, ~2 MB of payload.
+    var i: u64 = 0;
+    while (i < 20) : (i += 1) {
+        const payload = try testing.allocator.alloc(u8, 100_000);
+        defer testing.allocator.free(payload);
+        @memset(payload, @truncate(i));
+        _ = try s.put([]const u8, testing.allocator, payload, TestB);
+        try s.commit();
+    }
+    const list = s.state.segs.segmentsSlice();
+    try list[0].ensureOpen();
+    const seg = &list[0];
+    var diag: Diag = .{};
+    var r = try SecIn.init(seg.handle().?, testing.allocator, SCAN_BUF, &diag);
+    defer r.deinit();
+    r.resetHard(SEG_HDR, seg.valid_end);
+    var off: u64 = SEG_HDR;
+    var entries: usize = 0;
+    while (off < seg.valid_end) {
+        r.rebound(off, seg.valid_end);
+        var hdr: [@as(usize, SEC_HDR)]u8 = undefined;
+        try r.readFully(&hdr);
+        const h = parseSecHdr(&hdr);
+        const body_start = off + SEC_HDR;
+        const body_end = body_start + @as(u64, @intCast(h.body_len));
+        r.rebound(body_start, body_end);
+        while (r.pos() < body_end) {
+            _ = try nextEntryRecid(&r, 1, &diag);
+            entries += 1;
+        }
+        off = body_end;
+    }
+    seg.release();
+    try testing.expectEqual(@as(usize, 20), entries);
+    // Walking 20 entries over ~2 MB must not read the payloads.
+    try testing.expect(r.reads <= 3 * @as(u64, entries));
 }

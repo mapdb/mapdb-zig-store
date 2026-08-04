@@ -1036,6 +1036,61 @@ pub const StoreDirect = struct {
         }
     }
 
+    /// Snapshot ONE recid for the WAL cleaner: `sink.emit(prealloc, cap_bytes,
+    /// content)` for a live/preallocated/null record (`content` is a temporary
+    /// owned slice freed after the callback returns), returning whether the
+    /// record exists at all (`false` for a void or deleted slot, where the sink
+    /// is not invoked). Mirrors Rust `wal_snapshot_one`. WAL hook.
+    ///
+    /// Per-recid rather than the whole-store [`walSnapshot`] walk, because the
+    /// cleaner re-homes the records it MEETS in the segments it is retiring —
+    /// a walk over every recid would be O(store) under the WAL write lock,
+    /// which is the pause the incremental cleaner exists to remove. The sink
+    /// runs after the per-recid lock is released, so the caller must hold its
+    /// own barrier (the WAL write lock) if it needs check-copy-publish to be
+    /// one serialized unit. The parity/semantic validation matches
+    /// [`walSnapshot`]'s (a deviation from rust in the refusing direction,
+    /// recorded there).
+    pub fn walSnapshotOne(self: *Self, recid: u64, sink: anytype) DbError!bool {
+        var c = try self.mutateEnter();
+        defer c.unlock();
+        var emit = false;
+        var is_prealloc = false;
+        var cap_bytes: usize = 0;
+        var content: ?[]u8 = null;
+        {
+            var rg: SegReadGuard = undefined;
+            self.segs.read(recid, &rg);
+            defer rg.unlock();
+            const ivval = try self.rawIndexGet(recid);
+            if (ivval != 0) {
+                if (!ivParityOk(ivval)) return error.DataCorruption; // index slot parity broken
+                if (!ivSemanticOk(ivval)) return error.DataCorruption; // capUnits/flags out of domain
+                const cap = iv.capUnits(ivval);
+                if (cap != iv.CAP_DELETED) {
+                    emit = true;
+                    if (cap == iv.CAP_NULL) {
+                        is_prealloc = iv.isPrealloc(ivval);
+                    } else if (iv.isLinked(ivval)) {
+                        content = try self.linkedGet(self.alloc, ivval);
+                    } else {
+                        const ou = try self.readUsed(ivval);
+                        const b = try self.alloc.alloc(u8, ou.used);
+                        errdefer self.alloc.free(b);
+                        try self.vol.getData(ou.off + 4, b);
+                        content = b;
+                        cap_bytes = @as(usize, cap) * 16;
+                    }
+                }
+            }
+        }
+        if (emit) {
+            defer if (content) |cc| self.alloc.free(cc);
+            try sink.emit(is_prealloc, cap_bytes, content);
+        }
+        return emit;
+    }
+
     // ---------- verify ----------
 
     fn verifyLocked(self: *Self) DbError!void {
