@@ -41,16 +41,32 @@ echo "== WAL sync probe (the real syscalls, not just seam events) =="
 # changes this sequence. strace is REQUIRED: a gate that skips this step passes
 # on seam events alone, which is the exact defect the step exists to catch
 # (B2p1 r2 review, blocking finding 1).
+#
+# The trace is taken with `-y`, so each call carries the PATH of the descriptor
+# it ran on, and the pin is a sequence of `call:file` pairs rather than bare
+# syscall names. A name-only pin says a sync happened, not what it synced: a
+# force that reported the active segment while syncing a stale one produced a
+# byte-identical name-only trace (B3 r2 review, blocking finding 1). The
+# temp directory's own name carries the pid, so it normalises to `DIR`; the
+# segment names are `<base>.wal.<16 hex>` and are pinned literally.
 command -v strace >/dev/null 2>&1 || {
   echo "strace not installed — the sync-site discriminator cannot run; gate FAILED"
   exit 1
 }
 zig build sync-probe
 probe_trace="$(mktemp)"
-strace -e trace=fsync,fdatasync -o "$probe_trace" ./zig-out/bin/wal-sync-probe
-got="$(grep -oE '^(fsync|fdatasync)' "$probe_trace" | tr '\n' ' ')"
+strace -y -e trace=fsync,fdatasync -o "$probe_trace" ./zig-out/bin/wal-sync-probe
+got="$(awk 'match($0, /^(fsync|fdatasync)\([0-9]+<[^>]+>/) {
+  call = substr($0, 1, index($0, "(") - 1)
+  rest = substr($0, index($0, "<") + 1)
+  path = substr(rest, 1, index(rest, ">") - 1)
+  n = split(path, parts, "/")
+  name = parts[n]
+  if (name ~ /^mapdb5_syncprobe_[0-9]+$/) name = "DIR"
+  printf "%s:%s ", call, name
+}' "$probe_trace")"
 rm -f "$probe_trace"
-want="fsync fsync fdatasync fdatasync fdatasync fsync fsync fsync fdatasync fdatasync "
+want="fsync:store.db.wal.0000000000000001 fsync:DIR fdatasync:store.db.wal.0000000000000001 fdatasync:store.db.wal.0000000000000001 fdatasync:store.db.wal.0000000000000001 fsync:store.db.wal.0000000000000001 fsync:store.db.wal.0000000000000002 fsync:DIR fdatasync:store.db.wal.0000000000000002 fdatasync:store.db.wal.0000000000000002 "
 if [ "$got" != "$want" ]; then
   echo "sync probe MISMATCH:"
   echo "  want: $want"

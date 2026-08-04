@@ -28,6 +28,13 @@
 //! `fdatasync` is called by NOTHING but the writer's data force, so its count
 //! equals the number of appends (marks included); every full force in the
 //! scenario is an fsync.
+//!
+//! The gate traces with `-y` and pins `call:file` pairs, not bare syscall
+//! names, because WHICH descriptor was synced is half the claim: the scenario
+//! deliberately spans two segments so that a force naming one segment while
+//! syncing another shows up as a different sequence. It did not before — that
+//! exact mutant produced a byte-identical name-only trace (B3 r2 review,
+//! blocking finding 1).
 
 const std = @import("std");
 const mapdb = @import("mapdb_zig_store");

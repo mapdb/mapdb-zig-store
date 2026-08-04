@@ -624,7 +624,7 @@ const WalState = struct {
     fn rollActiveInner(self: *WalState) DbError!void {
         const a = self.segs.active().?; // checked by the caller
         try a.ensureOpen();
-        try forceFull(self.segs.io, a.handle().?, a.seq, a.file_len);
+        try forceFull(self.segs.io, a, a.file_len);
         a.release();
         // `a` is DEAD from here: `createSegment` may reallocate the list.
         _ = try self.segs.createSegment(self.next_lsn);
@@ -2569,13 +2569,28 @@ test "wal3 B3 W5: the mark is forced before any unlink" {
     // event's TAG, not by position. A forced 'C' image is also a force_data
     // event, so "the last force precedes the first unlink" was satisfiable
     // with the mark's own force deleted (B3 review, blocking finding 1).
+    // And it must be forced ON THE SEGMENT THE MARK WAS WRITTEN TO: the force's
+    // `seq` is required to equal the seq of the mark's own section header. A
+    // tag-matched force says only that SOME descriptor was synced — a force
+    // that named the active segment while syncing a stale one passed this test
+    // and the syscall gate both (B3 r2 review, blocking finding 1). Production
+    // now derives the event and the fd from one `*Segment`, and this is the
+    // assertion that a caller cannot reintroduce the split.
     var mark_force: ?usize = null;
+    var mark_force_seq: i64 = 0;
+    var mark_hdr_seq: ?i64 = null;
     var first_unlink: ?usize = null;
     for (evs, 0..) |e, idx| {
-        if (e.kind == .force_data and e.tag == TAG_MARK) mark_force = idx;
+        if (e.kind == .sec_header and e.tag == TAG_MARK) mark_hdr_seq = e.seq;
+        if (e.kind == .force_data and e.tag == TAG_MARK) {
+            mark_force = idx;
+            mark_force_seq = e.seq;
+        }
         if (e.kind == .unlink and first_unlink == null) first_unlink = idx;
     }
     try testing.expect(mark_force != null); // the mark is forced, as the mark
+    try testing.expect(mark_hdr_seq != null); // and it really was written
+    try testing.expectEqual(mark_hdr_seq.?, mark_force_seq); // on the segment that holds it
     try testing.expect(first_unlink != null); // segments are retired
     try testing.expect(mark_force.? < first_unlink.?); // the 'K' before the first unlink
     try testing.expectEqual(wal_io.WalOpKind.dir_sync, evs[evs.len - 1].kind); // and the unlinks are made durable

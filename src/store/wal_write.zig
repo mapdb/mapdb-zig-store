@@ -132,20 +132,29 @@ pub const BodySink = struct {
 /// really is `fdatasync` — not a no-op, not the wrong flavour — is pinned by the
 /// gate's strace probe (`wal_sync_probe.zig`), which counts the actual syscalls;
 /// the seam trace alone is declared intent, not evidence.
-fn forceData(io: ?*const WalIo, file: std.fs.File, seq: i64, end: u64, tag: u8) DbError!void {
-    try walIoEvent(io, WalOpKind.force_data, seq, end, 0, tag);
-    std.posix.fdatasync(file.handle) catch return error.Io;
+///
+/// The force takes the SEGMENT, not a file and a sequence: the reported `seq`
+/// and the synced descriptor are then read out of the same object, so a caller
+/// cannot name one segment and sync another. It could before — the two arrived
+/// as independent arguments — and a mutant that reported the active segment
+/// while syncing a stale one passed both the seam suite and the syscall gate
+/// (B3 round-2 review, blocking finding 1). Recovery reads the segment the
+/// bytes are IN; a force on any other descriptor leaves the section unflushed
+/// with the log claiming otherwise.
+fn forceData(io: ?*const WalIo, seg: *Segment, end: u64, tag: u8) DbError!void {
+    try walIoEvent(io, WalOpKind.force_data, seg.seq, end, 0, tag);
+    std.posix.fdatasync(seg.handle().?.handle) catch return error.Io;
 }
 
 /// The sealing force (W3) — force(true), never a data-only sync: the sealed
 /// segment's SIZE is the payload (D5). One operation, like [forceData], and
-/// pinned by the same probe. Public because the cleaner's episode roll (B3,
-/// `wal.zig`) seals the active segment through exactly this function — a second
-/// spelling of "event + fsync" would reintroduce the drift the one-function
-/// rule exists to prevent.
-pub fn forceFull(io: ?*const WalIo, file: std.fs.File, seq: i64, len: u64) DbError!void {
-    try walIoEvent(io, WalOpKind.force_full, seq, len, 0, 0);
-    std.posix.fsync(file.handle) catch return error.Io;
+/// pinned by the same probe, and it takes the segment for the same reason.
+/// Public because the cleaner's episode roll (B3, `wal.zig`) seals the active
+/// segment through exactly this function — a second spelling of "event + fsync"
+/// would reintroduce the drift the one-function rule exists to prevent.
+pub fn forceFull(io: ?*const WalIo, seg: *Segment, len: u64) DbError!void {
+    try walIoEvent(io, WalOpKind.force_full, seg.seq, len, 0, 0);
+    std.posix.fsync(seg.handle().?.handle) catch return error.Io;
 }
 
 // ------------------------------------------------------------ append a section
@@ -188,7 +197,7 @@ pub fn appendSection(
             // port's data sync loses a sealed segment's tail extent, because
             // recovery would then see a torn NON-FINAL segment and refuse a
             // legitimate image.
-            try forceFull(io, a.handle().?, a.seq, a.file_len);
+            try forceFull(io, a, a.file_len);
             // The sealed segment will never be read or written again by this store
             // (nothing reads a segment after recovery). Releasing here is the same
             // recorded divergence as W7's: the reference keeps the stale handle,
@@ -243,7 +252,7 @@ pub fn appendSection(
     // creating a segment (W2), sealing one at rollover (W3), the post-truncate
     // force (W7) — a full sync is used instead, and the distinction is spec.
     const end = body_start + body_len;
-    try forceData(io, file, seq, end, tag);
+    try forceData(io, active, end, tag);
 
     active.file_len = end;
     active.valid_end = end;
