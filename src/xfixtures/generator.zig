@@ -663,7 +663,122 @@ fn writeFragment(alloc: Allocator, path: []const u8, r: Recids, raw_len: usize, 
     try f.writeAll(out.items);
 }
 
+/// `--golden <dir>`: write ONE port-authored WAL v3 namespace and stop.
+///
+/// Not the Stage C fixture generator — that is `mainStageC`, still parked, and
+/// this deliberately does not touch it. This is C0b's single deliverable from
+/// plan C-D2 / fable finding 7: the byte-pinned reader sample is Java-written,
+/// so without a port-written bundle beside it the first time any engine reads
+/// port-authored GROUPING is C5's full staged run. D6 explicitly permits
+/// writers to group entries differently, so that is a real reader bug class
+/// surfacing at the pipeline's most expensive point instead of its cheapest.
+///
+/// The workload mirrors `Wal3GoldenWriter.workload` in mapdb-java-store — same
+/// operations, same payload ids, same lengths, same 4096-byte segment size — so
+/// a diff between the two bundles is a diff in ENGINE behaviour and nothing
+/// else. Their bytes are NOT expected to match.
+fn mainGolden(alloc: Allocator, out_dir: []const u8) !void {
+    const BASE: u64 = 141; // zig tail base (contract §5)
+
+    // REFUSE a non-empty target before touching anything. The C0b review found
+    // this mode would happily open an EXISTING namespace in place and append,
+    // update and delete records in it — the same class of damage the staleness
+    // refusal below exists to prevent, reintroduced by a mode that ran before
+    // it. There is deliberately no `--force`: this writes one small fixture,
+    // so "point it somewhere fresh" costs nothing and removes the failure mode
+    // rather than gating it behind a flag someone will pass reflexively.
+    std.fs.cwd().makePath(out_dir) catch |e|
+        fatal("cannot create output dir `{s}`: {s}", .{ out_dir, @errorName(e) });
+    {
+        var dir = std.fs.cwd().openDir(out_dir, .{ .iterate = true }) catch |e|
+            fatal("cannot open output dir `{s}`: {s}", .{ out_dir, @errorName(e) });
+        defer dir.close();
+        var it = dir.iterate();
+        if (try it.next()) |first|
+            fatal("--golden needs an EMPTY directory; `{s}` already contains `{s}`. " ++
+                "Opening a populated namespace would mutate it in place.", .{ out_dir, first.name });
+    }
+
+    const base_path = try std.fs.path.join(alloc, &.{ out_dir, "x" });
+    defer alloc.free(base_path);
+
+    var s = mapdb.StoreWAL.openSegmentBytes(alloc, base_path, 4096) catch |e|
+        fatal("cannot open `{s}`: {s}", .{ base_path, @errorName(e) });
+    // On the error path both teardown steps must run, exactly once each: the
+    // explicit `close()` at the end is part of the fixture (it seals the
+    // segment), and `close()` is a documented no-op on an already-closed store,
+    // so a failing explicit close cannot be retried into a double free here.
+    errdefer {
+        s.close() catch {};
+        s.deinit();
+    }
+
+    const p1 = try payloadAlloc(alloc, BASE, 200);
+    defer alloc.free(p1);
+    const p2 = try payloadAlloc(alloc, BASE + 1, 900);
+    defer alloc.free(p2);
+    const a = try s.put([]const u8, alloc, p1, R);
+    const b = try s.put([]const u8, alloc, p2, R);
+    _ = try s.preallocate();
+    try s.commit();
+
+    var i: u64 = 0;
+    while (i < 6) : (i += 1) {
+        const p = try payloadAlloc(alloc, BASE + 10 + i, 700);
+        defer alloc.free(p);
+        _ = try s.put([]const u8, alloc, p, R);
+    }
+    try s.commit();
+
+    const p3 = try payloadAlloc(alloc, BASE + 2, 120);
+    defer alloc.free(p3);
+    try s.update([]const u8, alloc, a, p3, R);
+    try s.delete(b);
+    try s.commit();
+
+    const p4 = try payloadAlloc(alloc, BASE + 3, 64);
+    defer alloc.free(p4);
+    _ = try s.put([]const u8, alloc, p4, R);
+    try s.commit();
+
+    // the smallest bodies the engine can produce (see the java writer's note)
+    _ = try s.preallocate();
+    try s.commit();
+    _ = try s.put([]const u8, alloc, "", R);
+    try s.commit();
+
+    try s.close();
+    s.deinit(); // close() and deinit() are separate steps (store_wal_test.zig:242)
+    std.debug.print("wrote a zig-authored v3 namespace under {s}\n", .{out_dir});
+}
+
 pub fn main() !void {
+    // `--golden <dir>` runs BEFORE the staleness refusal below: it writes a
+    // fresh namespace into its own directory and never touches the v1 fixture
+    // outputs the refusal exists to protect.
+    {
+        var gpa: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = gpa.deinit();
+        const alloc = gpa.allocator();
+        const args = try std.process.argsAlloc(alloc);
+        defer std.process.argsFree(alloc, args);
+        // EXACT shape: `--golden <dir>` and nothing else. Scanning for
+        // `--golden` anywhere let `--out protected --golden protected` silently
+        // ignore `--out` and run against the directory the staleness refusal
+        // was protecting (C0b review finding 5).
+        if (args.len >= 2 and std.mem.eql(u8, args[1], "--golden")) {
+            if (args.len != 3)
+                fatal("usage: --golden <dir>   (exactly one argument, no other flags)", .{});
+            try mainGolden(alloc, args[2]);
+            return;
+        }
+        for (args[1..]) |a| {
+            if (std.mem.eql(u8, a, "--golden"))
+                fatal("--golden must be the FIRST argument and the only mode: " ++
+                    "`--golden <dir>`", .{});
+        }
+    }
+
     // FAIL FAST, before any output-directory mutation: the W half of this
     // generator became unrunnable at the WAL v3 cutover (StoreWAL writes a
     // segment NAMESPACE, not the single v1 file the fixture rows publish),
