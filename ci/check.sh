@@ -34,7 +34,9 @@ echo "== WAL sync probe (the real syscalls, not just seam events) =="
 # the kernel-observed sync sequence is pinned exactly:
 #   create seg 1 (file fsync, dir fsync) . 3 appends (fdatasync each) .
 #   rollover seal (fsync) . create seg 2 (file fsync, dir fsync) .
-#   final append (fdatasync)
+#   final append (fdatasync) . 'K' mark append (fdatasync — a TAG-conditional
+#   skip of the mark's force is invisible to a section-only scenario; B3
+#   review, blocking finding 1)
 # Deleting either of the writer's syncs, or swapping one flavour for the other,
 # changes this sequence. strace is REQUIRED: a gate that skips this step passes
 # on seam events alone, which is the exact defect the step exists to catch
@@ -48,7 +50,7 @@ probe_trace="$(mktemp)"
 strace -e trace=fsync,fdatasync -o "$probe_trace" ./zig-out/bin/wal-sync-probe
 got="$(grep -oE '^(fsync|fdatasync)' "$probe_trace" | tr '\n' ' ')"
 rm -f "$probe_trace"
-want="fsync fsync fdatasync fdatasync fdatasync fsync fsync fsync fdatasync "
+want="fsync fsync fdatasync fdatasync fdatasync fsync fsync fsync fdatasync fdatasync "
 if [ "$got" != "$want" ]; then
   echo "sync probe MISMATCH:"
   echo "  want: $want"

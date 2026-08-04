@@ -16,17 +16,26 @@
 //!   3. one append with the limit at 1 byte  → the rollover seal's fsync, the
 //!      successor create's fsync + directory fsync, then the section's
 //!      fdatasync
-//!   4. close
+//!   4. one `'K'` mark append              → 1× fdatasync
+//!   5. close
+//!
+//! Step 4 exists because the mark's force is W5's whole content and a
+//! TAG-conditional skip of it is invisible to a section-only scenario: the
+//! B3 review ran exactly that mutant (`if (tag != 'K') forceData`) and the
+//! prior scenario passed. With a mark in the trace, deleting the `'K'` force
+//! changes the kernel-observed counts and fails the gate.
 //!
 //! `fdatasync` is called by NOTHING but the writer's data force, so its count
-//! equals the number of appends; every full force in the scenario is an fsync.
+//! equals the number of appends (marks included); every full force in the
+//! scenario is an fsync.
 
 const std = @import("std");
 const mapdb = @import("mapdb_zig_store");
 
 const ws = mapdb.store.wal_segments;
 const ww = mapdb.store.wal_write;
-const TAG_SECTION = mapdb.store.wal_recover.TAG_SECTION;
+const wr = mapdb.store.wal_recover;
+const TAG_SECTION = wr.TAG_SECTION;
 
 const Ctx = struct { body: []const u8 };
 
@@ -39,6 +48,14 @@ fn append(set: *ws.WalSegmentSet, segment_bytes: u64, lsn: i64, alloc: std.mem.A
     // syscalls.
     const ctx = Ctx{ .body = "probe" };
     try ww.appendSection(set, segment_bytes, null, TAG_SECTION, lsn, alloc, &ctx, emitBody);
+}
+
+fn appendMark(set: *ws.WalSegmentSet, lsn: i64, alloc: std.mem.Allocator) !void {
+    // A genuine mark body, exactly as the cleaner writes one (its content is
+    // irrelevant to the syscall counts; its TAG is the point).
+    const body = wr.buildMarkBody(1, lsn);
+    const ctx = Ctx{ .body = &body };
+    try ww.appendSection(set, 1 << 20, null, wr.TAG_MARK, lsn, alloc, &ctx, emitBody);
 }
 
 pub fn main() !void {
@@ -58,4 +75,5 @@ pub fn main() !void {
     var lsn: i64 = 1;
     while (lsn <= 3) : (lsn += 1) try append(&set, 1 << 20, lsn, alloc);
     try append(&set, 1, 4, alloc);
+    try appendMark(&set, 5, alloc);
 }

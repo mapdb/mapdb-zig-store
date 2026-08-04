@@ -1496,69 +1496,79 @@ fn scanUnit(
             }
             try list[c.seg].ensureOpen();
         }
-        const seg = &segs.segmentsSlice()[c.seg];
-        const valid_end = seg.valid_end;
-        const seq = seg.seq;
-        var r = try SecIn.init(seg.handle().?, alloc, SCAN_BUF, diag);
-        defer r.deinit();
-        // The HARD bound is the segment, set once; `rebound` then narrows the
-        // soft bound per section without dropping the window.
-        r.resetHard(SEG_HDR, valid_end);
-        if (c.offset < SEG_HDR) c.offset = SEG_HDR;
         var leave_segment = false;
         var stop = false;
-        while (true) {
-            if (steps >= max_steps) break;
-            if (c.entry_pos == null) {
-                if (c.offset >= valid_end) {
-                    leave_segment = true;
+        {
+            const seg = &segs.segmentsSlice()[c.seg];
+            const valid_end = seg.valid_end;
+            const seq = seg.seq;
+            // The reader BORROWS the segment's handle, so it lives in this
+            // inner scope, which ends BEFORE the leave path releases the
+            // segment: the borrower dies before the owner closes the
+            // descriptor. That is the handle rule `wal_segments.zig` states,
+            // and rust enforces it by drop order; today `SecIn.deinit` only
+            // frees its window, but scoping it keeps a future deinit change
+            // from becoming a latent read of a closed fd (B3 review,
+            // non-blocking finding 1).
+            var r = try SecIn.init(seg.handle().?, alloc, SCAN_BUF, diag);
+            defer r.deinit();
+            // The HARD bound is the segment, set once; `rebound` then narrows
+            // the soft bound per section without dropping the window.
+            r.resetHard(SEG_HDR, valid_end);
+            if (c.offset < SEG_HDR) c.offset = SEG_HDR;
+            while (true) {
+                if (steps >= max_steps) break;
+                if (c.entry_pos == null) {
+                    if (c.offset >= valid_end) {
+                        leave_segment = true;
+                        steps += 1;
+                        break;
+                    }
+                    // The header is read THROUGH the window, and both bounds are
+                    // checked BEFORE the bytes are: this walk verifies no CRC —
+                    // the section was verified whole at open — so it says what it
+                    // trusts, and a header or body running past the validated end
+                    // would otherwise surface as a bare overrun out of a scan that
+                    // catches none.
+                    if (valid_end - c.offset < SEC_HDR) {
+                        diag.note(W_CLEAN_SCAN_HDR, seq, c.offset, 0, 0);
+                        return error.DataCorruption;
+                    }
+                    r.rebound(c.offset, valid_end);
+                    var hdr: [@as(usize, SEC_HDR)]u8 = undefined;
+                    try r.readFully(&hdr);
+                    const h = parseSecHdr(&hdr);
+                    const body_start = c.offset + SEC_HDR;
+                    if (h.body_len < 0 or @as(u64, @intCast(h.body_len)) > valid_end - body_start) {
+                        diag.note(W_CLEAN_SCAN_BODY, seq, c.offset, 0, h.body_len);
+                        return error.DataCorruption;
+                    }
+                    c.body_end = body_start + @as(u64, @intCast(h.body_len));
+                    c.offset = c.body_end; // where the NEXT section begins
+                    // Entering a section costs a header read and is charged like
+                    // an entry. Without that, a range of mark-only or empty
+                    // sections is walked ENTIRELY within one unit at no budgeted
+                    // cost — the same unbounded-work-under-the-lock defect as a
+                    // per-section unit, with metadata instead of payload.
                     steps += 1;
-                    break;
+                    if (h.tag == TAG_MARK) continue; // a 'K' body carries no entries
+                    c.entry_pos = body_start;
                 }
-                // The header is read THROUGH the window, and both bounds are
-                // checked BEFORE the bytes are: this walk verifies no CRC —
-                // the section was verified whole at open — so it says what it
-                // trusts, and a header or body running past the validated end
-                // would otherwise surface as a bare overrun out of a scan that
-                // catches none.
-                if (valid_end - c.offset < SEC_HDR) {
-                    diag.note(W_CLEAN_SCAN_HDR, seq, c.offset, 0, 0);
-                    return error.DataCorruption;
+                r.rebound(c.entry_pos.?, c.body_end); // the section bound, window kept
+                while (r.pos() < c.body_end and steps < max_steps) {
+                    const recid = try nextEntryRecid(&r, seq, diag);
+                    c.entry_pos = r.pos();
+                    steps += 1;
+                    if (!try visit(ctx, recid)) {
+                        stop = true;
+                        break;
+                    }
                 }
-                r.rebound(c.offset, valid_end);
-                var hdr: [@as(usize, SEC_HDR)]u8 = undefined;
-                try r.readFully(&hdr);
-                const h = parseSecHdr(&hdr);
-                const body_start = c.offset + SEC_HDR;
-                if (h.body_len < 0 or @as(u64, @intCast(h.body_len)) > valid_end - body_start) {
-                    diag.note(W_CLEAN_SCAN_BODY, seq, c.offset, 0, h.body_len);
-                    return error.DataCorruption;
+                if (c.entry_pos) |p| {
+                    if (p >= c.body_end) c.entry_pos = null; // section done
                 }
-                c.body_end = body_start + @as(u64, @intCast(h.body_len));
-                c.offset = c.body_end; // where the NEXT section begins
-                // Entering a section costs a header read and is charged like
-                // an entry. Without that, a range of mark-only or empty
-                // sections is walked ENTIRELY within one unit at no budgeted
-                // cost — the same unbounded-work-under-the-lock defect as a
-                // per-section unit, with metadata instead of payload.
-                steps += 1;
-                if (h.tag == TAG_MARK) continue; // a 'K' body carries no entries
-                c.entry_pos = body_start;
+                if (stop) break;
             }
-            r.rebound(c.entry_pos.?, c.body_end); // the section bound, window kept
-            while (r.pos() < c.body_end and steps < max_steps) {
-                const recid = try nextEntryRecid(&r, seq, diag);
-                c.entry_pos = r.pos();
-                steps += 1;
-                if (!try visit(ctx, recid)) {
-                    stop = true;
-                    break;
-                }
-            }
-            if (c.entry_pos) |p| {
-                if (p >= c.body_end) c.entry_pos = null; // section done
-            }
-            if (stop) break;
         }
         if (leave_segment) {
             // Released the moment the walk leaves it: what keeps the
@@ -2554,19 +2564,21 @@ test "wal3 B3 W5: the mark is forced before any unlink" {
     }
     const from = rec.events.items.len;
     try s.checkpoint();
-    const kinds = try rec.kinds(testing.allocator);
-    defer testing.allocator.free(kinds);
-    const tail = kinds[from..];
+    const evs = rec.events.items[from..];
+    // The force the assertion finds must be the 'K' ITSELF — matched by the
+    // event's TAG, not by position. A forced 'C' image is also a force_data
+    // event, so "the last force precedes the first unlink" was satisfiable
+    // with the mark's own force deleted (B3 review, blocking finding 1).
     var mark_force: ?usize = null;
     var first_unlink: ?usize = null;
-    for (tail, 0..) |k, idx| {
-        if (k == .force_data) mark_force = idx; // last one wins (rposition)
-        if (k == .unlink and first_unlink == null) first_unlink = idx;
+    for (evs, 0..) |e, idx| {
+        if (e.kind == .force_data and e.tag == TAG_MARK) mark_force = idx;
+        if (e.kind == .unlink and first_unlink == null) first_unlink = idx;
     }
-    try testing.expect(mark_force != null); // the mark is forced
+    try testing.expect(mark_force != null); // the mark is forced, as the mark
     try testing.expect(first_unlink != null); // segments are retired
     try testing.expect(mark_force.? < first_unlink.?); // the 'K' before the first unlink
-    try testing.expectEqual(wal_io.WalOpKind.dir_sync, tail[tail.len - 1]); // and the unlinks are made durable
+    try testing.expectEqual(wal_io.WalOpKind.dir_sync, evs[evs.len - 1].kind); // and the unlinks are made durable
 }
 
 test "wal3 B3: the closing mark states the successor's own first LSN" {
