@@ -35,7 +35,7 @@ pub const xfixtures_wal3 = @import("xfixtures/wal3_fixtures.zig");
 // The cross-port conformance suites, pulled in for TEST DISCOVERY ONLY.
 //
 // `pub const` would publish them: a downstream importer could name the WAL v3
-/// decoder, the manifest executor and the format constants it re-exports, and
+// decoder, the manifest executor and the format constants it re-exports, and
 // depend on shapes that exist to be rewritten every time the fixture protocol
 // moves. The C3z review found exactly that, and the fix is that a test root
 // references a test module rather than exporting it. Golden files live in
