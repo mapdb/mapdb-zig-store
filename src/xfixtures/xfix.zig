@@ -459,6 +459,22 @@ pub fn decode(ctx: *Ctx, raw: []const u8, where: []const u8, out: *Segment) Erro
     out.trailing = raw.len - off;
 }
 
+/// [`decode`] plus the requirement every PINNED file must satisfy: the segment
+/// is framed all the way to its last byte.
+///
+/// The rule cannot live in [`decode`], which reports a torn tail on purpose so a
+/// caller can decide whether one is legal. It cannot be measured by the sample
+/// either — no pinned file has a torn tail, so deleting the rule left the whole
+/// suite green, which the C3z campaign measured. That is lesson (g) in its pure
+/// form: a rule whose subject never varies in the corpus is reachable only by a
+/// synthetic input. Every production call site goes through here, so the rule is
+/// written once and the battery can address it directly.
+pub fn decodeComplete(ctx: *Ctx, raw: []const u8, where: []const u8, out: *Segment) Error!void {
+    try decode(ctx, raw, where, out);
+    if (out.trailing != 0)
+        return ctx.err("{s}: {d} bytes follow the last section", .{ where, out.trailing });
+}
+
 /// Decodes the ordered entry stream of an `'S'` or `'C'` section.
 ///
 /// `'C'` is decoded exactly like `'S'`: the two tags differ in what recovery
@@ -1269,9 +1285,7 @@ pub fn renderFraming(ctx: *Ctx, sample: *const SampleV2, out: *Strings) Error!vo
         const where = try scratch.add(ctx.alloc, "{s}/{s}", .{ f.fixture, f.rel });
         var seg = Segment{};
         defer seg.deinit(ctx.alloc);
-        try decode(ctx, f.bytes, where, &seg);
-        if (seg.trailing != 0)
-            return ctx.err("{s}: {d} bytes follow the last section", .{ where, seg.trailing });
+        try decodeComplete(ctx, f.bytes, where, &seg);
         _ = try out.add(ctx.alloc, "hdr\t{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{x:0>8}", .{
             f.fixture,      f.rel,                seg.header.version,    seg.header.flags,
             seg.header.seq, seg.header.first_lsn, seg.header.header_crc,
@@ -1334,7 +1348,7 @@ pub fn renderBody(ctx: *Ctx, sample: *const SampleV2, out: *Strings) Error!void 
         const where = try scratch.add(ctx.alloc, "{s}/{s}", .{ f.fixture, f.rel });
         var seg = Segment{};
         defer seg.deinit(ctx.alloc);
-        try decode(ctx, f.bytes, where, &seg);
+        try decodeComplete(ctx, f.bytes, where, &seg);
 
         for (seg.sections.items) |s| {
             if (s.tag == TAG_MARK) {
@@ -1543,7 +1557,7 @@ pub fn assertEveryLoggedRecidIsClassified(
         if (!eql(f.fixture, fixture)) continue;
         var seg = Segment{};
         defer seg.deinit(ctx.alloc);
-        try decode(ctx, f.bytes, f.blob, &seg);
+        try decodeComplete(ctx, f.bytes, f.blob, &seg);
         for (seg.sections.items) |sec| {
             if (sec.tag == TAG_MARK) continue;
             var es: std.ArrayListUnmanaged(Entry) = .empty;
@@ -1765,18 +1779,35 @@ pub fn runV2Cells(ctx: *Ctx, sample: *const SampleV2, mode: []const u8, tmp: std
         try ran.append(ctx.alloc, e.fixture);
     }
 
-    for (m.fixtures.items) |f| {
-        if (!contains(ran.items, f.id))
+    try assertCellSetExact(ctx, m.fixtures.items, ran.items, mode);
+}
+
+/// The cells that RAN must be exactly the ones the `fixture` rows call for.
+///
+/// Split out from [`runV2Cells`] so it can be addressed directly. The sample
+/// declares three fixtures and runs three cells, so on the real corpus this rule
+/// never fires and deleting it was invisible — the C3z campaign measured that
+/// too. Both directions are stated: a declared fixture with no cell, and a cell
+/// for a fixture nothing declares.
+pub fn assertCellSetExact(
+    ctx: *Ctx,
+    declared: []const FixtureRow,
+    ran: []const []const u8,
+    mode: []const u8,
+) Error!void {
+    for (declared) |f| {
+        if (!contains(ran, f.id))
             return ctx.err(
                 "fixture `{s}` is declared but no {s}/{s} cell ran for it",
                 .{ f.id, ENGINE, mode },
             );
     }
-    for (ran.items) |r| {
-        var declared = false;
-        for (m.fixtures.items) |f| {
-            if (eql(f.id, r)) declared = true;
+    for (ran) |r| {
+        var is_declared = false;
+        for (declared) |f| {
+            if (eql(f.id, r)) is_declared = true;
         }
-        if (!declared) return ctx.err("a {s}/{s} cell ran for undeclared fixture `{s}`", .{ ENGINE, mode, r });
+        if (!is_declared)
+            return ctx.err("a {s}/{s} cell ran for undeclared fixture `{s}`", .{ ENGINE, mode, r });
     }
 }

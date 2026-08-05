@@ -256,6 +256,43 @@ test "xfixtures v2: the sample's rw and ro cells pass" {
     for (xfix.MODES) |mode| try xfix.runV2Cells(&ctx, &sample, mode, tmp.dir);
 }
 
+// The executor really does compare the cell set it ran against the fixture rows.
+//
+// `assertCellSetExact` has its own direct battery in wal3_decode_test.zig, but a
+// rule can be correct and never called. This is the case the corpus cannot
+// contain: a fixture DECLARED with no `expect` row addressed to this engine. It
+// is built by re-parsing the real manifest with one extra `fixture` row (and a
+// `recid` row so referential integrity is satisfied) and handing the executor
+// the real sample's bytes.
+test "xfixtures v2: a declared fixture with no cell fails the executor" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    var sample = try loadSample(&ctx);
+    defer sample.deinit(a);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const doctored = v2_manifest_tsv ++
+        "fixture\tghost\twal3-namespace\tjava\tc3z\nrecid\tghost\tr1\t1\tlive\t1\t8\n";
+    var loaded = try xfix.parse(&ctx, doctored);
+    defer loaded.deinit(a);
+
+    var files: std.ArrayListUnmanaged(xfix.RawFile) = .empty;
+    defer files.deinit(a);
+    try files.appendSlice(a, sample.files.items);
+
+    // `blob_names` stays empty and this value is never deinit'd: it BORROWS the
+    // real sample's bytes and `loaded`'s manifest, both of which own themselves.
+    const doctored_sample = xfix.SampleV2{ .manifest = loaded.v2, .files = files };
+    try xfix.expectRefused(
+        &ctx,
+        "a fixture declared with no zig cell",
+        xfix.runV2Cells,
+        .{ &ctx, &doctored_sample, "rw", tmp.dir },
+    );
+}
+
 // FRAMING, against the python-authored pin.
 //
 // This is the comparison `GOLDEN.tsv` cannot make: a raw sha attests which
@@ -285,6 +322,39 @@ test "xfixtures v2: framing matches GOLDEN-DECODE.tsv" {
         if (std.mem.startsWith(u8, r, "sec\t")) saw_sec = true;
     }
     try testing.expect(saw_hdr and saw_sec);
+}
+
+// Both renderers really do require every pinned file to be framed to its last
+// byte.
+//
+// `decodeComplete` carries that rule and has its own direct battery, but a rule
+// can be correct and never called: reverting one renderer's call to plain
+// `decode` is invisible on a corpus where every file is whole. This builds the
+// input the corpus cannot contain — the real sample with one junk byte appended
+// to one segment — and points both renderers at it.
+test "xfixtures v2: both renderers refuse a segment with trailing bytes" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    var sample = try loadSample(&ctx);
+    defer sample.deinit(a);
+
+    var files: std.ArrayListUnmanaged(xfix.RawFile) = .empty;
+    defer files.deinit(a);
+    try files.appendSlice(a, sample.files.items);
+    const junked = try std.mem.concat(a, u8, &.{ files.items[0].bytes, &[_]u8{0x7f} });
+    defer a.free(junked);
+    files.items[0].bytes = junked;
+
+    // BORROWS the real manifest and bytes; never deinit'd, so nothing is freed twice.
+    const doctored = xfix.SampleV2{ .manifest = sample.manifest, .files = files };
+
+    var rows: xfix.Strings = .{};
+    defer rows.deinit(a);
+    try xfix.expectRefused(&ctx, "a trailing byte, seen by the framing renderer", xfix.renderFraming, .{ &ctx, &doctored, &rows });
+
+    var rows2: xfix.Strings = .{};
+    defer rows2.deinit(a);
+    try xfix.expectRefused(&ctx, "a trailing byte, seen by the body renderer", xfix.renderBody, .{ &ctx, &doctored, &rows2 });
 }
 
 // DECODED BODIES, against the file the FROZEN JAVA READER authored.

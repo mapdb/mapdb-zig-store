@@ -525,6 +525,112 @@ fn decodeEntries(ctx: *xfix.Ctx, raw: []const u8, where: []const u8) xfix.Error!
     try xfix.entries(ctx, &seg.sections.items[0], where, &es);
 }
 
+fn decodeCompleteInto(ctx: *xfix.Ctx, raw: []const u8, where: []const u8, seg: *xfix.Segment) !void {
+    try xfix.decodeComplete(ctx, raw, where, seg);
+}
+
+// A PINNED file must be framed to its last byte, and the corpus cannot say so.
+//
+// `decode` reports a torn tail rather than refusing it, and the rule that every
+// pinned file has `trailing == 0` therefore lives in `decodeComplete`. No sample
+// bundle has a torn tail, so deleting that rule left the whole suite green — the
+// C3z campaign measured it. Lesson (g): the input has to be built.
+test "wal3 decode: a pinned segment must be framed to its last byte" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+
+    const p = try xfix.payload(a, 1, 9);
+    defer a.free(p);
+    const entry = try record(a, 1, 16, p);
+    defer a.free(entry);
+    var b = SegBuilder.init(a, 1, 1, 0);
+    defer b.deinit();
+    try b.push(xfix.TAG_SECTION, 1, entry);
+    const raw = try b.bytes();
+    defer a.free(raw);
+
+    {
+        var seg = xfix.Segment{};
+        defer seg.deinit(a);
+        try decodeCompleteInto(&ctx, raw, "whole", &seg);
+        try testing.expectEqual(@as(usize, 0), seg.trailing);
+    }
+    // One byte of junk after the last section: `decode` REPORTS it...
+    {
+        const with_junk = try std.mem.concat(a, u8, &.{ raw, &[_]u8{0x7f} });
+        defer a.free(with_junk);
+        var seg = xfix.Segment{};
+        defer seg.deinit(a);
+        try decodeInto(&ctx, with_junk, "junk", &seg);
+        try testing.expectEqual(@as(usize, 1), seg.trailing);
+    }
+    // ...and the pinned-file rule REFUSES it. The two halves are separate on
+    // purpose: reporting is the decoder's job, refusing is this slice's policy.
+    {
+        const with_junk = try std.mem.concat(a, u8, &.{ raw, &[_]u8{0x7f} });
+        defer a.free(with_junk);
+        var seg = xfix.Segment{};
+        defer seg.deinit(a);
+        try xfix.expectRefused(&ctx, "a pinned segment with bytes after its last section", decodeCompleteInto, .{ &ctx, with_junk, "junk", &seg });
+    }
+}
+
+// The recid cross-check is ONE-WAY, and it fires.
+//
+// Every recid the manifest names must be witnessed in the decoded history, never
+// the reverse. Plan §5 forbids the reverse — a rolled-back put need only be
+// invisible through the API, and `wal3-java-tail` already carries recids beyond
+// the six §5.2 describes — so set equality would be a violation waiting for the
+// first legal fixture. Both halves are asserted: the surplus direction must be
+// TOLERATED, the missing direction REFUSED. Without this the whole rule could be
+// made vacuous with the suite still green, because the engine-level recid
+// assertions never look at the decoded entry stream.
+test "wal3 decode: the recid cross-check is one-way and can fail" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+
+    const text = "version\t2\nfixture\tf\twal3-namespace\tjava\tc\n" ++
+        "file\tf\tx.wal.0000000000000001\t36\taa\tbb\n" ++
+        "recid\tf\tr1\t1\tlive\t1\t8\n" ++
+        "recid\tf\tr2\t2\tnull\t0\t0\n";
+    var loaded = try xfix.parse(&ctx, text);
+    defer loaded.deinit(a);
+    const m = &loaded.v2;
+
+    // exactly the named recids, and a superset: both fine.
+    try xfix.checkRecidsAgainstManifest(&ctx, m, "f", &.{ 1, 2 });
+    try xfix.checkRecidsAgainstManifest(&ctx, m, "f", &.{ 1, 2, 7, 99 });
+
+    const cases = [_]struct { seen: []const u64, what: []const u8 }{
+        .{ .seen = &.{1}, .what = "a decode that never mentions recid 2" },
+        .{ .seen = &.{}, .what = "a decode that mentions no recid at all" },
+        .{ .seen = &.{ 3, 4 }, .what = "a decode whose recids are all shifted" },
+    };
+    for (cases) |c| {
+        try xfix.expectRefused(&ctx, c.what, xfix.checkRecidsAgainstManifest, .{ &ctx, m, "f", c.seen });
+    }
+    try xfix.expectRefused(&ctx, "a fixture with no recid rows to check against", xfix.checkRecidsAgainstManifest, .{ &ctx, m, "nonexistent", @as([]const u64, &.{}) });
+}
+
+// The exact-cell-set rule fires in both directions.
+//
+// The sample declares three fixtures and runs three cells, so the rule never
+// fires on the real corpus and deleting it was invisible — measured, not
+// assumed. Its whole purpose is the case the corpus cannot contain: an `expect`
+// row deleted while its `fixture` row stays.
+test "wal3 decode: the exact-cell-set rule fires in both directions" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+
+    const declared = [_]xfix.FixtureRow{
+        .{ .id = "a", .kind = "wal3-namespace" },
+        .{ .id = "b", .kind = "wal3-namespace" },
+    };
+    try xfix.assertCellSetExact(&ctx, &declared, &.{ "a", "b" }, "rw");
+    try xfix.expectRefused(&ctx, "a declared fixture with no cell", xfix.assertCellSetExact, .{ &ctx, @as([]const xfix.FixtureRow, &declared), @as([]const []const u8, &.{"a"}), "rw" });
+    try xfix.expectRefused(&ctx, "a cell for a fixture nothing declares", xfix.assertCellSetExact, .{ &ctx, @as([]const xfix.FixtureRow, &declared), @as([]const []const u8, &.{ "a", "b", "c" }), "rw" });
+}
+
 test "wal3 decode: a malformed entry stream is refused, not truncated" {
     const a = testing.allocator;
     var ctx = xfix.Ctx{ .alloc = a };
