@@ -177,6 +177,31 @@ pub fn expectRefused(ctx: *Ctx, what: []const u8, comptime f: anytype, args: any
     }
 }
 
+/// [`expectRefused`], plus the demand that the message NAMES the rule that fired.
+///
+/// Needed wherever an input can trip more than one rule — lesson (h) inside the
+/// test harness itself. The write-gate probe is the case that forced it: pointing
+/// the `rw` branch at a read-only handle refuses either because `preallocate` was
+/// rejected (the rule) or because the `rollback` after it was (a different rule),
+/// and a bare "it refused" cannot tell those apart. It could not, and a mutant
+/// that swallowed the preallocate error survived.
+pub fn expectRefusedSaying(
+    ctx: *Ctx,
+    what: []const u8,
+    saying: []const u8,
+    comptime f: anytype,
+    args: anytype,
+) !void {
+    try expectRefused(ctx, what, f, args);
+    if (std.mem.indexOf(u8, ctx.message(), saying) == null) {
+        std.debug.print(
+            "[xfixtures] {s}: refused, but the message does not mention `{s}`:\n  {s}\n",
+            .{ what, saying, ctx.message() },
+        );
+        return error.TestUnexpectedResult;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // small utilities
 // ---------------------------------------------------------------------------
@@ -1833,7 +1858,7 @@ pub fn assertPostState(
 /// gate. The `rw` half rolls back rather than committing, and the post-state rule
 /// that runs immediately afterwards is what proves the rollback left no trace: if
 /// an uncommitted preallocate ever reached the log, this cell would fail there.
-fn assertWriteGate(ctx: *Ctx, s: *StoreWAL, mode: []const u8, cell: []const u8) Error!void {
+pub fn assertWriteGate(ctx: *Ctx, s: *StoreWAL, mode: []const u8, cell: []const u8) Error!void {
     if (eql(mode, "ro")) {
         if (s.preallocate()) |recid| {
             return ctx.err("[{s}] a read-only handle preallocated recid {d}", .{ cell, recid });

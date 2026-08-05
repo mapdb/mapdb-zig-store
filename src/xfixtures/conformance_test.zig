@@ -289,6 +289,50 @@ test "xfixtures v2: the golden-shape rule rejects text the row comparison would 
     }
 }
 
+// The write-gate probe fires in BOTH directions.
+//
+// The probe is what makes the manifest's `mode` column observable, and its two
+// branches are the rule. Pointing it at a handle opened the other way is the
+// only input that reaches them: on the real cells both branches pass, so making
+// either one vacuous was invisible until this test existed.
+test "xfixtures v2: the write-gate probe fires in both directions" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    var sample = try loadSample(&ctx);
+    defer sample.deinit(a);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const fixture = sample.files.items[0].fixture;
+    for ([_]bool{ true, false }, 0..) |read_only, i| {
+        var name_buf: [32]u8 = undefined;
+        var dir = try tmp.dir.makeOpenPath(try std.fmt.bufPrint(&name_buf, "gate-{d}", .{i}), .{ .iterate = true });
+        defer dir.close();
+        for (sample.files.items) |f| {
+            if (!std.mem.eql(u8, f.fixture, fixture)) continue;
+            try dir.writeFile(.{ .sub_path = f.rel, .data = f.bytes });
+        }
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const base = try std.fs.path.join(a, &.{ try dir.realpath(".", &path_buf), "x" });
+        defer a.free(base);
+
+        var s2 = try StoreWAL.openCfg(a, base, .{ .read_only = read_only });
+        defer s2.deinit();
+        // The handle satisfies the branch that matches how it was opened...
+        try xfix.assertWriteGate(&ctx, &s2, if (read_only) "ro" else "rw", "the matching mode");
+        // ...and must fail the other one, FOR THE STATED REASON. A bare "it
+        // refused" is not enough here: a read-only handle graded as `rw` also
+        // fails the `rollback` that follows the probe, so a probe that swallowed
+        // the preallocate error would still be refused — by the wrong rule.
+        // Measured: that mutant survived until the message was checked.
+        const what = if (read_only) "a read-only handle graded as rw" else "a read-write handle graded as ro";
+        const saying = if (read_only) "refused a preallocate" else "preallocated recid";
+        try xfix.expectRefusedSaying(&ctx, what, saying, xfix.assertWriteGate, .{ &ctx, &s2, if (read_only) "rw" else "ro", what });
+        try s2.close();
+    }
+}
+
 // The loader's REFUSAL paths, under `testing.allocator`.
 //
 // A green suite that only ever loads successfully is not memory evidence. The
