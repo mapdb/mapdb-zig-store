@@ -41,6 +41,16 @@ const distributed = @import("xfix_distributed");
 
 const ENGINE = xfix.ENGINE;
 
+/// Two well-formed sha256 columns for the hand-written manifests below.
+///
+/// They used to be `aa` and `bb`, which the frozen java reader refuses and this
+/// reader accepted — so every case named for a LATER rule was resting on a
+/// manifest that is not grammatically valid at all, and would have started
+/// measuring the hash rule the moment it was added. Lesson (h), one layer above
+/// where it was found. The C3z review named it.
+const SHAS = "\t" ++ "a" ** 64 ++ "\t" ++ "b" ** 64;
+const SHAS2 = "\t" ++ "c" ** 64 ++ "\t" ++ "d" ** 64;
+
 // ---------------------------------------------------------------------------
 // schema v1 — the live tree
 // ---------------------------------------------------------------------------
@@ -256,6 +266,55 @@ test "xfixtures v2: the sample's rw and ro cells pass" {
     for (xfix.MODES) |mode| try xfix.runV2Cells(&ctx, &sample, mode, tmp.dir);
 }
 
+// The golden-shape rule, on texts the distributed files cannot supply.
+//
+// Both golden files are a leading comment block and then rows, so the rule never
+// fires on them and deleting it would be invisible — the same shape as every
+// other survivor this slice found. These are hand-written.
+test "xfixtures v2: the golden-shape rule rejects text the row comparison would drop" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+
+    try xfix.assertGoldenShape(&ctx, "ok", "# header\n# more\nsec\ta\tb\nsec\tc\td\n");
+    try xfix.assertGoldenShape(&ctx, "ok, no trailing newline", "# header\nsec\ta\tb");
+
+    const cases = [_]struct { text: []const u8, what: []const u8 }{
+        .{ .text = "# header\nsec\ta\n# a later comment\nsec\tb\n", .what = "a comment after the first data row" },
+        .{ .text = "# header\nsec\ta\n\nsec\tb\n", .what = "a blank line between data rows" },
+        .{ .text = "# header\n# only comments\n", .what = "a golden file with no data rows" },
+        .{ .text = "", .what = "an empty golden file" },
+    };
+    for (cases) |c| {
+        try xfix.expectRefused(&ctx, c.what, xfix.assertGoldenShape, .{ &ctx, c.what, c.text });
+    }
+}
+
+// The loader's REFUSAL paths, under `testing.allocator`.
+//
+// A green suite that only ever loads successfully is not memory evidence. The
+// C3z review reproduced a segfault here: `loaded.v2` was copied into
+// `sample.manifest` with an `errdefer` still live on each, so every refusal
+// after that line ran both destructors over the same array lists. Nothing asked
+// this function to refuse, so nothing saw it. These do, and the leak detector
+// grades the result.
+test "xfixtures v2: the loader refuses cleanly once it owns the manifest" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+
+    // (a) a manifest whose blobs are in no embed table.
+    try xfix.expectRefused(&ctx, "a manifest with no embedded blobs", xfix.loadSampleV2, .{ &ctx, v2_manifest_tsv, @as([]const xfix.Blob, &.{}) });
+
+    // (b) the right blob NAME carrying the wrong bytes: the gz hash refuses, and
+    // that refusal is one step further in, past the table lookup.
+    var wrong: [embedded_v2.blobs.len]xfix.Blob = undefined;
+    for (embedded_v2.blobs, 0..) |b, i| wrong[i] = .{ .name = b.name, .gz = "not a gzip stream" };
+    try xfix.expectRefused(&ctx, "a blob whose gz hash does not match", xfix.loadSampleV2, .{ &ctx, v2_manifest_tsv, @as([]const xfix.Blob, &wrong) });
+
+    // (c) a schema-v1 manifest handed to the v2 loader — a refusal BEFORE the
+    // ownership transfer, which is the other side of the same defect.
+    try xfix.expectRefused(&ctx, "a schema-v1 manifest in the v2 loader", xfix.loadSampleV2, .{ &ctx, v1_manifest_tsv, @as([]const xfix.Blob, &embedded_v2.blobs) });
+}
+
 // The executor really does compare the cell set it ran against the fixture rows.
 //
 // `assertCellSetExact` has its own direct battery in wal3_decode_test.zig, but a
@@ -311,6 +370,7 @@ test "xfixtures v2: framing matches GOLDEN-DECODE.tsv" {
     defer got.deinit(a);
     try xfix.renderFraming(&ctx, &sample, &got);
 
+    try xfix.assertGoldenShape(&ctx, "GOLDEN-DECODE.tsv", golden_decode_tsv);
     var want = try xfix.goldenRows(a, golden_decode_tsv);
     defer want.deinit(a);
     try xfix.assertRowsEqual(&ctx, "GOLDEN-DECODE.tsv", want.items, got.slice());
@@ -415,6 +475,10 @@ test "xfixtures v2: decoded bodies match GOLDEN-BODY.tsv" {
     defer got.deinit(a);
     try xfix.renderBody(&ctx, &sample, &got);
 
+    // Rows and the leading block are compared separately, so a comment hiding
+    // AFTER the first data row would be seen by neither. Java compares whole
+    // text; this is the equivalent, without a second unreadable diff.
+    try xfix.assertGoldenShape(&ctx, "GOLDEN-BODY.tsv", golden_body_tsv);
     var want = try xfix.goldenRows(a, golden_body_tsv);
     defer want.deinit(a);
     try xfix.assertRowsEqual(&ctx, "GOLDEN-BODY.tsv", want.items, got.slice());
@@ -573,9 +637,9 @@ test "xfixtures: the two schemas are told apart by their version line only" {
     const a = testing.allocator;
     var ctx = xfix.Ctx{ .alloc = a };
 
-    const v1 = "version\t1\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1\taa\tbb\n" ++
+    const v1 = "version\t1\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1" ++ SHAS ++ "\n" ++
         "expect\tf\tzig\taccept\tdirect\tx.db\tx.db\n";
-    const v2 = "version\t2\nfixture\tf\twal3-namespace\tjava\tc\nfile\tf\tx\t1\taa\tbb\n" ++
+    const v2 = "version\t2\nfixture\tf\twal3-namespace\tjava\tc\nfile\tf\tx\t1" ++ SHAS ++ "\n" ++
         "expect\tf\tzig\tro\taccept\twal3\tx\n";
 
     var l1 = try xfix.parse(&ctx, v1);
@@ -588,7 +652,7 @@ test "xfixtures: the two schemas are told apart by their version line only" {
     // The v1 rows, read as v2, are not merely different — the third column is a
     // verdict where v2 wants a mode, so the vocabulary check catches it. That is
     // the collision made visible rather than assumed away.
-    const v1_as_v2 = "version\t2\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1\taa\tbb\n" ++
+    const v1_as_v2 = "version\t2\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1" ++ SHAS ++ "\n" ++
         "expect\tf\tzig\taccept\tdirect\tx.db\tx.db\n";
     try refuse(&ctx, "v1 expect rows under a v2 version line", v1_as_v2);
     try refuse(&ctx, "an unknown schema version", "version\t3\n");
@@ -597,7 +661,7 @@ test "xfixtures: the two schemas are told apart by their version line only" {
 }
 
 const V2_HEAD = "version\t2\nfixture\tf\twal3-namespace\tjava\tc\n";
-const V2_FILE = "file\tf\tx.wal.0000000000000001\t36\taa\tbb\n";
+const V2_FILE = "file\tf\tx.wal.0000000000000001\t36" ++ SHAS ++ "\n";
 
 // Rows the reader must refuse rather than skip.
 //
@@ -611,8 +675,8 @@ test "xfixtures: unrecognised and malformed rows are refused" {
     try refuse(&ctx, "an unknown row type", V2_HEAD ++ V2_FILE ++ "sparkle\tf\tx\n");
     try refuse(&ctx, "a short file row", V2_HEAD ++ "file\tf\tx\t36\taa\n");
     try refuse(&ctx, "a file row with an empty field", V2_HEAD ++ "file\tf\tx\t36\t\tbb\n");
-    try refuse(&ctx, "a non-canonical integer", V2_HEAD ++ "file\tf\tx\t036\taa\tbb\n");
-    try refuse(&ctx, "a relName that escapes the cell directory", V2_HEAD ++ "file\tf\t../x\t36\taa\tbb\n");
+    try refuse(&ctx, "a non-canonical integer", V2_HEAD ++ "file\tf\tx\t036" ++ SHAS ++ "\n");
+    try refuse(&ctx, "a relName that escapes the cell directory", V2_HEAD ++ "file\tf\t../x\t36" ++ SHAS ++ "\n");
     try refuse(&ctx, "an unknown engine", V2_HEAD ++ V2_FILE ++ "expect\tf\tgo\tro\taccept\twal3\tx\n");
     try refuse(&ctx, "an unknown mode", V2_HEAD ++ V2_FILE ++ "expect\tf\tzig\trwx\taccept\twal3\tx\n");
     try refuse(&ctx, "an unknown verdict on a java row", V2_HEAD ++ V2_FILE ++ "expect\tf\tjava\tro\tmaybe\twal3\tx\n");
@@ -626,6 +690,36 @@ test "xfixtures: unrecognised and malformed rows are refused" {
         "recid\tf\ta\t1\tlive\t1\t1\nrecid\tf\tb\t1\tlive\t1\t1\n");
     try refuse(&ctx, "an unbounded recidrange", V2_HEAD ++ V2_FILE ++ "recidrange\tf\tr\t1\t99999999\tlive\t1\t1\n");
     try refuse(&ctx, "a v2 manifest with no file rows", V2_HEAD);
+
+    // The two hash columns, which the frozen java reader validates and this one
+    // did not until the C3z review.
+    try refuse(&ctx, "a rawSha that is not 64 hex digits", V2_HEAD ++ "file\tf\tx\t36\taa" ++ "\t" ++ "b" ** 64 ++ "\n");
+    try refuse(&ctx, "a gzSha that is not 64 hex digits", V2_HEAD ++ "file\tf\tx\t36\t" ++ "a" ** 64 ++ "\tbb\n");
+    try refuse(&ctx, "an uppercase sha", V2_HEAD ++ "file\tf\tx\t36\t" ++ "A" ** 64 ++ "\t" ++ "b" ** 64 ++ "\n");
+
+    // A `derived` row NAMES another fixture, and that fixture must exist —
+    // `manifest_v2.py`'s `fixture_unknown_ref`. The referential-integrity rule
+    // exempted the one row type whose purpose is to point at a fixture.
+    try refuse(&ctx, "a derived row whose source fixture does not exist", "version\t2\nfixture\tf\treject\tderived\tc\n" ++ V2_FILE ++ "derived\tf\tghost\t1\trecipe\n");
+
+    // `edit` rows: a fixture reference like every other row's first column, plus
+    // the canonical scalar forms.
+    try refuse(&ctx, "an edit row naming a fixture with no fixture row", V2_HEAD ++ V2_FILE ++ "edit\tghost\tx\t3\t53\t35\n");
+    try refuse(&ctx, "an edit row with a non-canonical offset", V2_HEAD ++ V2_FILE ++ "edit\tf\tx\t03\t53\t35\n");
+    try refuse(&ctx, "an edit row whose before-bytes are not whole hex bytes", V2_HEAD ++ V2_FILE ++ "edit\tf\tx\t3\t5\t35\n");
+    try refuse(&ctx, "an edit row whose after-bytes are not hex", V2_HEAD ++ V2_FILE ++ "edit\tf\tx\t3\t53\tzz\n");
+
+    // A recidrange at the very top of the recid domain. `from == to ==
+    // maxInt(u64)` passes the span check, and with `r <= to` as the loop
+    // condition the counter then overflows — a trap in Debug, a wrap through
+    // most of the u64 domain in ReleaseFast, and in neither case a refusal. It
+    // is a LEGAL one-row range, so the fix is a terminal break and this case
+    // asserts it PARSES: a rule that refused it would be inventing a limit the
+    // grammar does not state.
+    try parseOk(&ctx, V2_HEAD ++ V2_FILE ++ "recidrange\tf\tr\t18446744073709551615\t18446744073709551615\tlive\t1\t8\n");
+    // The payload id is an INDEPENDENT addition and can overflow on a range that
+    // is otherwise unremarkable. That one really is a refusal.
+    try refuse(&ctx, "a recidrange whose payload ids overflow", V2_HEAD ++ V2_FILE ++ "recidrange\tf\tr\t1\t2\tlive\t18446744073709551615\t8\n");
 
     // Vocabularies contract §2 makes load-bearing. The C3r review found kind,
     // generatorEngine and opener stored unchecked — and `opener` in particular was
@@ -664,14 +758,14 @@ test "xfixtures: every referenced fixture must be declared and every declared on
     var ctx = xfix.Ctx{ .alloc = a };
 
     try parseOk(&ctx, V2_HEAD ++ V2_FILE);
-    try refuse(&ctx, "a file row naming a fixture with no fixture row", V2_HEAD ++ V2_FILE ++ "file\tg\tx.wal.0000000000000002\t36\tcc\tdd\n");
+    try refuse(&ctx, "a file row naming a fixture with no fixture row", V2_HEAD ++ V2_FILE ++ "file\tg\tx.wal.0000000000000002\t36" ++ SHAS2 ++ "\n");
     try refuse(&ctx, "an expect row naming a fixture with no fixture row", V2_HEAD ++ V2_FILE ++ "expect\tg\tzig\tro\taccept\twal3\tx\n");
     try refuse(&ctx, "a post row naming a fixture with no fixture row", V2_HEAD ++ V2_FILE ++ "post\tg\tzig\tro\tx.lock\tunchanged\n");
     try refuse(&ctx, "a recid row naming a fixture with no fixture row", V2_HEAD ++ V2_FILE ++ "recid\tg\tr1\t1\tlive\t1\t8\n");
     try refuse(&ctx, "a declared fixture no row refers to", V2_HEAD ++ V2_FILE ++ "fixture\tg\twal3-namespace\tjava\tc\n");
 
     // The same rule guards the v1 tree, where the live manifest satisfies it.
-    const v1 = "version\t1\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1\taa\tbb\n";
+    const v1 = "version\t1\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1" ++ SHAS ++ "\n";
     try parseOk(&ctx, v1);
     try refuse(&ctx, "a v1 recid row naming a fixture with no fixture row", v1 ++ "recid\tg\tr1\t1\tlive\t1\t8\n");
 }
@@ -688,7 +782,7 @@ test "xfixtures: the v1 grammar has its own vocabularies" {
     var ctx = xfix.Ctx{ .alloc = a };
 
     const head = "version\t1\nfixture\tf\tport-wal\tjava\tc\n";
-    const file = "file\tf\tx.wal\t1\taa\tbb\n";
+    const file = "file\tf\tx.wal\t1" ++ SHAS ++ "\n";
     inline for (.{ "direct", "wal" }) |opener| {
         try parseOk(&ctx, head ++ file ++ "expect\tf\tzig\taccept\t" ++ opener ++ "\tx.wal\tx.wal\n");
     }
@@ -697,8 +791,8 @@ test "xfixtures: the v1 grammar has its own vocabularies" {
     try refuse(&ctx, "an unknown v1 opener on a java row", head ++ file ++ "expect\tf\tjava\taccept\twalrus\tx.wal\tx.wal\n");
     try refuse(&ctx, "an unknown v1 verdict", head ++ file ++ "expect\tf\tzig\tmaybe\tdirect\tx.wal\tx.wal\n");
     // `wal3-namespace` is the kind v2 ADDED; a v1 manifest must not carry it.
-    try refuse(&ctx, "the v2-only fixture kind on a v1 row", "version\t1\nfixture\tf\twal3-namespace\tjava\tc\nfile\tf\tx\t1\taa\tbb\n");
-    try refuse(&ctx, "an unknown v1 generatorEngine", "version\t1\nfixture\tf\tdirect\tgo\tc\nfile\tf\tx\t1\taa\tbb\n");
+    try refuse(&ctx, "the v2-only fixture kind on a v1 row", "version\t1\nfixture\tf\twal3-namespace\tjava\tc\nfile\tf\tx\t1" ++ SHAS ++ "\n");
+    try refuse(&ctx, "an unknown v1 generatorEngine", "version\t1\nfixture\tf\tdirect\tgo\tc\nfile\tf\tx\t1" ++ SHAS ++ "\n");
 }
 
 // A `bytes` row is refused BY NAME, not skipped.
@@ -754,6 +848,7 @@ test "xfixtures: the post-state rule fails in both directions" {
     const abc_new = [_]xfix.InputFile{ .{ .rel = "seg", .bytes = "abc" }, .{ .rel = "new", .bytes = "q" } };
     const surprise = [_]xfix.InputFile{ .{ .rel = "seg", .bytes = "abc" }, .{ .rel = "surprise", .bytes = "x" } };
     const none = [_]xfix.InputFile{};
+    const toolong = [_]xfix.InputFile{.{ .rel = "n" ** 300, .bytes = "" }};
 
     // `E` is the empty-string sha and `S` the sha of "q"; expanded below so the
     // rows stay readable.
@@ -774,6 +869,11 @@ test "xfixtures: the post-state rule fails in both directions" {
         .{ .what = "`created` naming a file that WAS an input", .inputs = &q, .after = &q, .posts = &.{"seg\tcreated:1:S"}, .ok = false },
         .{ .what = "`deleted` naming a file that was never an input", .inputs = &abc, .after = &abc, .posts = &.{"ghost\tdeleted"}, .ok = false },
         .{ .what = "a `deleted` file replaced by a directory of the same name", .inputs = &abc, .after = &none, .posts = &.{"seg\tdeleted"}, .ok = false, .make_dir = true },
+        // A stat failure that is NOT "not found". `catch false` would call this
+        // absent and pass the `deleted` row on a name nothing has established
+        // anything about; the C3z review found that swallow, which is the C3r
+        // post-state finding one level down.
+        .{ .what = "a `deleted` row whose name cannot be stat'd at all", .inputs = &toolong, .after = &none, .posts = &.{("n" ** 300) ++ "\tdeleted"}, .ok = false },
     };
 
     const sha_q = xfix.sha256Hex("q");
@@ -790,7 +890,7 @@ test "xfixtures: the post-state rule fails in both directions" {
         // reader, so the disposition grammar under test is the shipped one.
         var text: std.ArrayListUnmanaged(u8) = .empty;
         defer text.deinit(a);
-        try text.appendSlice(a, V2_HEAD ++ "file\tf\tseg\t3\taa\tbb\n");
+        try text.appendSlice(a, V2_HEAD ++ "file\tf\tseg\t3" ++ SHAS ++ "\n");
         for (c.posts) |row| {
             try text.appendSlice(a, "post\tf\tzig\tro\t");
             for (row) |ch| {
@@ -815,7 +915,7 @@ test "xfixtures: the post-state rule fails in both directions" {
             try xfix.expectRefused(&ctx, c.what, xfix.assertPostState, .{ &ctx, dir, c.inputs, posts.items, c.what });
         }
     }
-    try testing.expectEqual(@as(usize, 13), cases.len);
+    try testing.expectEqual(@as(usize, 14), cases.len);
 }
 
 test {

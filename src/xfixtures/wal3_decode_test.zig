@@ -33,6 +33,9 @@ const io = @import("../io.zig");
 const DataOutput2 = io.DataOutput2;
 const Crc32 = std.hash.crc.Crc32;
 
+/// Well-formed sha256 columns — see the note in conformance_test.zig.
+const SHAS = "\t" ++ "a" ** 64 ++ "\t" ++ "b" ** 64;
+
 // ---------------------------------------------------------------------------
 // builders
 // ---------------------------------------------------------------------------
@@ -590,7 +593,7 @@ test "wal3 decode: the recid cross-check is one-way and can fail" {
     var ctx = xfix.Ctx{ .alloc = a };
 
     const text = "version\t2\nfixture\tf\twal3-namespace\tjava\tc\n" ++
-        "file\tf\tx.wal.0000000000000001\t36\taa\tbb\n" ++
+        "file\tf\tx.wal.0000000000000001\t36" ++ SHAS ++ "\n" ++
         "recid\tf\tr1\t1\tlive\t1\t8\n" ++
         "recid\tf\tr2\t2\tnull\t0\t0\n";
     var loaded = try xfix.parse(&ctx, text);
@@ -610,6 +613,80 @@ test "wal3 decode: the recid cross-check is one-way and can fail" {
         try xfix.expectRefused(&ctx, c.what, xfix.checkRecidsAgainstManifest, .{ &ctx, m, "f", c.seen });
     }
     try xfix.expectRefused(&ctx, "a fixture with no recid rows to check against", xfix.checkRecidsAgainstManifest, .{ &ctx, m, "nonexistent", @as([]const u64, &.{}) });
+}
+
+// The four entry opcodes, pinned as LITERALS — the one place this suite does not
+// borrow from the engine.
+//
+// Borrowing is strong where the pinned corpus exercises the borrowed thing: a
+// wrong CRC domain or a wrong varint reader disagrees with python's or java's
+// file. It is weak where the corpus exercises NOTHING. `T_APPEND` is that case —
+// no golden row contains one, `entries` refuses it before decoding its remaining
+// fields, and the builder here encodes it with the same imported constant the
+// decoder compares against, so the two would drift together in silence. Rust
+// catches this class with its transcription-equality test; this is the zig
+// equivalent, narrowed to the values that need it.
+test "wal3 decode: the entry opcodes are pinned, not just borrowed" {
+    try testing.expectEqual(@as(u8, 1), xfix.T_PREALLOC);
+    try testing.expectEqual(@as(u8, 2), xfix.T_RECORD);
+    try testing.expectEqual(@as(u8, 3), xfix.T_APPEND);
+    try testing.expectEqual(@as(u8, 4), xfix.T_DELETE);
+    // ...and the section tags, which the golden files DO pin as characters, so
+    // these are belt and braces rather than the only witness.
+    try testing.expectEqual(@as(u8, 'S'), xfix.TAG_SECTION);
+    try testing.expectEqual(@as(u8, 'C'), xfix.TAG_IMAGE);
+    try testing.expectEqual(@as(u8, 'K'), xfix.TAG_MARK);
+}
+
+// The entry-shape rules are reachable, which inside `contentSha` they were not.
+//
+// `entries` slices exactly `lenPlus - 1` content bytes and sets `cap` only for
+// records, so every entry it produces satisfies these rules by construction: the
+// C3z review deleted the NULL-cap rule and the whole suite stayed green. A rule
+// that only ever sees values built to satisfy it is not a check. These entries
+// are hand-built to violate one rule each.
+test "wal3 decode: the entry-shape witness rejects entries the writer never wrote" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    const p = try xfix.payload(a, 7, 8);
+    defer a.free(p);
+
+    // the shapes a conforming writer does produce
+    try xfix.checkEntryShape(&ctx, .{ .tag = xfix.T_RECORD, .recid = 1, .cap = 0, .len_plus = 0 }, "a NULL record");
+    try xfix.checkEntryShape(&ctx, .{ .tag = xfix.T_RECORD, .recid = 1, .cap = 16, .len_plus = 1, .content = &.{} }, "a zero-length record");
+    try xfix.checkEntryShape(&ctx, .{ .tag = xfix.T_RECORD, .recid = 1, .cap = 16, .len_plus = 9, .content = p }, "an ordinary record");
+    try xfix.checkEntryShape(&ctx, .{ .tag = xfix.T_PREALLOC, .recid = 1 }, "a prealloc");
+    try xfix.checkEntryShape(&ctx, .{ .tag = xfix.T_DELETE, .recid = 1 }, "a delete");
+
+    const cases = [_]struct { e: xfix.Entry, what: []const u8 }{
+        .{
+            .e = .{ .tag = xfix.T_RECORD, .recid = 1, .cap = 16, .len_plus = 0 },
+            .what = "a NULL record with a nonzero capacity",
+        },
+        .{
+            .e = .{ .tag = xfix.T_RECORD, .recid = 1, .cap = 0, .len_plus = 0, .content = &.{} },
+            .what = "a NULL record carrying content",
+        },
+        .{
+            .e = .{ .tag = xfix.T_PREALLOC, .recid = 1, .content = &.{} },
+            .what = "a prealloc carrying content",
+        },
+        .{
+            .e = .{ .tag = xfix.T_RECORD, .recid = 1, .cap = 16, .len_plus = 9 },
+            .what = "a sized record with no content",
+        },
+        .{
+            .e = .{ .tag = xfix.T_RECORD, .recid = 1, .cap = 16, .len_plus = 5, .content = p },
+            .what = "a content length that disagrees with lenPlus",
+        },
+        .{
+            .e = .{ .tag = xfix.T_RECORD, .recid = 1, .cap = 15, .len_plus = 9, .content = p },
+            .what = "a capacity that is not 16-aligned",
+        },
+    };
+    for (cases) |c| {
+        try xfix.expectRefused(&ctx, c.what, xfix.checkEntryShape, .{ &ctx, c.e, c.what });
+    }
 }
 
 // The exact-cell-set rule fires in both directions.
@@ -756,7 +833,11 @@ test "wal3 decode: the cap witness accepts only real capacities" {
     // `cap` arrives from `unpackLong`, whose domain is u64.
 }
 
-test "wal3 decode: the payload witness rejects bytes the corpus never issued" {
+// The NAME says language, not corpus, and that is all the inputs support: the
+// witness consults no fixture history. The inherited wording claimed corpus
+// membership, which is this workstream's recurring defect; the C3z review caught
+// it surviving the port.
+test "wal3 decode: the payload witness rejects bytes outside the payload language" {
     const a = testing.allocator;
     var ctx = xfix.Ctx{ .alloc = a };
 

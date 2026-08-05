@@ -18,12 +18,22 @@
 //! - `recover.parseSecHdr` and `io.DataInput2.unpackLong`, the engine's own
 //!   section-header and packed-long readers.
 //!
-//! Borrowing those makes the §11.2 comparisons *stronger*, not weaker. The two
+//! Borrowing those makes the §11.2 comparisons stronger **for behaviour the
+//! pinned corpus exercises**, and that qualification is load-bearing. The two
 //! golden tables are written by python (framing) and by the frozen java reader
-//! (bodies), so they are external authorities: if the engine's own domain, its
-//! section-header parse or its packed-long reader disagreed with java's, this
-//! suite would report it as a golden mismatch. A second in-repo transcription
-//! would only ever grade this file against itself.
+//! (bodies), so they are external authorities: if the engine's own CRC domain,
+//! its section-header parse or its packed-long reader disagreed with java's on a
+//! sample byte, this suite would report it as a golden mismatch, where a second
+//! in-repo transcription could only ever grade this file against itself.
+//!
+//! It is WEAKER for anything the corpus does not exercise, because then the
+//! reader and the thing under test move together and nothing external notices.
+//! `T_APPEND` is the concrete case: no golden row contains one, [`entries`]
+//! refuses it before decoding its remaining fields, and the synthetic battery
+//! encodes it with the same imported constant it then decodes with — so a drift
+//! in the engine's opcode would be followed, not caught. The battery therefore
+//! pins the four entry opcodes as literals, which is the one place this file
+//! deliberately does not borrow. The C3z review drew the line.
 //!
 //! # What the decoder validates, and what it does not
 //!
@@ -299,6 +309,38 @@ pub fn goldenHeader(alloc: Allocator, text: []const u8) !std.ArrayListUnmanaged(
         try out.append(alloc, line);
     }
     return out;
+}
+
+/// A golden `.tsv` is a leading comment block and then data rows, with nothing
+/// else anywhere.
+///
+/// Zig compares rows and pins the leading block separately, where java compares
+/// whole text. Without this the two are not equivalent: a comment inserted,
+/// rewritten or deleted AFTER the first data row is dropped by `goldenRows` and
+/// missed by `goldenHeader`, so it would be invisible here and visible to java.
+/// The C3z review named the gap; this closes it without a second whole-text
+/// comparison whose failures are unreadable.
+pub fn assertGoldenShape(ctx: *Ctx, what: []const u8, text: []const u8) Error!void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var seen_data = false;
+    var n: usize = 0;
+    while (lines.next()) |raw| {
+        n += 1;
+        const line = std.mem.trimRight(u8, raw, "\r");
+        if (line.len == 0) {
+            // Only the empty piece a trailing newline leaves is allowed, and only
+            // as the very last one.
+            if (lines.peek() != null)
+                return ctx.err("{s} line {d}: a blank line", .{ what, n });
+            continue;
+        }
+        if (line[0] == '#') {
+            if (seen_data) return ctx.err("{s} line {d}: a comment after the first data row", .{ what, n });
+            continue;
+        }
+        seen_data = true;
+    }
+    if (!seen_data) return ctx.err("{s}: no data rows", .{what});
 }
 
 /// Compares two row lists line by line, reporting the FIRST disagreement with
@@ -666,6 +708,32 @@ fn relName(ctx: *Ctx, s: []const u8, line: []const u8) Error![]const u8 {
     return s;
 }
 
+/// 64 lowercase hex digits. The frozen java reader validates both hash columns
+/// of a `file` row (`XFixtureManifest.sha256`); this reader stored them raw until
+/// the C3z review, which meant a manifest could carry `aa`/`bb` and parse — and
+/// several of this suite's own scaffolds did exactly that, so a case named for a
+/// later rule was resting on a manifest the reference implementation refuses.
+fn sha256Field(ctx: *Ctx, s: []const u8, line: []const u8) Error![]const u8 {
+    if (s.len != 64) return ctx.err("not 64 lowercase hex digits: {s} in: {s}", .{ s, line });
+    for (s) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+        if (!ok) return ctx.err("not 64 lowercase hex digits: {s} in: {s}", .{ s, line });
+    }
+    return s;
+}
+
+/// A nonempty, even-length, lowercase-hex byte string — an `edit` row's `before`
+/// and `after` columns.
+fn hexBytes(ctx: *Ctx, s: []const u8, line: []const u8) Error![]const u8 {
+    if (s.len == 0 or s.len % 2 != 0)
+        return ctx.err("not a whole number of lowercase hex bytes: {s} in: {s}", .{ s, line });
+    for (s) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+        if (!ok) return ctx.err("not a whole number of lowercase hex bytes: {s} in: {s}", .{ s, line });
+    }
+    return s;
+}
+
 fn oneOf(ctx: *Ctx, s: []const u8, allowed: []const []const u8, what: []const u8, line: []const u8) Error![]const u8 {
     if (!contains(allowed, s))
         return ctx.err("unknown {s} `{s}` in: {s}", .{ what, s, line });
@@ -815,17 +883,25 @@ fn pushRange(
     if (from > to) return ctx.err("empty recidrange: {s}", .{line});
     if (to - from >= MAX_RANGE_SPAN)
         return ctx.err("recidrange spans {d} recids: {s}", .{ to - from + 1, line });
+    // Terminal break rather than `r <= to`: `from == to == maxInt(u64)` passes the
+    // span check above and then `r += 1` overflows, which traps in Debug and wraps
+    // in ReleaseFast — neither of them a messaged refusal. Same for the payload id,
+    // which is an independent addition and can overflow on a two-row range.
     var r = from;
-    while (r <= to) : (r += 1) {
+    while (true) {
         const label = try owned.add(ctx.alloc, "{s}[{d}]", .{ t.f[2], r - from });
+        const pid = std.math.add(u64, base, r - from) catch
+            return ctx.err("payloadId {d} + {d} overflows: {s}", .{ base, r - from, line });
         try addRecid(ctx, into, .{
             .fixture = t.f[1],
             .label = label,
             .recid = r,
             .state = state,
-            .payload_id = base + (r - from),
+            .payload_id = pid,
             .len = @intCast(len),
         }, line);
+        if (r == to) break;
+        r += 1;
     }
 }
 
@@ -852,12 +928,7 @@ fn parseDisposition(ctx: *Ctx, s: []const u8, line: []const u8) Error!V2Post {
     if (want_args == 0) return .{ .fixture = "", .engine = "", .mode = "", .rel = "", .verb = verb };
 
     const len = try nat(ctx, args[0], line);
-    const sha = args[1];
-    if (sha.len != 64) return ctx.err("not a lowercase sha256 hex digest: {s} in: {s}", .{ sha, line });
-    for (sha) |c| {
-        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
-        if (!ok) return ctx.err("not a lowercase sha256 hex digest: {s} in: {s}", .{ sha, line });
-    }
+    const sha = try sha256Field(ctx, args[1], line);
     return .{ .fixture = "", .engine = "", .mode = "", .rel = "", .verb = verb, .len = len, .sha = sha };
 }
 
@@ -891,6 +962,24 @@ fn referentialIntegrity(
     }
 }
 
+/// `edit <fid> <relName> <offset> <before> <after>` — provenance for a derived
+/// reject image; nothing here executes it.
+///
+/// Java arity-checks it and stops. Two things are added: the row NAMES a fixture,
+/// so it is a reference like every other row's first column (the C3z review found
+/// `edit ghost ...` parsing against no declaration), and its scalars get the same
+/// canonical forms the rest of the grammar uses. Being stricter than the frozen
+/// reference is not a disagreement with it — the live manifest's three edit rows
+/// satisfy both rules.
+fn editRow(ctx: *Ctx, t: Fields, line: []const u8, referenced: *std.ArrayListUnmanaged([]const u8)) Error!void {
+    try arity(ctx, t, 6, line);
+    _ = try relName(ctx, t.f[2], line);
+    _ = try nat(ctx, t.f[3], line);
+    _ = try hexBytes(ctx, t.f[4], line);
+    _ = try hexBytes(ctx, t.f[5], line);
+    try referenced.append(ctx.alloc, t.f[1]);
+}
+
 fn declareFixture(ctx: *Ctx, m: *std.ArrayListUnmanaged(FixtureRow), t: Fields, line: []const u8) Error!void {
     for (m.items) |prior| {
         if (eql(prior.id, t.f[1]))
@@ -904,8 +993,8 @@ fn addFile(ctx: *Ctx, files: *std.ArrayListUnmanaged(FileRow), t: Fields, line: 
         .fixture = t.f[1],
         .rel = try relName(ctx, t.f[2], line),
         .raw_len = try nat(ctx, t.f[3], line),
-        .raw_sha = t.f[4],
-        .gz_sha = t.f[5],
+        .raw_sha = try sha256Field(ctx, t.f[4], line),
+        .gz_sha = try sha256Field(ctx, t.f[5], line),
     };
     for (files.items) |prior| {
         if (eql(prior.fixture, f.fixture) and eql(prior.rel, f.rel))
@@ -1005,8 +1094,7 @@ fn parseV1(ctx: *Ctx, lines: *LineIter) Error!V1 {
             try pushRange(ctx, &m.recids, &m.owned, t, line);
             try referenced.append(ctx.alloc, t.f[1]);
         } else if (eql(tag, "edit")) {
-            try arity(ctx, t, 6, line);
-            // provenance for a derived reject image; nothing here executes it.
+            try editRow(ctx, t, line, &referenced);
         } else {
             return ctx.err("unknown v1 manifest row type `{s}`: {s}", .{ tag, line });
         }
@@ -1054,6 +1142,12 @@ fn parseV2(ctx: *Ctx, lines: *LineIter) Error!V2 {
             }
             try has_derived.append(ctx.alloc, t.f[1]);
             try referenced.append(ctx.alloc, t.f[1]);
+            // The SOURCE fixture is a reference too — `manifest_v2.py`'s
+            // `fixture_unknown_ref` says so, and without it a fixture may
+            // legally derive from a fixture that does not exist. The C3z review
+            // found the referential-integrity rule silently exempting the one
+            // row type whose whole purpose is to name another fixture.
+            try referenced.append(ctx.alloc, t.f[2]);
         } else if (eql(tag, "file")) {
             try arity(ctx, t, 6, line);
             try addFile(ctx, &m.files, t, line);
@@ -1104,7 +1198,7 @@ fn parseV2(ctx: *Ctx, lines: *LineIter) Error!V2 {
             try pushRange(ctx, &m.recids, &m.owned, t, line);
             try referenced.append(ctx.alloc, t.f[1]);
         } else if (eql(tag, "edit")) {
-            try arity(ctx, t, 6, line);
+            try editRow(ctx, t, line, &referenced);
         } else if (eql(tag, "bytes")) {
             try arity(ctx, t, 7, line);
             _ = try oneOf(ctx, t.f[2], &ENGINES, "engine", line);
@@ -1234,10 +1328,18 @@ pub const Blob = struct { name: []const u8, gz: []const u8 };
 /// dump taken from bytes that were never checked against their pins describes
 /// whatever happened to be on disk.
 pub fn loadSampleV2(ctx: *Ctx, manifest_tsv: []const u8, table: []const Blob) Error!SampleV2 {
+    // ONE owner at every point. Copying `loaded.v2` into `sample.manifest` leaves
+    // two values holding the same array lists, and an `errdefer` on each ran both
+    // destructors on every refusal after this line — a missing blob, a bad hash, a
+    // short gunzip. The C3z review reproduced the double free as a segfault, and
+    // the green suite could not see it because nothing ever asked this function to
+    // refuse. So the version check is handled before the transfer, and after the
+    // transfer only `sample` has a destructor.
     var loaded = try parse(ctx, manifest_tsv);
-    errdefer loaded.deinit(ctx.alloc);
-    if (loaded.version() != 2) return ctx.err("the v2 sample root is schema v1", .{});
-
+    if (loaded.version() != 2) {
+        loaded.deinit(ctx.alloc);
+        return ctx.err("the v2 sample root is schema v1", .{});
+    }
     var sample = SampleV2{ .manifest = loaded.v2 };
     errdefer sample.deinit(ctx.alloc);
 
@@ -1305,20 +1407,35 @@ pub fn renderFraming(ctx: *Ctx, sample: *const SampleV2, out: *Strings) Error!vo
 /// rule ([`checkCap`]), and the bytes lie in the payload language
 /// ([`checkPayload`]). None of the three is a corpus-membership proof on its
 /// own; together they refuse the streams a mis-framed decode actually produces.
-fn contentSha(ctx: *Ctx, e: Entry, where: []const u8, out: *[64]u8) Error!?[]const u8 {
+/// The shape rules an entry must satisfy before its content is hashed.
+///
+/// Split out from [`contentSha`] and made `pub` because inside that function they
+/// were unreachable: `entries` slices exactly `lenPlus - 1` bytes and sets `cap`
+/// only for records, so every value it produces satisfies them by construction,
+/// and the C3z review deleted the NULL-cap rule with the whole suite still green.
+/// A rule that only ever sees values built to satisfy it is not a check. Fed
+/// hand-built entries, these are.
+pub fn checkEntryShape(ctx: *Ctx, e: Entry, where: []const u8) Error!void {
     if (!e.isRecord() or e.len_plus.? == 0) {
         if (e.content != null)
             return ctx.err("{s}: a non-record or NULL entry carries content", .{where});
+        // `cap == 0` is how the writer encodes NULL content; any other capacity
+        // means the entry stream was framed some other way than it was written.
         if (e.isRecord() and e.cap.? != 0)
             return ctx.err("{s}: a NULL record's cap must be 0, not {d}", .{ where, e.cap.? });
-        return null;
+        return;
     }
     const c = e.content orelse return ctx.err("{s}: a sized record carries no content", .{where});
     if (c.len != e.len_plus.? - 1)
         return ctx.err("{s}: content length {d} disagrees with lenPlus {d}", .{ where, c.len, e.len_plus.? });
     try checkCap(ctx, e.cap.?, c.len, where);
     try checkPayload(ctx, c, where);
-    out.* = sha256Hex(c);
+}
+
+fn contentSha(ctx: *Ctx, e: Entry, where: []const u8, out: *[64]u8) Error!?[]const u8 {
+    try checkEntryShape(ctx, e, where);
+    if (!e.isRecord() or e.len_plus.? == 0) return null;
+    out.* = sha256Hex(e.content.?);
     return out[0..];
 }
 
@@ -1592,8 +1709,16 @@ pub fn assertEveryLoggedRecidIsClassified(
 /// uses. `readFile(..) catch false` would turn a permission error, or the target
 /// having been replaced by a DIRECTORY, into "absent", so a `deleted` row would
 /// pass on a file that is very much still there in another shape.
-fn exists(dir: std.fs.Dir, name: []const u8) bool {
-    _ = std.posix.fstatat(dir.fd, name, std.posix.AT.SYMLINK_NOFOLLOW) catch return false;
+///
+/// Only `NotFound` means absent. Every other errno is REPORTED: `catch false`
+/// would make an I/O or permission failure indistinguishable from absence, which
+/// is the same defect one level down — a `deleted` row passing without anything
+/// having established that the file is gone. The C3z review named it.
+fn exists(ctx: *Ctx, dir: std.fs.Dir, name: []const u8, cell: []const u8) Error!bool {
+    _ = std.posix.fstatat(dir.fd, name, std.posix.AT.SYMLINK_NOFOLLOW) catch |e| switch (e) {
+        error.FileNotFound => return false,
+        else => return ctx.err("[{s}] cannot stat {s}: {s}", .{ cell, name, @errorName(e) }),
+    };
     return true;
 }
 
@@ -1616,7 +1741,7 @@ pub fn assertPostState(
     cell: []const u8,
 ) Error!void {
     for (posts) |p| {
-        const present = exists(dir, p.rel);
+        const present = try exists(ctx, dir, p.rel, cell);
         var was_input: ?[]const u8 = null;
         for (before) |b| {
             if (eql(b.rel, p.rel)) was_input = b.bytes;
@@ -1695,6 +1820,34 @@ pub fn assertPostState(
     }
 }
 
+/// The one thing that makes the manifest's `mode` column OBSERVABLE.
+///
+/// Until the C3z review both modes did the same reads and asserted the same post
+/// state, so `mode` was validated by the parser and then selected a flag whose
+/// effect nothing looked at: setting `read_only = false` unconditionally left the
+/// whole suite green, and all six `ro` cells were writable opens. That is the
+/// acceptance question's own shape — a field the comparison never reaches — sitting
+/// in the executor rather than in the decoder.
+///
+/// `preallocate` is the probe because it is the cheapest thing behind the write
+/// gate. The `rw` half rolls back rather than committing, and the post-state rule
+/// that runs immediately afterwards is what proves the rollback left no trace: if
+/// an uncommitted preallocate ever reached the log, this cell would fail there.
+fn assertWriteGate(ctx: *Ctx, s: *StoreWAL, mode: []const u8, cell: []const u8) Error!void {
+    if (eql(mode, "ro")) {
+        if (s.preallocate()) |recid| {
+            return ctx.err("[{s}] a read-only handle preallocated recid {d}", .{ cell, recid });
+        } else |e| if (e != error.ReadOnly) {
+            return ctx.err("[{s}] a read-only handle refused a write with {s}, not ReadOnly", .{ cell, @errorName(e) });
+        }
+    } else {
+        _ = s.preallocate() catch |e|
+            return ctx.err("[{s}] a read-write handle refused a preallocate: {s}", .{ cell, @errorName(e) });
+        s.rollback() catch |e|
+            return ctx.err("[{s}] rollback failed: {s}", .{ cell, @errorName(e) });
+    }
+}
+
 /// Runs every schema-v2 cell addressed to this engine in `mode`, and asserts the
 /// set that ran is **exactly** the set the `fixture` rows call for.
 ///
@@ -1753,6 +1906,7 @@ pub fn runV2Cells(ctx: *Ctx, sample: *const SampleV2, mode: []const u8, tmp: std
             defer s.deinit();
             try assertReaderContract(ctx, &s, m.recids.items, e.fixture, cell);
             try assertEveryLoggedRecidIsClassified(ctx, &s, sample, e.fixture, cell);
+            try assertWriteGate(ctx, &s, mode, cell);
             s.close() catch |err| return ctx.err("[{s}] close failed: {s}", .{ cell, @errorName(err) });
         } else if (eql(e.verdict, "reject")) {
             if (StoreWAL.openCfg(ctx.alloc, base, opts)) |*opened| {

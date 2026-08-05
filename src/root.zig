@@ -26,17 +26,25 @@ pub const listener = @import("listener.zig");
 pub const queue = @import("queue/mod.zig");
 /// DB/DBMaker facade: name catalog, typed makers, Atomic, Bind.
 pub const db = @import("db/mod.zig");
-/// Cross-port conformance fixture tests (golden files in src/xfixtures/data/
-/// and src/xfixtures/data-v2/, consumed via @embedFile; generator wired as
-/// `zig build fixtures`).
-pub const xfixtures = @import("xfixtures/conformance_test.zig");
-/// Stage C slice C3z: the shared v1/v2 manifest dispatch reader and WAL v3
-/// decoder, plus its synthetic decoder battery.
-pub const xfixtures_xfix = @import("xfixtures/xfix.zig");
-pub const xfixtures_wal3_decode = @import("xfixtures/wal3_decode_test.zig");
 /// Stage C slice C2z: the WAL v3 accept-bundle generator and its gate
-/// (`zig build fixtures -- --wal3 <dir>`).
+/// (`zig build fixtures -- --wal3 <dir>`). PUBLIC because
+/// `src/xfixtures/generator.zig` is a separate executable that reaches it
+/// through this module.
 pub const xfixtures_wal3 = @import("xfixtures/wal3_fixtures.zig");
+
+// The cross-port conformance suites, pulled in for TEST DISCOVERY ONLY.
+//
+// `pub const` would publish them: a downstream importer could name the WAL v3
+/// decoder, the manifest executor and the format constants it re-exports, and
+// depend on shapes that exist to be rewritten every time the fixture protocol
+// moves. The C3z review found exactly that, and the fix is that a test root
+// references a test module rather than exporting it. Golden files live in
+// src/xfixtures/data/ and src/xfixtures/data-v2/ and are consumed via
+// @embedFile; the generator is wired as `zig build fixtures`.
+test {
+    _ = @import("xfixtures/conformance_test.zig");
+    _ = @import("xfixtures/wal3_decode_test.zig");
+}
 
 /// The single error set every public API returns.
 pub const DbError = errors.DbError;
