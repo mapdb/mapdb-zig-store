@@ -74,6 +74,34 @@ if [ "$got" != "$want" ]; then
   exit 1
 fi
 
+echo "== WAL v3 fixture generator: two PROCESSES, byte for byte (C2z) =="
+# Contract §5.4 obligation 8's across-process half. The generator compares two
+# runs of each shape inside one process and refuses to publish otherwise, and
+# the unit suite compares two in-process `generate` calls over the whole tree —
+# but both live in one process and share every process-wide seed, so an output
+# depending on an address, a hash-map iteration order or a lazily initialised
+# global agrees with itself and still differs between runs. `fragment.tsv` is
+# also the one file the generator structurally cannot compare: it does not
+# exist yet when `produceTwice` runs.
+#
+# Two real invocations of the documented CLI, whole trees diffed. `--commit` is
+# passed the same value both times deliberately: it is metadata the sync script
+# supplies, not something the generator derives, and letting it vary here would
+# make the comparison fail for a reason that is not about determinism.
+a="$(mktemp -d)"; b="$(mktemp -d)"
+trap 'rm -rf "$a" "$b"' EXIT
+zig build fixtures -- --wal3 "$a" --force --commit ci >/dev/null
+zig build fixtures -- --wal3 "$b" --force --commit ci >/dev/null
+if ! diff -r "$a" "$b" >/dev/null; then
+  echo "the WAL v3 fixture generator is NOT deterministic across two processes:"
+  diff -r "$a" "$b" || true
+  exit 1
+fi
+# ...and non-vacuously: an empty tree diffs clean against another empty tree.
+for want in wal3-zig-tail wal3-zig-cleaned fragment.tsv layout.tsv; do
+  test -e "$a/$want" || { echo "generator published no $want"; exit 1; }
+done
+
 echo "== package (.paths allowlist covers what a consumer is entitled to) =="
 for f in README.md NOTICE.md LICENSE-EPL-1.0.txt LICENSE-EDL-1.0.txt; do
   grep -q "\"$f\"" build.zig.zon || { echo "not in build.zig.zon .paths: $f"; exit 1; }

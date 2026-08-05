@@ -29,6 +29,9 @@ pub const db = @import("db/mod.zig");
 /// Cross-port conformance fixture tests (golden files in src/xfixtures/data/,
 /// consumed via @embedFile; generator wired as `zig build fixtures`).
 pub const xfixtures = @import("xfixtures/conformance_test.zig");
+/// Stage C slice C2z: the WAL v3 accept-bundle generator and its gate
+/// (`zig build fixtures -- --wal3 <dir>`).
+pub const xfixtures_wal3 = @import("xfixtures/wal3_fixtures.zig");
 
 /// The single error set every public API returns.
 pub const DbError = errors.DbError;

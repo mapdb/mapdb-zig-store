@@ -41,6 +41,8 @@ const DataInput2 = mapdb.DataInput2;
 const DataOutput2 = mapdb.DataOutput2;
 const StoreDirect = mapdb.StoreDirect;
 const StoreWAL = mapdb.StoreWAL;
+/// Stage C slice C2z: the WAL v3 accept-bundle generator (`--wal3 <dir>`).
+const wal3 = mapdb.xfixtures_wal3;
 
 const FIXTURE_ID = "direct-v1-zig";
 const DB_NAME = "direct-v1-zig.db";
@@ -771,6 +773,43 @@ pub fn main() !void {
                 fatal("usage: --golden <dir>   (exactly one argument, no other flags)", .{});
             try mainGolden(alloc, args[2]);
             return;
+        }
+        // `--wal3 <dir> [--force]`: the Stage C (C2z) accept-bundle generator.
+        // Like `--golden` it runs BEFORE the staleness refusal below, writes
+        // into its own directory, and never touches the v1 fixture outputs that
+        // refusal protects. EXACT shape, for the reason `--golden` is: scanning
+        // for the flag anywhere let `--out protected --wal3 protected` silently
+        // ignore `--out` (C0b review finding 5).
+        if (args.len >= 2 and std.mem.eql(u8, args[1], "--wal3")) {
+            if (args.len < 3) fatal("usage: --wal3 <dir> [--force] [--commit <hash>]", .{});
+            var force = false;
+            var commit: []const u8 = "unknown";
+            var i: usize = 3;
+            while (i < args.len) : (i += 1) {
+                if (std.mem.eql(u8, args[i], "--force")) {
+                    force = true;
+                } else if (std.mem.eql(u8, args[i], "--commit")) {
+                    i += 1;
+                    if (i >= args.len) fatal("--commit needs a hash argument", .{});
+                    commit = args[i];
+                } else {
+                    fatal("usage: --wal3 <dir> [--force] [--commit <hash>]", .{});
+                }
+            }
+            var arena_state = std.heap.ArenaAllocator.init(alloc);
+            defer arena_state.deinit();
+            var g: wal3.Grade = .{};
+            wal3.generate(arena_state.allocator(), args[2], force, commit, &g) catch |e| {
+                if (g.row) |row|
+                    fatal("§5.3/§5.3.1 refusal [{s}]: {s}", .{ @tagName(row), g.message() });
+                fatal("--wal3 failed: {s}", .{@errorName(e)});
+            };
+            std.debug.print("wrote {s}/ and {s}/ plus fragment.tsv and layout.tsv under {s}\n", .{ wal3.TAIL_ID, wal3.CLEANED_ID, args[2] });
+            return;
+        }
+        for (args[1..]) |a| {
+            if (std.mem.eql(u8, a, "--wal3"))
+                fatal("--wal3 must be the FIRST argument: `--wal3 <dir> [--force]`", .{});
         }
         for (args[1..]) |a| {
             if (std.mem.eql(u8, a, "--golden"))
