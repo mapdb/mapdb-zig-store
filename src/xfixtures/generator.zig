@@ -749,6 +749,20 @@ fn mainGolden(alloc: Allocator, out_dir: []const u8) !void {
     _ = try s.put([]const u8, alloc, "", R);
     try s.commit();
 
+    // commits 7 and 8: a NULL-content record. `lenPlus == 0` is null and
+    // `lenPlus == 1` is the zero-length record written just above, and a reader
+    // that decodes `lenPlus` into a length collapses the two. C3s added this to
+    // both writers because the corpus contained no `lenPlus == 0` entry at all,
+    // which made the C3 body comparison unable to fail on that row. Kept in
+    // lockstep with `Wal3GoldenWriter.workload` — a divergence here is a
+    // divergence in the sample, not in the engines.
+    const p5 = try payloadAlloc(alloc, BASE + 4, 32);
+    defer alloc.free(p5);
+    const nul = try s.put([]const u8, alloc, p5, R);
+    try s.commit();
+    try s.update([]const u8, alloc, nul, null, R);
+    try s.commit();
+
     try s.close();
     s.deinit(); // close() and deinit() are separate steps (store_wal_test.zig:242)
     std.debug.print("wrote a zig-authored v3 namespace under {s}\n", .{out_dir});
