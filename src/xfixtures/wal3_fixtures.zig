@@ -271,8 +271,26 @@ fn cleanedWorkload(alloc: Allocator, base_path: []const u8, r: *Recids) !void {
 
 /// The final logical state §5.2 pins, which §5.3 shares verbatim.
 fn assertFinalState(alloc: Allocator, s: *StoreWAL, r: *const Recids, base: u64) !void {
+    try assertStateWithA(alloc, s, r, base, base + 5, 120);
+}
+
+/// §5.2's final logical state with A's content named by the caller.
+///
+/// Every adopted workload ends with A holding `p(base+5, 120)`; the one probe
+/// variant that deliberately stops mid-pair ends with A holding the oversized
+/// payload instead. Naming A's expectation rather than skipping the check keeps
+/// that variant's exception scoped to the ONE record it is about — otherwise an
+/// unrelated state defect in it would be exempt too.
+fn assertStateWithA(
+    alloc: Allocator,
+    s: *StoreWAL,
+    r: *const Recids,
+    base: u64,
+    a_id: u64,
+    a_len: usize,
+) !void {
     try s.verify();
-    try expectPayload(alloc, s, r.a, base + 5, 120);
+    try expectPayload(alloc, s, r.a, a_id, a_len);
     try expectPayload(alloc, s, r.b, base + 1, 0);
     try expectNull(alloc, s, r.c);
     try expectNull(alloc, s, r.d);
@@ -981,7 +999,9 @@ fn writeSidecar(arena: Allocator, out_dir: []const u8, name: []const u8, data: [
 /// logical state §5.3 pins and asserts it before closing, so a variant that
 /// reaches the shape by changing what the fixture MEANS fails here rather than
 /// in review. The one exception is `shaped-half-rotate`, which exists precisely
-/// to show that half of a state-preserving PAIR is not state-preserving.
+/// to show that half of a state-preserving PAIR is not state-preserving; it
+/// asserts the state it DOES reach — A holding the oversized payload, the rest
+/// of §5.2 unchanged — rather than skipping the check.
 pub const Variant = enum {
     /// §5.3 exactly as revision 1 wrote it
     spec,
@@ -1061,9 +1081,16 @@ pub fn probeVariant(arena: Allocator, variant: Variant, dir_path: []const u8) !v
         },
     }
     if (s.cleanerBytes().written <= 0) return error.CheckpointWroteNoImage;
-    // Every variant but the deliberately state-breaking one reaches §5.3's
-    // final logical state, and says so before it is allowed to be measured.
-    if (variant != .shaped_half_rotate) try assertFinalState(arena, &s, &r, b);
+    // Every variant says what state it reaches before it is allowed to be
+    // measured. `shaped_half_rotate` is the one that does NOT reach §5.3's —
+    // that is the point of it — so it names the state it does reach instead:
+    // A holding the oversized payload, every other record where §5.2 leaves it.
+    // The exception it is granted is exactly one record wide.
+    if (variant == .shaped_half_rotate) {
+        try assertStateWithA(arena, &s, &r, b, b + 7, @intCast(SEGMENT_BYTES));
+    } else {
+        try assertFinalState(arena, &s, &r, b);
+    }
     try s.close();
     dropLock(dir_path, arena);
 }
