@@ -616,10 +616,14 @@ fn checkCleaned(arena: Allocator, segs: []const Seg, g: *Grade) ![]Symbol {
     var retained: std.ArrayListUnmanaged(Seg) = .empty;
     for (segs) |s| if (s.seq > m.through) try retained.append(arena, s);
     const ret = retained.items;
-    if (ret.len == 0 or ret[0].seq <= 1)
-        return g.fail(.floor_not_above_one, "the retained floor must be above segment 1 (§5.3)", .{});
+    // Cardinality BEFORE the floor, matching rust and java: an image retaining
+    // nothing is refused for row 1, which is what is wrong with it, and not for a
+    // floor read off an element that is not there. Folding the empty case into the
+    // floor test is bounds-safe but names the wrong reason.
     if (ret.len != 3)
         return g.fail(.retained_cardinality, "§5.3.1 row 1 requires exactly three retained segments; this bundle retains {d}", .{ret.len});
+    if (ret[0].seq <= 1)
+        return g.fail(.floor_not_above_one, "the retained floor must be above segment 1 (§5.3)", .{});
     const lowest = ret[0];
     const middle = ret[1];
     const active = ret[2];
@@ -1015,8 +1019,9 @@ pub const Variant = enum {
     /// the adopted workload MINUS shapeRotate
     shaped_no_rotate,
     /// the adopted workload with only the half of shapeRotate that CROSSES
-    /// segmentBytes. Ends with A holding the oversized payload, so it does NOT
-    /// reach §5.3's final state and is measured for SHAPE only.
+    /// segmentBytes. Ends with A holding the OVERSIZED payload, so it does not
+    /// reach §5.3's final state — it asserts the state it does reach instead,
+    /// which is every §5.2 row plus the recid set, with A's expectation moved.
     shaped_half_rotate,
 };
 
