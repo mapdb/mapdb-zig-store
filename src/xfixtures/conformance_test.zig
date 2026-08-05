@@ -357,6 +357,48 @@ test "xfixtures v2: both renderers refuse a segment with trailing bytes" {
     try xfix.expectRefused(&ctx, "a trailing byte, seen by the body renderer", xfix.renderBody, .{ &ctx, &doctored, &rows2 });
 }
 
+// EVERY bundle's recids are cross-checked, not just some of them.
+//
+// `renderBody` calls the one-way rule twice — once per bundle boundary and once
+// for the last bundle — and on a corpus where every bundle satisfies the rule,
+// dropping either call leaves the suite green. Measured, not assumed: both
+// mutants survived round 2. So each case below doctors ONE bundle's manifest
+// with a recid its log never mentions, and the two cases pick a bundle that is
+// not last and the bundle that is.
+test "xfixtures v2: every bundle's manifest recids are cross-checked" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    var sample = try loadSample(&ctx);
+    defer sample.deinit(a);
+
+    // dump order is (fixtureId, relName): java-cleaned, java-tail, zig-tail.
+    const cases = [_]struct { row: []const u8, what: []const u8 }{
+        .{
+            .row = "recid\twal3-java-cleaned\tghost\t9999\tlive\t1\t8\n",
+            .what = "a phantom recid on a bundle that is not the last",
+        },
+        .{
+            .row = "recid\twal3-zig-tail\tghost\t9999\tlive\t1\t8\n",
+            .what = "a phantom recid on the last bundle",
+        },
+    };
+    for (cases) |c| {
+        const text = try std.mem.concat(a, u8, &.{ v2_manifest_tsv, c.row });
+        defer a.free(text);
+        var loaded = try xfix.parse(&ctx, text);
+        defer loaded.deinit(a);
+
+        var files: std.ArrayListUnmanaged(xfix.RawFile) = .empty;
+        defer files.deinit(a);
+        try files.appendSlice(a, sample.files.items);
+        const doctored = xfix.SampleV2{ .manifest = loaded.v2, .files = files };
+
+        var rows: xfix.Strings = .{};
+        defer rows.deinit(a);
+        try xfix.expectRefused(&ctx, c.what, xfix.renderBody, .{ &ctx, &doctored, &rows });
+    }
+}
+
 // DECODED BODIES, against the file the FROZEN JAVA READER authored.
 //
 // Contract §11.2 settles body semantics engine-against-engine rather than in a
