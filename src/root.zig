@@ -26,9 +26,14 @@ pub const listener = @import("listener.zig");
 pub const queue = @import("queue/mod.zig");
 /// DB/DBMaker facade: name catalog, typed makers, Atomic, Bind.
 pub const db = @import("db/mod.zig");
-/// Cross-port conformance fixture tests (golden files in src/xfixtures/data/,
-/// consumed via @embedFile; generator wired as `zig build fixtures`).
+/// Cross-port conformance fixture tests (golden files in src/xfixtures/data/
+/// and src/xfixtures/data-v2/, consumed via @embedFile; generator wired as
+/// `zig build fixtures`).
 pub const xfixtures = @import("xfixtures/conformance_test.zig");
+/// Stage C slice C3z: the shared v1/v2 manifest dispatch reader and WAL v3
+/// decoder, plus its synthetic decoder battery.
+pub const xfixtures_xfix = @import("xfixtures/xfix.zig");
+pub const xfixtures_wal3_decode = @import("xfixtures/wal3_decode_test.zig");
 /// Stage C slice C2z: the WAL v3 accept-bundle generator and its gate
 /// (`zig build fixtures -- --wal3 <dir>`).
 pub const xfixtures_wal3 = @import("xfixtures/wal3_fixtures.zig");

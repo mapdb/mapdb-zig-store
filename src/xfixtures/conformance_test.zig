@@ -1,55 +1,62 @@
-//! Cross-port conformance fixture tests — Stage 1 (D accept matrix + the
-//! reject rows derivable from D outputs) and Stage 2 (W WAL accept cells +
-//! WAL-file-based reject rows).
+//! Cross-port conformance harness — **both manifest schemas**, dispatched on
+//! the version line (Stage C slice **C3z**).
 //!
-//! These fixtures pin the CURRENT state of an UNSTABLE on-disk format for
-//! divergence detection between the java/rust/zig store engines. Cross-engine
-//! openability is an implementation fact, not a supported feature; any format
-//! change regenerates the fixtures as part of that change.
+//! `src/xfixtures/data/` is the live schema-v1 tree; `src/xfixtures/data-v2/` is
+//! the shared static schema-v2 sample (`todo/store-cross/sample-v2/`, byte for
+//! byte). Keeping both roots in the suite at once is deliberate: C6 is a data
+//! commit, and a reader that only ever saw the schema it was written for would
+//! discover the other one on cutover day.
 //!
-//! Fixture data lives in `src/xfixtures/data/` (`MANIFEST.tsv` + one
-//! `<relName>.gz` per fixture file, byte-identical across the three repos)
-//! and is consumed via `@embedFile` (no cwd assumption). The suite HARD-FAILS
-//! (test failure, not skip) on a manifest whose version is not 1; a MISSING
-//! manifest or data file is a COMPILE error by construction of `@embedFile`,
-//! which is the strongest possible "sync step was never run" failure.
+//! What runs here:
 //!
-//! Flow (identical in all three engines, see impl-contract-stage1.md):
-//! 1. parse MANIFEST.tsv, assert `version 1`;
-//! 2. gunzip every referenced `.gz`, verify rawSha256 + rawLen (and gzSha256);
-//! 3. for each `expect` row with engine == zig: fresh per-cell temp dir, copy
-//!    the fixture file in as `placeAs`, run the cell (accept: open — opener
-//!    `direct` = StoreDirect, opener `wal` = StoreWAL replay — + verify()
-//!    + per-recid assertions + getAllRecids set equality; reject:
-//!    `error.DataCorruption` from the opener), then assert the working copy
-//!    is byte-identical and no files beyond `.lock` sidecars appeared (in
-//!    particular NO `.ckpt` companion after a clean StoreWAL close).
+//! - **v1 cells** — accept/reject, `direct` and `wal` openers, as before, but
+//!   now through the SHARED parser in `xfix.zig` rather than a bespoke one.
+//! - **v2 `rw` and `ro` cells** — both here. Decision C-D3 costs this port
+//!   nothing: `WalOptions.read_only` is `pub` and this suite is in-package, so
+//!   neither mode needs new public surface (rust had to move its `ro` executor
+//!   into the crate to say the same thing).
+//! - **the two §11.2 comparisons** — framing against `GOLDEN-DECODE.tsv`,
+//!   decoded bodies against `GOLDEN-BODY.tsv`, which the frozen Java reader
+//!   authored.
+//! - **C-D4** — the generated `embedded_v2.zig` table, graded by three-way set
+//!   equality against the manifest and against what `build.zig` finds on disk.
+//!
+//! Fixture data is consumed via `@embedFile` (no cwd assumption). A MISSING
+//! manifest or data file is a COMPILE error by construction, which is the
+//! strongest possible "the sync step was never run".
 
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const DbError = @import("../errors.zig").DbError;
-const io = @import("../io.zig");
-const DataInput2 = io.DataInput2;
-const DataOutput2 = io.DataOutput2;
 const store_mod = @import("../store/mod.zig");
 const StoreDirect = store_mod.StoreDirect;
 const StoreWAL = store_mod.StoreWAL;
 
-const ENGINE = "zig";
+const xfix = @import("xfix.zig");
+const embedded_v2 = @import("embedded_v2.zig");
+/// What `build.zig` found in `src/xfixtures/data-v2/` — C-D4's third set, and
+/// the only one of the three neither the manifest nor the generator can affect.
+const distributed = @import("xfix_distributed");
 
-const manifest_tsv: []const u8 = @embedFile("data/MANIFEST.tsv");
+const ENGINE = xfix.ENGINE;
+
+// ---------------------------------------------------------------------------
+// schema v1 — the live tree
+// ---------------------------------------------------------------------------
+
+const v1_manifest_tsv: []const u8 = @embedFile("data/MANIFEST.tsv");
 
 const EmbeddedGz = struct { rel_name: []const u8, gz: []const u8 };
-/// NOTE: this list MUST cover every `file` row of data/MANIFEST.tsv —
-/// `rel_name` == the row's relName, embedding `<relName>.gz`. `@embedFile`
-/// needs comptime-known names, so the list is static (all 14 Stage-2 manifest
-/// files); the runtime preflight hard-fails on any manifest file row missing
-/// here. The CONVERSE is tolerated: an embedded entry the current manifest
-/// does not reference is harmless surplus (see `loadBaselines`), which keeps
-/// compilation stable across sync generations — the manifest is data while
-/// this list is comptime, so a not-yet-distributed fixture only needs a
-/// placeholder .gz in data/, not a code change.
+/// This list MUST cover every `file` row of data/MANIFEST.tsv. `@embedFile`
+/// needs comptime-known names, so it is static; the runtime preflight hard-fails
+/// on any manifest file row missing here.
+///
+/// Surplus is TOLERATED on this v1 root and refused on the v2 one, which is not
+/// an inconsistency: the v1 tree is live data that the sync step rewrites
+/// generation by generation, so a not-yet-referenced fixture needs a placeholder
+/// `.gz` and no code change. The v2 sample is STATIC and generated, which is why
+/// C-D4 can demand set equality there.
 const embedded_gz = [_]EmbeddedGz{
     .{ .rel_name = "direct-v1-java.db", .gz = @embedFile("data/direct-v1-java.db.gz") },
     .{ .rel_name = "direct-v1-rust.db", .gz = @embedFile("data/direct-v1-rust.db.gz") },
@@ -67,562 +74,636 @@ const embedded_gz = [_]EmbeddedGz{
     .{ .rel_name = "reject-wal-java-v3.walseg", .gz = @embedFile("data/reject-wal-java-v3.walseg.gz") },
 };
 
-// ---------------------------------------------------------------- serializer
-
-/// Raw-bytes serializer: content == value (framed by `size`). Same shape as
-/// the `RawSer` fixtures in tck.zig / store_direct_test.zig (the contract
-/// mandates a raw byte-array serializer — payload bytes ARE the content).
-const RawSer = struct {
-    pub const Elem = []const u8;
-    pub const instance: RawSer = .{};
-    pub fn serialize(_: RawSer, out: *DataOutput2, v: []const u8) DbError!void {
-        try out.writeAll(v);
-    }
-    pub fn deserialize(_: RawSer, alloc: Allocator, input: *DataInput2, size: ?usize) DbError![]const u8 {
-        const n = size orelse return error.DataCorruption;
-        const b = try alloc.alloc(u8, n);
-        errdefer alloc.free(b);
-        try input.readFully(b);
-        return b;
-    }
-    pub fn cloneElem(_: RawSer, alloc: Allocator, v: []const u8) DbError![]const u8 {
-        return alloc.dupe(u8, v);
-    }
-    pub fn deinitElem(_: RawSer, alloc: Allocator, v: []const u8) void {
-        alloc.free(v);
-    }
-    pub fn equals(_: RawSer, a: []const u8, b: []const u8) bool {
-        return std.mem.eql(u8, a, b);
-    }
-    pub fn compare(_: RawSer, a: []const u8, b: []const u8) std.math.Order {
-        return std.mem.order(u8, a, b);
-    }
-    pub fn fixedSize(_: @This()) ?usize {
-        return null;
-    }
-    pub fn equalsBySerializedBytes(_: @This()) bool {
-        return true;
-    }
-};
-const R = RawSer.instance;
-
-/// Contract payload function: `payload(payloadId, len)[i] = (i*131 + payloadId) & 0xff`.
-/// Recomputed per assertion — the >1 MiB payload is never cached globally.
-fn payloadAlloc(alloc: Allocator, payload_id: u64, len: usize) ![]u8 {
-    const buf = try alloc.alloc(u8, len);
-    for (buf, 0..) |*b, i| b.* = @truncate(i * 131 + payload_id);
-    return buf;
-}
-
-// ------------------------------------------------------------ manifest model
-
-const FileRow = struct {
-    fixture: []const u8,
-    rel_name: []const u8,
-    raw_len: u64,
-    raw_sha: []const u8,
-    gz_sha: []const u8,
+/// The `wal-v1-*` accept cells RETIRE at this engine's WAL v3 cutover: the port
+/// refuses format v1 outright (there is no migration, by design) and its opener
+/// no longer takes a WAL FILE path at all, so the cell cannot even be expressed.
+/// D6 retires these IDs family-wide at Stage C; until the java and zig
+/// generators stop emitting v1 rows they stay in the shared manifest for the
+/// engines that still speak v1, and this engine skips them. The list is EXACT
+/// and asserted below: a new accept row addressed to zig must not be silently
+/// dropped by a prefix match, and a retired cell vanishing from the manifest
+/// means Stage C has begun and this skip list must go with it.
+const retired_v1_accepts = [_][]const u8{
+    "wal-v1-rust-tail",
+    "wal-v1-rust-ckpt",
+    "wal-v1-zig-tail",
+    "wal-v1-zig-ckpt",
 };
 
-const ExpectRow = struct {
-    fixture: []const u8,
-    engine: []const u8,
-    verdict: []const u8,
-    opener: []const u8,
-    place_as: []const u8,
-    open_arg: []const u8,
-};
-
-const RecState = enum { live, null_rec, prealloc, deleted };
-
-/// A `recid` row (from == to) or a `recidrange` row; payloadId for recid r in
-/// a range = pid_base + (r - from).
-const RecidRow = struct {
-    fixture: []const u8,
-    label: []const u8,
-    from: u64,
-    to: u64,
-    state: RecState,
-    pid_base: u64,
-    len: u64,
-};
-
-const Manifest = struct {
-    files: std.ArrayListUnmanaged(FileRow) = .empty,
-    expects: std.ArrayListUnmanaged(ExpectRow) = .empty,
-    recids: std.ArrayListUnmanaged(RecidRow) = .empty,
-
-    fn deinit(self: *Manifest, alloc: Allocator) void {
-        self.files.deinit(alloc);
-        self.expects.deinit(alloc);
-        self.recids.deinit(alloc);
-    }
-
-    /// Every fixture has exactly ONE file row (Stage-1 rule, still in force
-    /// for Stage 2 — every Stage-2 fixture is single-file; asserted here).
-    fn fileFor(self: *const Manifest, fixture: []const u8) !FileRow {
-        var found: ?FileRow = null;
-        for (self.files.items) |f| {
-            if (std.mem.eql(u8, f.fixture, fixture)) {
-                if (found != null) {
-                    std.debug.print("[xfixtures] fixture {s}: more than one file row (contract forbids)\n", .{fixture});
-                    return error.XFixturesManifest;
-                }
-                found = f;
-            }
-        }
-        return found orelse {
-            std.debug.print("[xfixtures] fixture {s}: no file row\n", .{fixture});
-            return error.XFixturesManifest;
-        };
-    }
-};
-
-fn parseState(s: []const u8) !RecState {
-    if (std.mem.eql(u8, s, "live")) return .live;
-    if (std.mem.eql(u8, s, "null")) return .null_rec;
-    if (std.mem.eql(u8, s, "prealloc")) return .prealloc;
-    if (std.mem.eql(u8, s, "deleted")) return .deleted;
-    std.debug.print("[xfixtures] unknown recid state `{s}`\n", .{s});
-    return error.XFixturesManifest;
-}
-
-fn parseU64(s: []const u8) !u64 {
-    return std.fmt.parseInt(u64, s, 10) catch {
-        std.debug.print("[xfixtures] bad number `{s}` in manifest\n", .{s});
-        return error.XFixturesManifest;
-    };
-}
-
-/// Split one manifest line into up to 8 tab-separated fields; `n` fields
-/// required (extra fields are a manifest error).
-fn fields(line: []const u8, comptime n: usize) ![n][]const u8 {
-    var out: [n][]const u8 = undefined;
-    var it = std.mem.splitScalar(u8, line, '\t');
-    for (&out) |*f| {
-        f.* = it.next() orelse {
-            std.debug.print("[xfixtures] manifest line has fewer than {d} fields: `{s}`\n", .{ n, line });
-            return error.XFixturesManifest;
-        };
-    }
-    if (it.next() != null) {
-        std.debug.print("[xfixtures] manifest line has more than {d} fields: `{s}`\n", .{ n, line });
-        return error.XFixturesManifest;
-    }
-    return out;
-}
-
-/// Parse MANIFEST.tsv. `#` comments and blank lines ignored; the first data
-/// line MUST be `version<TAB>1` — anything else is a HARD test failure.
-fn parseManifest(alloc: Allocator) !Manifest {
-    var m: Manifest = .{};
-    errdefer m.deinit(alloc);
-    var saw_version = false;
-    var lines = std.mem.splitScalar(u8, manifest_tsv, '\n');
-    while (lines.next()) |line_raw| {
-        const line = std.mem.trimRight(u8, line_raw, "\r");
-        if (line.len == 0 or line[0] == '#') continue;
-        var it = std.mem.splitScalar(u8, line, '\t');
-        const tag = it.next().?;
-        if (!saw_version) {
-            const f = try fields(line, 2);
-            if (!std.mem.eql(u8, f[0], "version") or !std.mem.eql(u8, f[1], "1")) {
-                std.debug.print("[xfixtures] first manifest data line is not `version 1`: `{s}`\n", .{line});
-                return error.XFixturesManifest;
-            }
-            saw_version = true;
-            continue;
-        }
-        if (std.mem.eql(u8, tag, "fixture")) {
-            _ = try fields(line, 5); // shape check only (id/kind/engine/commit)
-        } else if (std.mem.eql(u8, tag, "file")) {
-            const f = try fields(line, 6);
-            try m.files.append(alloc, .{
-                .fixture = f[1],
-                .rel_name = f[2],
-                .raw_len = try parseU64(f[3]),
-                .raw_sha = f[4],
-                .gz_sha = f[5],
-            });
-        } else if (std.mem.eql(u8, tag, "expect")) {
-            const f = try fields(line, 7);
-            try m.expects.append(alloc, .{
-                .fixture = f[1],
-                .engine = f[2],
-                .verdict = f[3],
-                .opener = f[4],
-                .place_as = f[5],
-                .open_arg = f[6],
-            });
-        } else if (std.mem.eql(u8, tag, "recid")) {
-            const f = try fields(line, 7);
-            const recid = try parseU64(f[3]);
-            try m.recids.append(alloc, .{
-                .fixture = f[1],
-                .label = f[2],
-                .from = recid,
-                .to = recid,
-                .state = try parseState(f[4]),
-                .pid_base = try parseU64(f[5]),
-                .len = try parseU64(f[6]),
-            });
-        } else if (std.mem.eql(u8, tag, "recidrange")) {
-            const f = try fields(line, 8);
-            const from = try parseU64(f[3]);
-            const to = try parseU64(f[4]);
-            if (from > to) {
-                std.debug.print("[xfixtures] empty recidrange: `{s}`\n", .{line});
-                return error.XFixturesManifest;
-            }
-            try m.recids.append(alloc, .{
-                .fixture = f[1],
-                .label = f[2],
-                .from = from,
-                .to = to,
-                .state = try parseState(f[5]),
-                .pid_base = try parseU64(f[6]),
-                .len = try parseU64(f[7]),
-            });
-        } else if (std.mem.eql(u8, tag, "edit")) {
-            _ = try fields(line, 6);
-            // recorded provenance of derived reject files; not needed to run cells
-        } else {
-            std.debug.print("[xfixtures] unknown manifest row tag `{s}`\n", .{tag});
-            return error.XFixturesManifest;
-        }
-    }
-    if (!saw_version) {
-        std.debug.print("[xfixtures] manifest has no data lines (missing `version 1`)\n", .{});
-        return error.XFixturesManifest;
-    }
-    return m;
-}
-
-// ---------------------------------------------------------- gunzip + hashing
-
-fn sha256Hex(data: []const u8) [64]u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
-    return std.fmt.bytesToHex(digest, .lower);
-}
-
-/// Decompress an embedded `.gz` (zig 0.15 API: `std.compress.flate.Decompress`
-/// over a fixed `std.Io.Reader`, container `.gzip`). Owned result.
-fn gunzipAlloc(alloc: Allocator, gz: []const u8, raw_len: u64) ![]u8 {
-    var in: std.Io.Reader = .fixed(gz);
-    const window = try alloc.alloc(u8, std.compress.flate.max_window_len);
-    defer alloc.free(window);
-    var dec = std.compress.flate.Decompress.init(&in, .gzip, window);
-    return dec.reader.allocRemaining(alloc, .limited64(raw_len + 1)) catch |e| {
-        std.debug.print("[xfixtures] gunzip failed: {s}\n", .{@errorName(e)});
-        return error.XFixturesGunzip;
-    };
-}
-
-/// Embedded raw content for a manifest file row: gz lookup by relName, gunzip,
-/// gzSha256 + rawSha256 + rawLen verification. Owned result.
-fn rawContentFor(alloc: Allocator, row: FileRow) ![]u8 {
+fn v1Baseline(ctx: *xfix.Ctx, row: xfix.FileRow) ![]u8 {
     const gz: []const u8 = for (embedded_gz) |e| {
-        if (std.mem.eql(u8, e.rel_name, row.rel_name)) break e.gz;
+        if (std.mem.eql(u8, e.rel_name, row.rel)) break e.gz;
     } else {
-        std.debug.print("[xfixtures] file `{s}` not in the embedded_gz list (sync it with MANIFEST.tsv)\n", .{row.rel_name});
-        return error.XFixturesManifest;
+        std.debug.print("[xfixtures] file `{s}` is not in the embedded_gz list\n", .{row.rel});
+        return error.XFixtures;
     };
-    const gz_sha = sha256Hex(gz);
-    if (!std.mem.eql(u8, &gz_sha, row.gz_sha)) {
-        std.debug.print("[xfixtures] {s}.gz sha256 mismatch: manifest {s}, embedded {s}\n", .{ row.rel_name, row.gz_sha, &gz_sha });
-        return error.XFixturesChecksum;
-    }
-    const raw = try gunzipAlloc(alloc, gz, row.raw_len);
-    errdefer alloc.free(raw);
-    if (raw.len != row.raw_len) {
-        std.debug.print("[xfixtures] {s} rawLen mismatch: manifest {d}, got {d}\n", .{ row.rel_name, row.raw_len, raw.len });
-        return error.XFixturesChecksum;
-    }
-    const raw_sha = sha256Hex(raw);
-    if (!std.mem.eql(u8, &raw_sha, row.raw_sha)) {
-        std.debug.print("[xfixtures] {s} rawSha256 mismatch: manifest {s}, got {s}\n", .{ row.rel_name, row.raw_sha, &raw_sha });
-        return error.XFixturesChecksum;
-    }
+    const gz_sha = xfix.sha256Hex(gz);
+    try testing.expectEqualStrings(row.gz_sha, &gz_sha);
+    const raw = try xfix.gunzip(ctx, gz, row.raw_len, row.rel);
+    errdefer ctx.alloc.free(raw);
+    try testing.expectEqual(row.raw_len, raw.len);
+    const raw_sha = xfix.sha256Hex(raw);
+    try testing.expectEqualStrings(row.raw_sha, &raw_sha);
     return raw;
 }
 
-const Baseline = struct {
-    fixture: []const u8,
-    rel_name: []const u8,
-    raw: []u8,
-};
+test "xfixtures v1: cross-port conformance cells (engine=zig)" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
 
-fn loadBaselines(alloc: Allocator, m: *const Manifest) !std.ArrayListUnmanaged(Baseline) {
-    // Preflight coupling (relaxed from Stage 1's exact one-to-one): every
-    // manifest file row MUST be embedded — `rawContentFor` below hard-fails on
-    // a missing one — while embedded entries the manifest does not reference
-    // are harmless surplus. The embed list is comptime-static but the manifest
-    // is sync-generated data, so tolerating surplus keeps this repo compiling
-    // (and its cells running) across sync generations where some fixtures are
-    // only placeholder .gz files not yet referenced by the local manifest.
-    // Ambiguity is still rejected: duplicate rel_names on either side.
-    for (embedded_gz, 0..) |embedded, i| {
-        for (embedded_gz[i + 1 ..]) |other| {
-            if (std.mem.eql(u8, embedded.rel_name, other.rel_name)) {
-                std.debug.print("[xfixtures] duplicate embedded file `{s}`\n", .{embedded.rel_name});
-                return error.XFixturesManifest;
-            }
-        }
-    }
-    for (m.files.items, 0..) |row, i| {
-        for (m.files.items[i + 1 ..]) |other| {
-            if (std.mem.eql(u8, row.rel_name, other.rel_name)) {
-                std.debug.print("[xfixtures] duplicate manifest file row relName `{s}`\n", .{row.rel_name});
-                return error.XFixturesManifest;
-            }
-        }
-    }
+    var loaded = try xfix.parse(&ctx, v1_manifest_tsv);
+    defer loaded.deinit(a);
+    try testing.expectEqual(@as(u32, 1), loaded.version());
+    const m = &loaded.v1;
 
-    var baselines: std.ArrayListUnmanaged(Baseline) = .empty;
-    errdefer {
-        for (baselines.items) |base| alloc.free(base.raw);
-        baselines.deinit(alloc);
-    }
-    for (m.files.items) |row| {
-        const raw = try rawContentFor(alloc, row);
-        baselines.append(alloc, .{
-            .fixture = row.fixture,
-            .rel_name = row.rel_name,
-            .raw = raw,
-        }) catch |e| {
-            alloc.free(raw);
-            return e;
-        };
-    }
-    return baselines;
-}
-
-fn baselineFor(baselines: []const Baseline, fixture: []const u8, rel_name: []const u8) ![]const u8 {
-    for (baselines) |base| {
-        if (std.mem.eql(u8, base.fixture, fixture) and std.mem.eql(u8, base.rel_name, rel_name))
-            return base.raw;
-    }
-    std.debug.print("[xfixtures] no verified baseline for fixture `{s}`, file `{s}`\n", .{ fixture, rel_name });
-    return error.XFixturesManifest;
-}
-
-// ------------------------------------------------------------------ cells
-
-/// Cell-scoped context prefix for assertion messages.
-fn cellFail(cell: ExpectRow, comptime fmt: []const u8, args: anytype) error{XFixturesCell} {
-    std.debug.print("[xfixtures] cell fixture={s} verdict={s} opener={s} placeAs={s}: ", .{ cell.fixture, cell.verdict, cell.opener, cell.place_as });
-    std.debug.print(fmt ++ "\n", args);
-    return error.XFixturesCell;
-}
-
-// `s: anytype` — the identical assertion block runs against *StoreDirect
-// (opener=direct) and *StoreWAL (opener=wal); both expose the same
-// get/verify/getAllRecids/close surface.
-fn checkRecid(alloc: Allocator, s: anytype, cell: ExpectRow, row: RecidRow, recid: u64) !void {
-    switch (row.state) {
-        .live => {
-            const pid = row.pid_base + (recid - row.from);
-            const want = try payloadAlloc(alloc, pid, @intCast(row.len));
-            defer alloc.free(want);
-            const got = (s.get([]const u8, alloc, recid, R) catch |e|
-                return cellFail(cell, "recid {d} ({s}): get failed: {s}", .{ recid, row.label, @errorName(e) })) orelse
-                return cellFail(cell, "recid {d} ({s}): expected {d} live bytes, got null", .{ recid, row.label, row.len });
-            defer alloc.free(got);
-            if (!std.mem.eql(u8, want, got))
-                return cellFail(cell, "recid {d} ({s}): content mismatch (len {d} vs {d})", .{ recid, row.label, got.len, want.len });
-        },
-        .null_rec, .prealloc => {
-            const got = s.get([]const u8, alloc, recid, R) catch |e|
-                return cellFail(cell, "recid {d} ({s}): get failed: {s}", .{ recid, row.label, @errorName(e) });
-            if (got) |g| {
-                alloc.free(g);
-                return cellFail(cell, "recid {d} ({s}): expected null content", .{ recid, row.label });
-            }
-        },
-        .deleted => {
-            if (s.get([]const u8, alloc, recid, R)) |got| {
-                if (got) |g| alloc.free(g);
-                return cellFail(cell, "recid {d} ({s}): expected error.GetVoid (deleted)", .{ recid, row.label });
-            } else |e| if (e != error.GetVoid)
-                return cellFail(cell, "recid {d} ({s}): expected error.GetVoid, got {s}", .{ recid, row.label, @errorName(e) });
-        },
-    }
-}
-
-/// SAME reader assertion block for every accept cell (direct and wal):
-/// verify(), per-recid assertions, EXACT getAllRecids set, close.
-fn assertAcceptedStore(alloc: Allocator, cell: ExpectRow, s: anytype, m: *const Manifest) !void {
-    // Both StoreDirect and StoreWAL expose verify() (StoreWAL delegates to
-    // its replayed inner StoreDirect), so wal cells do NOT skip it.
-    s.verify() catch |e| return cellFail(cell, "verify() failed: {s}", .{@errorName(e)});
-
-    // per-recid assertions + expected getAllRecids set (live + null rows)
-    var want_all: std.ArrayListUnmanaged(u64) = .empty;
-    defer want_all.deinit(alloc);
-    for (m.recids.items) |row| {
-        if (!std.mem.eql(u8, row.fixture, cell.fixture)) continue;
-        var recid = row.from;
-        while (recid <= row.to) : (recid += 1) {
-            try checkRecid(alloc, s, cell, row, recid);
-            if (row.state == .live or row.state == .null_rec) try want_all.append(alloc, recid);
-        }
-    }
-    std.mem.sort(u64, want_all.items, {}, std.sort.asc(u64));
-    const all = s.getAllRecids(alloc) catch |e|
-        return cellFail(cell, "getAllRecids failed: {s}", .{@errorName(e)});
-    defer alloc.free(all);
-    if (!std.mem.eql(u64, want_all.items, all))
-        return cellFail(cell, "getAllRecids set mismatch: got {d} recids, want {d}", .{ all.len, want_all.items.len });
-
-    s.close() catch |e| return cellFail(cell, "close failed: {s}", .{@errorName(e)});
-}
-
-fn runAcceptDirect(alloc: Allocator, cell: ExpectRow, db_path: []const u8, m: *const Manifest) !void {
-    var s = StoreDirect.openFile(alloc, db_path, true) catch |e|
-        return cellFail(cell, "open failed: {s}", .{@errorName(e)});
-    defer s.deinit();
-    try assertAcceptedStore(alloc, cell, &s, m);
-}
-
-/// Stage-2 ("accept","wal") arm: StoreWAL.open takes the literal WAL file
-/// path (openArg), replays the log, then the SAME reader assertion block as
-/// direct-accept cells runs. `checkCellDir` afterwards enforces byte-identity
-/// and "no new files" — in particular a `.ckpt` companion must NOT exist
-/// after a clean close (its appearance is a cell failure, not a sidecar).
-fn runAcceptWal(alloc: Allocator, cell: ExpectRow, wal_path: []const u8, m: *const Manifest) !void {
-    var s = StoreWAL.open(alloc, wal_path, true) catch |e|
-        return cellFail(cell, "open failed: {s}", .{@errorName(e)});
-    defer s.deinit();
-    try assertAcceptedStore(alloc, cell, &s, m);
-}
-
-fn runReject(alloc: Allocator, cell: ExpectRow, path: []const u8) !void {
-    if (std.mem.eql(u8, cell.opener, "direct")) {
-        if (StoreDirect.openFile(alloc, path, true)) |*opened| {
-            var s = opened.*;
-            s.deinit();
-            return cellFail(cell, "StoreDirect open unexpectedly succeeded", .{});
-        } else |e| if (e != error.DataCorruption)
-            return cellFail(cell, "expected error.DataCorruption, got {s}", .{@errorName(e)});
-    } else if (std.mem.eql(u8, cell.opener, "wal")) {
-        if (StoreWAL.open(alloc, path, true)) |*opened| {
-            var s = opened.*;
-            s.deinit();
-            return cellFail(cell, "StoreWAL open unexpectedly succeeded", .{});
-        } else |e| if (e != error.DataCorruption)
-            return cellFail(cell, "expected error.DataCorruption, got {s}", .{@errorName(e)});
-    } else {
-        return cellFail(cell, "unknown opener", .{});
-    }
-}
-
-/// Post-cell invariants: working copy byte-identical to the pristine raw, and
-/// no files beyond `.lock` sidecars appeared in the cell dir. `.ckpt` is
-/// deliberately NOT on the allowed list: a clean StoreWAL close must leave no
-/// checkpoint temp behind, so its appearance fails the cell.
-fn checkCellDir(alloc: Allocator, cell_dir: std.fs.Dir, cell: ExpectRow, pristine: []const u8) !void {
-    const after = cell_dir.readFileAlloc(alloc, cell.place_as, 256 * 1024 * 1024) catch |e|
-        return cellFail(cell, "working copy unreadable after cell: {s}", .{@errorName(e)});
-    defer alloc.free(after);
-    if (!std.mem.eql(u8, pristine, after))
-        return cellFail(cell, "working copy bytes changed (len {d} -> {d})", .{ pristine.len, after.len });
-    var it = cell_dir.iterate();
-    while (it.next() catch |e| return cellFail(cell, "cell dir iteration failed: {s}", .{@errorName(e)})) |entry| {
-        if (std.mem.eql(u8, entry.name, cell.place_as)) continue;
-        if (std.mem.endsWith(u8, entry.name, ".lock")) continue; // allowed sidecar
-        return cellFail(cell, "unexpected new file `{s}` in cell dir", .{entry.name});
-    }
-}
-
-// ------------------------------------------------------------------- tests
-
-test "xfixtures: cross-port conformance (engine=zig)" {
-    const alloc = testing.allocator;
-    var m = try parseManifest(alloc);
-    defer m.deinit(alloc);
-
-    // Verify the complete embedded bundle before opening any cell. A damaged
-    // fixture must fail the preflight even when its expect row appears late.
-    var baselines = try loadBaselines(alloc, &m);
+    // gunzip every fixture file ONCE, verifying gz sha, raw length and raw sha
+    // before any cell runs: a damaged fixture must fail the preflight even when
+    // its expect row appears late.
+    var baselines: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
-        for (baselines.items) |base| alloc.free(base.raw);
-        baselines.deinit(alloc);
+        for (baselines.items) |b| a.free(b);
+        baselines.deinit(a);
     }
+    for (m.files.items) |f| try baselines.append(a, try v1Baseline(&ctx, f));
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The `wal-v1-*` accept cells RETIRE at this engine's WAL v3 cutover: the
-    // port refuses format v1 outright (there is no migration, by design), and
-    // its opener no longer takes a WAL FILE path at all, so the cell cannot
-    // even be expressed. D6 retires these IDs family-wide at Stage C, when the
-    // manifest gains the `wal3-namespace` bundle kind and the java generator
-    // stops emitting v1 rows; until then the rows stay in the shared manifest
-    // for the engines that still speak v1, and this engine skips them.
-    //
-    // The list is EXACT and asserted below: a new accept row addressed to zig
-    // must not be silently dropped by a prefix match, and a retired cell
-    // vanishing from the manifest means Stage C has begun and this skip list
-    // must go with it.
-    const retired_v1_accepts = [4][]const u8{
-        "wal-v1-rust-tail",
-        "wal-v1-rust-ckpt",
-        "wal-v1-zig-tail",
-        "wal-v1-zig-ckpt",
-    };
-    var retired_seen = [4]bool{ false, false, false, false };
+    var retired_seen = [_]bool{false} ** retired_v1_accepts.len;
+    var ran: usize = 0;
 
-    var cells_run: usize = 0;
-    for (m.expects.items, 0..) |cell, idx| {
-        if (!std.mem.eql(u8, cell.engine, ENGINE)) continue;
-        if (std.mem.eql(u8, cell.verdict, "accept") and std.mem.eql(u8, cell.opener, "wal")) {
+    for (m.expects.items, 0..) |e, idx| {
+        if (!std.mem.eql(u8, e.engine, ENGINE)) continue;
+        if (std.mem.eql(u8, e.verdict, "accept") and std.mem.eql(u8, e.opener, "wal")) {
             const at = for (retired_v1_accepts, 0..) |r, i| {
-                if (std.mem.eql(u8, cell.fixture, r)) break i;
-            } else return cellFail(cell, "accept-wal fixture is not one of the four v1 cells " ++
-                "retired at the v3 cutover — a new WAL accept row needs a v3 (base-path) cell, not a skip", .{});
+                if (std.mem.eql(u8, e.fixture, r)) break i;
+            } else {
+                std.debug.print(
+                    "[xfixtures] accept-wal fixture {s} is not one of the four v1 cells retired at " ++
+                        "the v3 cutover — a new WAL accept row needs a v3 (base-path) cell, not a skip\n",
+                    .{e.fixture},
+                );
+                return error.XFixtures;
+            };
             retired_seen[at] = true;
             continue;
         }
-        const file_row = try m.fileFor(cell.fixture);
-        const pristine = try baselineFor(baselines.items, cell.fixture, file_row.rel_name);
+        ran += 1;
 
-        // fresh per-cell dir with the fixture file placed as `placeAs`
+        // a v1 fixture has exactly one file row
+        var file: ?xfix.FileRow = null;
+        var pristine: []const u8 = undefined;
+        for (m.files.items, 0..) |f, i| {
+            if (!std.mem.eql(u8, f.fixture, e.fixture)) continue;
+            try testing.expect(file == null);
+            file = f;
+            pristine = baselines.items[i];
+        }
+        try testing.expect(file != null);
+
         var name_buf: [64]u8 = undefined;
-        const cell_name = try std.fmt.bufPrint(&name_buf, "cell{d}", .{idx});
+        const cell_name = try std.fmt.bufPrint(&name_buf, "v1-{d}", .{idx});
         var cell_dir = try tmp.dir.makeOpenPath(cell_name, .{ .iterate = true });
         defer cell_dir.close();
-        try cell_dir.writeFile(.{ .sub_path = cell.place_as, .data = pristine });
+        try cell_dir.writeFile(.{ .sub_path = e.place_as, .data = pristine });
 
-        // absolute paths — store openers resolve relative to cwd
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const cell_abs = try cell_dir.realpath(".", &path_buf);
-        const open_path = try std.fs.path.join(alloc, &.{ cell_abs, cell.open_arg });
-        defer alloc.free(open_path);
+        const target = try std.fs.path.join(a, &.{ cell_abs, e.open_arg });
+        defer a.free(target);
 
-        if (std.mem.eql(u8, cell.verdict, "accept")) {
-            if (std.mem.eql(u8, cell.opener, "direct")) {
-                try runAcceptDirect(alloc, cell, open_path, &m);
-            } else if (std.mem.eql(u8, cell.opener, "wal")) {
-                try runAcceptWal(alloc, cell, open_path, &m);
-            } else {
-                return cellFail(cell, "unknown accept opener `{s}`", .{cell.opener});
-            }
-        } else if (std.mem.eql(u8, cell.verdict, "reject")) {
-            try runReject(alloc, cell, open_path);
+        var cell_buf: [192]u8 = undefined;
+        const cell = try std.fmt.bufPrint(&cell_buf, "v1 cell {d}: fixture={s} verdict={s} opener={s} placeAs={s}", .{
+            idx, e.fixture, e.verdict, e.opener, e.place_as,
+        });
+
+        if (std.mem.eql(u8, e.verdict, "accept")) {
+            try testing.expectEqualStrings("direct", e.opener);
+            var s = StoreDirect.openFile(a, target, true) catch |err| {
+                std.debug.print("[xfixtures] {s}: open failed: {s}\n", .{ cell, @errorName(err) });
+                return error.XFixtures;
+            };
+            defer s.deinit();
+            try xfix.assertReaderContract(&ctx, &s, m.recids.items, e.fixture, cell);
+            try s.close();
         } else {
-            return cellFail(cell, "unknown verdict", .{});
+            // The v3 opener takes a BASE path. Every v1 reject row's openArg
+            // names a regular file the cell placed there, so each now refuses
+            // through D1's bare-base row rather than through a v1 header check —
+            // the same verdict for the same image, which is what the cell asserts.
+            if (std.mem.eql(u8, e.opener, "direct")) {
+                if (StoreDirect.openFile(a, target, true)) |*opened| {
+                    var s = opened.*;
+                    s.deinit();
+                    std.debug.print("[xfixtures] {s}: open unexpectedly succeeded\n", .{cell});
+                    return error.XFixtures;
+                } else |err| try testing.expectEqual(error.DataCorruption, err);
+            } else {
+                if (StoreWAL.open(a, target, true)) |*opened| {
+                    var s = opened.*;
+                    s.deinit();
+                    std.debug.print("[xfixtures] {s}: open unexpectedly succeeded\n", .{cell});
+                    return error.XFixtures;
+                } else |err| try testing.expectEqual(error.DataCorruption, err);
+            }
         }
-        try checkCellDir(alloc, cell_dir, cell, pristine);
-        cells_run += 1;
+
+        // working copy byte-identical, and no files beyond `.lock` sidecars.
+        // `.ckpt` is deliberately NOT on the allowed list: a clean StoreWAL close
+        // must leave no checkpoint temp behind.
+        const after = try cell_dir.readFileAlloc(a, e.place_as, 256 * 1024 * 1024);
+        defer a.free(after);
+        try testing.expectEqualSlices(u8, pristine, after);
+        var it = cell_dir.iterate();
+        while (try it.next()) |entry| {
+            if (std.mem.eql(u8, entry.name, e.place_as)) continue;
+            if (std.mem.endsWith(u8, entry.name, ".lock")) continue;
+            std.debug.print("[xfixtures] {s}: unexpected new file `{s}`\n", .{ cell, entry.name });
+            return error.XFixtures;
+        }
     }
-    // The manifest must drive at least one zig cell — an empty run means the
-    // sync step produced a manifest this engine silently ignores.
-    try testing.expect(cells_run > 0);
-    // Every retired v1 accept cell must still be present in the shared
-    // manifest: one gone means Stage C has begun and the skip list above must
-    // go with it.
+
+    // The manifest must drive at least one zig cell — an empty run means the sync
+    // step produced a manifest this engine silently ignores.
+    try testing.expect(ran > 0);
     for (retired_seen) |seen| try testing.expect(seen);
+}
+
+// ---------------------------------------------------------------------------
+// schema v2 — the shared static sample
+// ---------------------------------------------------------------------------
+
+const v2_manifest_tsv: []const u8 = @embedFile("data-v2/MANIFEST.tsv");
+const golden_decode_tsv: []const u8 = @embedFile("data-v2/GOLDEN-DECODE.tsv");
+const golden_body_tsv: []const u8 = @embedFile("data-v2/GOLDEN-BODY.tsv");
+
+fn loadSample(ctx: *xfix.Ctx) !xfix.SampleV2 {
+    return xfix.loadSampleV2(ctx, v2_manifest_tsv, &embedded_v2.blobs);
+}
+
+test "xfixtures v2: the sample's rw and ro cells pass" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    var sample = try loadSample(&ctx);
+    defer sample.deinit(a);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Both modes run here. Deleting either engine's `expect` row for a declared
+    // fixture fails the set check inside `runV2Cells`, because that set comes
+    // from the `fixture` rows and not from the rows about to be executed.
+    for (xfix.MODES) |mode| try xfix.runV2Cells(&ctx, &sample, mode, tmp.dir);
+}
+
+// FRAMING, against the python-authored pin.
+//
+// This is the comparison `GOLDEN.tsv` cannot make: a raw sha attests which
+// bytes were read and says nothing about the parse. It is also the only check
+// in the slice that reaches the section COUNT — both section CRCs bind a
+// section's own bytes to its own offset, so a reader that stopped one section
+// early would still validate every section it did read, and would still open
+// through the engine.
+test "xfixtures v2: framing matches GOLDEN-DECODE.tsv" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    var sample = try loadSample(&ctx);
+    defer sample.deinit(a);
+
+    var got: xfix.Strings = .{};
+    defer got.deinit(a);
+    try xfix.renderFraming(&ctx, &sample, &got);
+
+    var want = try xfix.goldenRows(a, golden_decode_tsv);
+    defer want.deinit(a);
+    try xfix.assertRowsEqual(&ctx, "GOLDEN-DECODE.tsv", want.items, got.slice());
+
+    var saw_hdr = false;
+    var saw_sec = false;
+    for (want.items) |r| {
+        if (std.mem.startsWith(u8, r, "hdr\t")) saw_hdr = true;
+        if (std.mem.startsWith(u8, r, "sec\t")) saw_sec = true;
+    }
+    try testing.expect(saw_hdr and saw_sec);
+}
+
+// DECODED BODIES, against the file the FROZEN JAVA READER authored.
+//
+// Contract §11.2 settles body semantics engine-against-engine rather than in a
+// python pin, because `walfmt.py` is a structural codec and store record
+// semantics written there would be a fifth implementation nobody reviews. Java
+// is authoritative by construction: it wrote this file.
+test "xfixtures v2: decoded bodies match GOLDEN-BODY.tsv" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    var sample = try loadSample(&ctx);
+    defer sample.deinit(a);
+
+    var got: xfix.Strings = .{};
+    defer got.deinit(a);
+    try xfix.renderBody(&ctx, &sample, &got);
+
+    var want = try xfix.goldenRows(a, golden_body_tsv);
+    defer want.deinit(a);
+    try xfix.assertRowsEqual(&ctx, "GOLDEN-BODY.tsv", want.items, got.slice());
+
+    // The file's own provenance block, which the row comparison drops. Without
+    // this the header could be rewritten to claim a different author while every
+    // test stayed green — and the authority claim is the reason this port is
+    // graded against this file at all.
+    var header = try xfix.goldenHeader(a, golden_body_tsv);
+    defer header.deinit(a);
+    try testing.expectEqual(xfix.GOLDEN_BODY_HEADER.len, header.items.len);
+    for (xfix.GOLDEN_BODY_HEADER, header.items) |w, g| try testing.expectEqualStrings(w, g);
+
+    // The distinction the whole file exists for must actually be IN it, or the
+    // comparison above is a comparison of two files that never disagree about the
+    // interesting case. `lenPlus == 0` is NULL content, `lenPlus == 1` is
+    // zero-length content, and they differ in BOTH the lenPlus and the sha column
+    // so no single-column bug can hide one as the other.
+    var saw_null = false;
+    var saw_empty = false;
+    var saw_mark = false;
+    var empty_suffix_buf: [80]u8 = undefined;
+    const empty_suffix = try std.fmt.bufPrint(&empty_suffix_buf, "\t1\t{s}", .{xfix.EMPTY_SHA});
+    for (want.items) |r| {
+        if (std.mem.indexOf(u8, r, "\tRECORD\t12\t0\t0\t-") != null) saw_null = true;
+        if (std.mem.endsWith(u8, r, empty_suffix)) saw_empty = true;
+        if (std.mem.startsWith(u8, r, "mark\t")) saw_mark = true;
+    }
+    try testing.expect(saw_null);
+    try testing.expect(saw_empty);
+    try testing.expect(saw_mark);
+}
+
+// ---------------------------------------------------------------------------
+// C-D4 — the generated embed table
+// ---------------------------------------------------------------------------
+
+test "xfixtures v2: the embed table, the manifest and the distributed blobs agree" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    var sample = try loadSample(&ctx);
+    defer sample.deinit(a);
+
+    var from_manifest: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer from_manifest.deinit(a);
+    for (sample.files.items) |f| try from_manifest.append(a, f.blob);
+
+    var from_table: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer from_table.deinit(a);
+    for (embedded_v2.blobs) |b| try from_table.append(a, b.name);
+
+    try xfix.checkBlobSets(&ctx, from_manifest.items, from_table.items, &distributed.gz);
+}
+
+// The validator itself must be able to fail — C-D4 asks for exactly this.
+//
+// One-way coverage is tautological when the table and the manifest come off the
+// same list, so the invariant is set equality; and a set-equality check that
+// nobody has ever seen reject anything is a set-equality check nobody has
+// measured. These triples delete, duplicate and add an entry.
+test "xfixtures v2: the three-way blob check rejects every way the sets can differ" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+
+    const full = [_][]const u8{ "a.gz", "b.gz", "c.gz" };
+    const short = [_][]const u8{ "a.gz", "b.gz" };
+    const dup = [_][]const u8{ "a.gz", "b.gz", "b.gz" };
+    const extra = [_][]const u8{ "a.gz", "b.gz", "c.gz", "d.gz" };
+    const unsafe = [_][]const u8{ "a.gz", "b.gz", "../c.gz" };
+    const empty = [_][]const u8{};
+
+    try xfix.checkBlobSets(&ctx, &full, &full, &full);
+
+    const cases = [_]struct {
+        what: []const u8,
+        m: []const []const u8,
+        t: []const []const u8,
+        d: []const []const u8,
+    }{
+        .{ .what = "an entry missing from the generated table", .m = &full, .t = &short, .d = &full },
+        .{ .what = "an entry missing from the manifest", .m = &short, .t = &full, .d = &full },
+        .{ .what = "a blob distributed that nothing embeds", .m = &full, .t = &full, .d = &extra },
+        .{ .what = "a blob embedded that is not distributed", .m = &extra, .t = &extra, .d = &full },
+        .{ .what = "a duplicated table entry", .m = &short, .t = &dup, .d = &short },
+        .{ .what = "an unsafe name on disk", .m = &full, .t = &full, .d = &unsafe },
+        .{ .what = "an empty distributed set", .m = &full, .t = &full, .d = &empty },
+        .{ .what = "an empty manifest set", .m = &empty, .t = &full, .d = &full },
+    };
+    for (cases) |c| {
+        try xfix.expectRefused(&ctx, c.what, xfix.checkBlobSets, .{ &ctx, c.m, c.t, c.d });
+    }
+}
+
+// Nothing in the distributed v2 root may be unexplained.
+//
+// The three tables plus one blob per `file` row, and nothing else. A stray
+// `.gz` that no manifest row names is either a fixture the suite silently never
+// runs or a leftover from a half-finished sync; both are the kind of thing only
+// ever noticed by a check that enumerates. `build.zig` supplies the enumeration
+// because `@embedFile` cannot walk a directory.
+test "xfixtures v2: the distributed root has nothing unexplained" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    var sample = try loadSample(&ctx);
+    defer sample.deinit(a);
+
+    var want: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer want.deinit(a);
+    try want.appendSlice(a, &.{ "MANIFEST.tsv", "GOLDEN-DECODE.tsv", "GOLDEN-BODY.tsv" });
+    for (sample.files.items) |f| try want.append(a, f.blob);
+
+    for (distributed.all) |name| {
+        var known = false;
+        for (want.items) |w| {
+            if (std.mem.eql(u8, w, name)) known = true;
+        }
+        if (!known) {
+            std.debug.print("[xfixtures] data-v2/{s} is explained by no manifest row\n", .{name});
+            return error.XFixtures;
+        }
+    }
+    for (want.items) |w| {
+        var present = false;
+        for (distributed.all) |name| {
+            if (std.mem.eql(u8, w, name)) present = true;
+        }
+        if (!present) {
+            std.debug.print("[xfixtures] data-v2/{s} is named but not distributed\n", .{w});
+            return error.XFixtures;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the dispatch itself
+// ---------------------------------------------------------------------------
+
+fn parseOk(ctx: *xfix.Ctx, text: []const u8) !void {
+    var loaded = try xfix.parse(ctx, text);
+    loaded.deinit(ctx.alloc);
+}
+
+fn refuse(ctx: *xfix.Ctx, what: []const u8, text: []const u8) !void {
+    try xfix.expectRefused(ctx, what, parseOk, .{ ctx, text });
+}
+
+// The version line is a HARD dispatch, and the reason is the arity collision.
+//
+// `expect <fid> <engine> <verdict> <opener> <placeAs> <openArg>` (v1) and
+// `expect <fid> <engine> <mode> <verdict> <opener> <openArg>` (v2) are both
+// seven fields. Guessing the schema from a row's shape would read `accept` as a
+// mode and `wal3` as a verdict without a single arity check firing, so the
+// version line decides and an unknown version is refused rather than assumed to
+// be the newest.
+test "xfixtures: the two schemas are told apart by their version line only" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+
+    const v1 = "version\t1\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1\taa\tbb\n" ++
+        "expect\tf\tzig\taccept\tdirect\tx.db\tx.db\n";
+    const v2 = "version\t2\nfixture\tf\twal3-namespace\tjava\tc\nfile\tf\tx\t1\taa\tbb\n" ++
+        "expect\tf\tzig\tro\taccept\twal3\tx\n";
+
+    var l1 = try xfix.parse(&ctx, v1);
+    defer l1.deinit(a);
+    try testing.expectEqual(@as(u32, 1), l1.version());
+    var l2 = try xfix.parse(&ctx, v2);
+    defer l2.deinit(a);
+    try testing.expectEqual(@as(u32, 2), l2.version());
+
+    // The v1 rows, read as v2, are not merely different — the third column is a
+    // verdict where v2 wants a mode, so the vocabulary check catches it. That is
+    // the collision made visible rather than assumed away.
+    const v1_as_v2 = "version\t2\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1\taa\tbb\n" ++
+        "expect\tf\tzig\taccept\tdirect\tx.db\tx.db\n";
+    try refuse(&ctx, "v1 expect rows under a v2 version line", v1_as_v2);
+    try refuse(&ctx, "an unknown schema version", "version\t3\n");
+    try refuse(&ctx, "a manifest with no version line", "fixture\tf\tdirect\tjava\tc\n");
+    try refuse(&ctx, "a version line with a trailing field", "version\t2\tx\n");
+}
+
+const V2_HEAD = "version\t2\nfixture\tf\twal3-namespace\tjava\tc\n";
+const V2_FILE = "file\tf\tx.wal.0000000000000001\t36\taa\tbb\n";
+
+// Rows the reader must refuse rather than skip.
+//
+// A reader that ignores what it does not recognise turns every future schema
+// addition into a silent no-op: the row is in the manifest, the suite is green,
+// and nothing ran.
+test "xfixtures: unrecognised and malformed rows are refused" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+
+    try refuse(&ctx, "an unknown row type", V2_HEAD ++ V2_FILE ++ "sparkle\tf\tx\n");
+    try refuse(&ctx, "a short file row", V2_HEAD ++ "file\tf\tx\t36\taa\n");
+    try refuse(&ctx, "a file row with an empty field", V2_HEAD ++ "file\tf\tx\t36\t\tbb\n");
+    try refuse(&ctx, "a non-canonical integer", V2_HEAD ++ "file\tf\tx\t036\taa\tbb\n");
+    try refuse(&ctx, "a relName that escapes the cell directory", V2_HEAD ++ "file\tf\t../x\t36\taa\tbb\n");
+    try refuse(&ctx, "an unknown engine", V2_HEAD ++ V2_FILE ++ "expect\tf\tgo\tro\taccept\twal3\tx\n");
+    try refuse(&ctx, "an unknown mode", V2_HEAD ++ V2_FILE ++ "expect\tf\tzig\trwx\taccept\twal3\tx\n");
+    try refuse(&ctx, "an unknown verdict on a java row", V2_HEAD ++ V2_FILE ++ "expect\tf\tjava\tro\tmaybe\twal3\tx\n");
+    try refuse(&ctx, "a duplicate expect row", V2_HEAD ++ V2_FILE ++
+        "expect\tf\tzig\tro\taccept\twal3\tx\nexpect\tf\tzig\tro\taccept\twal3\tx\n");
+    try refuse(&ctx, "a duplicate post row", V2_HEAD ++ V2_FILE ++
+        "post\tf\tzig\tro\tx.lock\tunchanged\npost\tf\tzig\tro\tx.lock\tdeleted\n");
+    try refuse(&ctx, "an unknown post disposition", V2_HEAD ++ V2_FILE ++ "post\tf\tzig\tro\tx.lock\tvanished\n");
+    try refuse(&ctx, "a sized post disposition missing its sha", V2_HEAD ++ V2_FILE ++ "post\tf\tzig\tro\tx.lock\tcreated:0\n");
+    try refuse(&ctx, "a duplicate recid within one fixture", V2_HEAD ++ V2_FILE ++
+        "recid\tf\ta\t1\tlive\t1\t1\nrecid\tf\tb\t1\tlive\t1\t1\n");
+    try refuse(&ctx, "an unbounded recidrange", V2_HEAD ++ V2_FILE ++ "recidrange\tf\tr\t1\t99999999\tlive\t1\t1\n");
+    try refuse(&ctx, "a v2 manifest with no file rows", V2_HEAD);
+
+    // Vocabularies contract §2 makes load-bearing. The C3r review found kind,
+    // generatorEngine and opener stored unchecked — and `opener` in particular was
+    // only ever validated by the cell executor, AFTER it had filtered to its own
+    // engine's rows, so a bad opener on another engine's row reached nothing. The
+    // cases below are therefore addressed to OTHER engines on purpose: executor
+    // filtering must not be able to masquerade as parser validation.
+    try refuse(&ctx, "an unknown opener on a java row", V2_HEAD ++ V2_FILE ++ "expect\tf\tjava\tro\taccept\twal9\tx\n");
+    try refuse(&ctx, "an unknown opener on a rust row", V2_HEAD ++ V2_FILE ++ "expect\tf\trust\trw\taccept\tdirekt\tx\n");
+    try refuse(&ctx, "an unknown fixture kind", "version\t2\nfixture\tf\twal3-namespaces\tjava\tc\n" ++ V2_FILE);
+    try refuse(&ctx, "an unknown generatorEngine", "version\t2\nfixture\tf\twal3-namespace\tgo\tc\n" ++ V2_FILE);
+
+    // `port-wal` and `java-wal-namespace` are RETAINED tokens: no v2 fixture uses
+    // them, and §2 says retiring a family is not a reason for a version-dispatch
+    // parser to reject the token. So they must still parse.
+    inline for (.{ "direct", "reject", "wal3-namespace", "port-wal", "java-wal-namespace" }) |kind| {
+        try parseOk(&ctx, "version\t2\nfixture\tf\t" ++ kind ++ "\tjava\tc\n" ++ V2_FILE);
+    }
+
+    // §2 amendment 3: `generatorEngine = derived` and a `derived` row imply each
+    // other, exactly once.
+    try refuse(&ctx, "a derived fixture with no derived row", "version\t2\nfixture\tf\treject\tderived\tc\n" ++ V2_FILE);
+    try refuse(&ctx, "a derived row on a fixture an engine wrote", V2_HEAD ++ V2_FILE ++ "derived\tf\tsrc\t1\trecipe\n");
+}
+
+// A fixture id a row REFERS to must be DECLARED, and vice versa.
+//
+// Without this the exact-cell-set rule has a coordinated escape: delete a
+// `fixture` row together with this engine's `expect` rows for it, and the
+// executor sees a consistently smaller world — the expected set shrinks by
+// exactly the cell that stopped running. The `file` and `recid` rows stay
+// behind, the golden comparisons still decode them, and the resource inventory
+// is unchanged. Found by the C3r review.
+test "xfixtures: every referenced fixture must be declared and every declared one used" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+
+    try parseOk(&ctx, V2_HEAD ++ V2_FILE);
+    try refuse(&ctx, "a file row naming a fixture with no fixture row", V2_HEAD ++ V2_FILE ++ "file\tg\tx.wal.0000000000000002\t36\tcc\tdd\n");
+    try refuse(&ctx, "an expect row naming a fixture with no fixture row", V2_HEAD ++ V2_FILE ++ "expect\tg\tzig\tro\taccept\twal3\tx\n");
+    try refuse(&ctx, "a post row naming a fixture with no fixture row", V2_HEAD ++ V2_FILE ++ "post\tg\tzig\tro\tx.lock\tunchanged\n");
+    try refuse(&ctx, "a recid row naming a fixture with no fixture row", V2_HEAD ++ V2_FILE ++ "recid\tg\tr1\t1\tlive\t1\t8\n");
+    try refuse(&ctx, "a declared fixture no row refers to", V2_HEAD ++ V2_FILE ++ "fixture\tg\twal3-namespace\tjava\tc\n");
+
+    // The same rule guards the v1 tree, where the live manifest satisfies it.
+    const v1 = "version\t1\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1\taa\tbb\n";
+    try parseOk(&ctx, v1);
+    try refuse(&ctx, "a v1 recid row naming a fixture with no fixture row", v1 ++ "recid\tg\tr1\t1\tlive\t1\t8\n");
+}
+
+// The v1 grammar's own vocabularies, which are NOT the v2 ones.
+//
+// v1's opener set is `{direct, wal}` where v2's is `{direct, wal3}`, and v1's
+// kind set is v2's minus `wal3-namespace`. Sharing one reader across two
+// grammars makes it easy to validate against the wrong set — or against no set
+// at all — and the live v1 tree cannot notice, because every value in it is
+// correct.
+test "xfixtures: the v1 grammar has its own vocabularies" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+
+    const head = "version\t1\nfixture\tf\tport-wal\tjava\tc\n";
+    const file = "file\tf\tx.wal\t1\taa\tbb\n";
+    inline for (.{ "direct", "wal" }) |opener| {
+        try parseOk(&ctx, head ++ file ++ "expect\tf\tzig\taccept\t" ++ opener ++ "\tx.wal\tx.wal\n");
+    }
+    // `wal3` is the V2 opener token and must NOT be accepted under v1.
+    try refuse(&ctx, "the v2 opener token on a v1 row", head ++ file ++ "expect\tf\tzig\taccept\twal3\tx.wal\tx.wal\n");
+    try refuse(&ctx, "an unknown v1 opener on a java row", head ++ file ++ "expect\tf\tjava\taccept\twalrus\tx.wal\tx.wal\n");
+    try refuse(&ctx, "an unknown v1 verdict", head ++ file ++ "expect\tf\tzig\tmaybe\tdirect\tx.wal\tx.wal\n");
+    // `wal3-namespace` is the kind v2 ADDED; a v1 manifest must not carry it.
+    try refuse(&ctx, "the v2-only fixture kind on a v1 row", "version\t1\nfixture\tf\twal3-namespace\tjava\tc\nfile\tf\tx\t1\taa\tbb\n");
+    try refuse(&ctx, "an unknown v1 generatorEngine", "version\t1\nfixture\tf\tdirect\tgo\tc\nfile\tf\tx\t1\taa\tbb\n");
+}
+
+// A `bytes` row is refused BY NAME, not skipped.
+//
+// `bytes` describes a derived fixture built by `walfmt.py` from another
+// fixture's image, and C4 is the slice that introduces both the deriver and the
+// fixtures. Until then the honest thing for a reader to do is stop: a `bytes`
+// row silently ignored is a fixture the manifest says exists and that nothing
+// ever opens.
+test "xfixtures: a bytes row is refused until C4 can execute it" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    // The row must be GRAMMATICALLY VALID, or the test proves only that a
+    // malformed row is refused — which the arity and vocabulary rules already do,
+    // and which is not what the name claims.
+    try refuse(&ctx, "a v2 `bytes` row", V2_HEAD ++ V2_FILE ++
+        "bytes\tf\tzig\tro\tx.wal.0000000000000001\t0\taa\n");
+}
+
+// ---------------------------------------------------------------------------
+// the D6 post-state rule, exercised directly
+// ---------------------------------------------------------------------------
+
+const PostCase = struct {
+    what: []const u8,
+    inputs: []const xfix.InputFile,
+    after: []const xfix.InputFile,
+    posts: []const []const u8,
+    ok: bool,
+    make_dir: bool = false,
+};
+
+// Both sides of the post-state rule, on inputs the sample cannot supply.
+//
+// The sample's `rw` and `ro` cells leave every segment untouched and create one
+// `x.lock`, so the corpus is CONSTANT in everything the rule's second side
+// checks: removing "an unnamed input must still be there byte for byte" and "a
+// file that is neither an input nor named must not exist" leaves the whole
+// suite green. That is lesson (g) again, and the answer is the same: an input
+// built to vary. These directories are built by hand.
+test "xfixtures: the post-state rule fails in both directions" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const abc = [_]xfix.InputFile{.{ .rel = "seg", .bytes = "abc" }};
+    const abd = [_]xfix.InputFile{.{ .rel = "seg", .bytes = "abd" }};
+    const q = [_]xfix.InputFile{.{ .rel = "seg", .bytes = "q" }};
+    const abc_lock = [_]xfix.InputFile{ .{ .rel = "seg", .bytes = "abc" }, .{ .rel = "x.lock", .bytes = "" } };
+    const abc_lockz = [_]xfix.InputFile{ .{ .rel = "seg", .bytes = "abc" }, .{ .rel = "x.lock", .bytes = "z" } };
+    const abc_new = [_]xfix.InputFile{ .{ .rel = "seg", .bytes = "abc" }, .{ .rel = "new", .bytes = "q" } };
+    const surprise = [_]xfix.InputFile{ .{ .rel = "seg", .bytes = "abc" }, .{ .rel = "surprise", .bytes = "x" } };
+    const none = [_]xfix.InputFile{};
+
+    // `E` is the empty-string sha and `S` the sha of "q"; expanded below so the
+    // rows stay readable.
+    const cases = [_]PostCase{
+        .{ .what = "an untouched input named by nothing", .inputs = &abc, .after = &abc, .posts = &.{}, .ok = true },
+        .{ .what = "an unnamed input rewritten behind the rule's back", .inputs = &abc, .after = &abd, .posts = &.{}, .ok = false },
+        .{ .what = "an unnamed input deleted behind the rule's back", .inputs = &abc, .after = &none, .posts = &.{}, .ok = false },
+        .{ .what = "a file that is neither an input nor named", .inputs = &abc, .after = &surprise, .posts = &.{}, .ok = false },
+        .{ .what = "a lock file the post rows do declare", .inputs = &abc, .after = &abc_lock, .posts = &.{"x.lock\tcreated:0:E"}, .ok = true },
+        .{ .what = "a `created` file whose sha does not match", .inputs = &abc, .after = &abc_lockz, .posts = &.{"x.lock\tcreated:0:E"}, .ok = false },
+        .{ .what = "a `deleted` file that is still there", .inputs = &abc, .after = &abc, .posts = &.{"seg\tdeleted"}, .ok = false },
+        .{ .what = "a `deleted` file that really is gone", .inputs = &abc, .after = &none, .posts = &.{"seg\tdeleted"}, .ok = true },
+        .{ .what = "an `unchanged` file that changed", .inputs = &abc, .after = &abd, .posts = &.{"seg\tunchanged"}, .ok = false },
+        .{ .what = "`modified` naming a file that was never an input", .inputs = &abc, .after = &abc_new, .posts = &.{"new\tmodified:1:S"}, .ok = false },
+        // §2.1's split has TWO sides: a post row is an explicit override of an
+        // input, or an explicit NEW file. The three below are the ones the C3r
+        // review found missing, and each was green under the old rule.
+        .{ .what = "`created` naming a file that WAS an input", .inputs = &q, .after = &q, .posts = &.{"seg\tcreated:1:S"}, .ok = false },
+        .{ .what = "`deleted` naming a file that was never an input", .inputs = &abc, .after = &abc, .posts = &.{"ghost\tdeleted"}, .ok = false },
+        .{ .what = "a `deleted` file replaced by a directory of the same name", .inputs = &abc, .after = &none, .posts = &.{"seg\tdeleted"}, .ok = false, .make_dir = true },
+    };
+
+    const sha_q = xfix.sha256Hex("q");
+
+    for (cases, 0..) |c, i| {
+        var name_buf: [32]u8 = undefined;
+        const cell_name = try std.fmt.bufPrint(&name_buf, "post-{d}", .{i});
+        var dir = try tmp.dir.makeOpenPath(cell_name, .{ .iterate = true });
+        defer dir.close();
+        for (c.after) |f| try dir.writeFile(.{ .sub_path = f.rel, .data = f.bytes });
+        if (c.make_dir) try dir.makeDir("seg");
+
+        // The post rows are written as manifest text and parsed by the REAL
+        // reader, so the disposition grammar under test is the shipped one.
+        var text: std.ArrayListUnmanaged(u8) = .empty;
+        defer text.deinit(a);
+        try text.appendSlice(a, V2_HEAD ++ "file\tf\tseg\t3\taa\tbb\n");
+        for (c.posts) |row| {
+            try text.appendSlice(a, "post\tf\tzig\tro\t");
+            for (row) |ch| {
+                switch (ch) {
+                    'E' => try text.appendSlice(a, xfix.EMPTY_SHA),
+                    'S' => try text.appendSlice(a, &sha_q),
+                    else => try text.append(a, ch),
+                }
+            }
+            try text.append(a, '\n');
+        }
+
+        var loaded = try xfix.parse(&ctx, text.items);
+        defer loaded.deinit(a);
+        var posts: std.ArrayListUnmanaged(xfix.V2Post) = .empty;
+        defer posts.deinit(a);
+        for (loaded.v2.posts.items) |p| try posts.append(a, p);
+
+        if (c.ok) {
+            try xfix.assertPostState(&ctx, dir, c.inputs, posts.items, c.what);
+        } else {
+            try xfix.expectRefused(&ctx, c.what, xfix.assertPostState, .{ &ctx, dir, c.inputs, posts.items, c.what });
+        }
+    }
+    try testing.expectEqual(@as(usize, 13), cases.len);
 }
 
 test {

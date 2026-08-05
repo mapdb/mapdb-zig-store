@@ -124,10 +124,14 @@ pub const TAG_MARK: u8 = 'K';
 /// a record, so it is not packLong-framed.
 pub const MARK_BODY_LEN: i64 = 16;
 
-const T_PREALLOC: u8 = 1;
-const T_RECORD: u8 = 2;
-const T_APPEND: u8 = 3;
-const T_DELETE: u8 = 4;
+// `pub` so the C3 cross-port fixture reader (src/xfixtures/xfix.zig) can name
+// the entry tags instead of transcribing them. This widens nothing outside the
+// package: `root.zig` does not re-export this module, so a downstream importer
+// of `mapdb_zig_store` cannot reach these.
+pub const T_PREALLOC: u8 = 1;
+pub const T_RECORD: u8 = 2;
+pub const T_APPEND: u8 = 3;
+pub const T_DELETE: u8 = 4;
 
 /// `'S'`, `'C'` and `'K'` — **all three**, in the main scan and in the lookahead
 /// alike.
