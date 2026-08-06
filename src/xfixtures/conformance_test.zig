@@ -973,7 +973,19 @@ test "xfixtures: the post-state rule fails in both directions" {
         // (`null == null`), and every `created` case varied the input side and
         // never post-file PRESENCE.
         .{ .what = "an `unchanged` row naming a file absent before and after", .inputs = &abc, .after = &abc, .posts = &.{"ghost\tunchanged"}, .ok = false },
+        // …and the same rule's OTHER half, isolated. The case above trips the
+        // "gone after the cell" check as well, so it measures whichever runs
+        // first: the campaign proved it by deleting the was-an-input check with
+        // the whole gate green. This one names a file that is PRESENT after and
+        // whose content is empty, so a defective executor substituting `""` for
+        // the missing input compares equal and accepts.
+        .{ .what = "an `unchanged` row naming a file that was never an input", .inputs = &abc, .after = &abc_lock, .posts = &.{"x.lock\tunchanged"}, .ok = false },
+        // The length check, isolated from the hash that subsumes it. A wrong
+        // length always implies a wrong hash, so "length does not match" above
+        // measures the HASH; this row's hash is right and only its length is
+        // wrong. Measured: without it, deleting the length check is green.
         .{ .what = "an `unchanged` file that is gone after the cell", .inputs = &abc, .after = &none, .posts = &.{"seg\tunchanged"}, .ok = false },
+        .{ .what = "a `created` file whose sha is right and whose length is not", .inputs = &abc, .after = &abc_lock, .posts = &.{"x.lock\tcreated:5:E"}, .ok = false },
         .{ .what = "a `created` file that is missing after the cell", .inputs = &abc, .after = &abc, .posts = &.{"x.lock\tcreated:0:E"}, .ok = false },
         // The verb RELATIONS (C5r round 3, and `NEXT.md` rev 26 item 8). Grading
         // the length and hash alone leaves both verbs as decoration: a file that
@@ -981,9 +993,12 @@ test "xfixtures: the post-state rule fails in both directions" {
         // Each half of each collapsed conjunction gets its own input, because the
         // collapse buys freedom from masking and not coverage (round 4).
         .{ .what = "a `truncated` file that is a proper prefix", .inputs = &abc, .after = &ab, .posts = &.{"seg\ttruncated:2:A"}, .ok = true },
-        .{ .what = "a `truncated` file whose bytes are exactly the input", .inputs = &q, .after = &q, .posts = &.{"seg\ttruncated:1:S"}, .ok = false },
         .{ .what = "a `truncated` file that grew", .inputs = &abc, .after = &abcd, .posts = &.{"seg\ttruncated:4:D"}, .ok = false },
         .{ .what = "a `truncated` file that shrank but is not a PREFIX of the input", .inputs = &abc, .after = &xy, .posts = &.{"seg\ttruncated:2:X"}, .ok = false },
+        // LAST of the three negatives, deliberately: it is the only one the
+        // one-token `<` -> `<=` mutant lets through, so the whole-relation
+        // mutant reports "that grew" and the strictness mutant reports this.
+        .{ .what = "a `truncated` file whose bytes are exactly the input", .inputs = &q, .after = &q, .posts = &.{"seg\ttruncated:1:S"}, .ok = false },
         .{ .what = "a `modified` file whose bytes really changed", .inputs = &abc, .after = &xy, .posts = &.{"seg\tmodified:2:X"}, .ok = true },
         .{ .what = "a `modified` file whose bytes are unchanged", .inputs = &q, .after = &q, .posts = &.{"seg\tmodified:1:S"}, .ok = false },
         .{ .what = "a `modified` row describing what is really a truncation", .inputs = &abc, .after = &ab, .posts = &.{"seg\tmodified:2:A"}, .ok = false },
@@ -1037,7 +1052,7 @@ test "xfixtures: the post-state rule fails in both directions" {
             try xfix.expectRefused(&ctx, c.what, gradePosts, .{ &ctx, dir, c, posts.items });
         }
     }
-    try testing.expectEqual(@as(usize, 25), cases.len);
+    try testing.expectEqual(@as(usize, 27), cases.len);
 }
 
 /// One battery case, through the CAPTURE and the ACCOUNTANT rather than around

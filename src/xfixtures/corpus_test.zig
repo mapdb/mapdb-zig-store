@@ -247,13 +247,17 @@ test "xfixtures corpus: the action row's refusals each have an input" {
     const cases = [_]struct { what: []const u8, args: []const u8, verb: []const u8 = "commit_one_record" }{
         .{ .what = "an unknown verb", .args = "op=put,payload_id=161,payload_len=64,recid_label=Q,serializer=raw", .verb = "rewrite_the_log" },
         .{ .what = "an unknown argument key", .args = "colour=red,op=put,payload_id=161,payload_len=64,recid_label=Q,serializer=raw" },
-        .{ .what = "an unimplemented op", .args = "op=append,payload_id=161,payload_len=64,recid_label=Q,serializer=raw" },
-        .{ .what = "an unimplemented serializer", .args = "op=put,payload_id=161,payload_len=64,recid_label=Q,serializer=java" },
+        // The five per-key READS come first, then the two VALUE checks. A
+        // mutant that replaces one read with a constant also satisfies that
+        // key's value check, so with the value cases first the two mutants
+        // would report one red between them — which is proof for neither site.
         .{ .what = "no op argument", .args = "payload_id=161,payload_len=64,recid_label=Q,serializer=raw" },
         .{ .what = "no recid_label argument", .args = "op=put,payload_id=161,payload_len=64,serializer=raw" },
         .{ .what = "no payload_id argument", .args = "op=put,payload_len=64,recid_label=Q,serializer=raw" },
         .{ .what = "no payload_len argument", .args = "op=put,payload_id=161,recid_label=Q,serializer=raw" },
         .{ .what = "no serializer argument", .args = "op=put,payload_id=161,payload_len=64,recid_label=Q" },
+        .{ .what = "an unimplemented op", .args = "op=append,payload_id=161,payload_len=64,recid_label=Q,serializer=raw" },
+        .{ .what = "an unimplemented serializer", .args = "op=put,payload_id=161,payload_len=64,recid_label=Q,serializer=java" },
         .{ .what = "a payload_id that is not an integer", .args = "op=put,payload_id=x,payload_len=64,recid_label=Q,serializer=raw" },
         .{ .what = "a payload_len that is not an integer", .args = "op=put,payload_id=161,payload_len=x,recid_label=Q,serializer=raw" },
     };
@@ -719,9 +723,12 @@ test "xfixtures corpus: applies and expect must be the same set" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const drops = [_][]const u8{
-        "applies\twal3-java-cleaned\tzig\trw",
-        "expect\twal3-java-cleaned\tzig\trw\taccept\twal3\tx",
+    // Each case names the rule its own drop must trip. A shared message would
+    // let the two loops' mutants report one red between them, which is proof
+    // for neither — measured, `applies_noexpect` reported the other loop's.
+    const drops = [_]struct { line: []const u8, saying: []const u8 }{
+        .{ .line = "applies\twal3-java-cleaned\tzig\trw", .saying = "has no `applies` row" },
+        .{ .line = "expect\twal3-java-cleaned\tzig\trw\taccept\twal3\tx", .saying = "has no `expect` row" },
     };
     for (drops, 0..) |drop, i| {
         var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -729,7 +736,7 @@ test "xfixtures corpus: applies and expect must be the same set" {
         var it = std.mem.splitScalar(u8, corpus_manifest_tsv, '\n');
         while (it.next()) |line| {
             if (line.len == 0) continue;
-            if (std.mem.eql(u8, line, drop)) continue;
+            if (std.mem.eql(u8, line, drop.line)) continue;
             try out.appendSlice(a, line);
             try out.append(a, '\n');
         }
@@ -743,7 +750,7 @@ test "xfixtures corpus: applies and expect must be the same set" {
         try xfix.expectRefusedSaying(
             &ctx,
             "applies and expect disagreeing",
-            "has no `",
+            drop.saying,
             xfix.runV2CorpusCells,
             .{ &ctx, &sample, "rw", dir, xfix.Dispatch.by_manifest },
         );
