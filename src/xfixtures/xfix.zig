@@ -2226,6 +2226,23 @@ pub fn assertWriteGate(ctx: *Ctx, s: *StoreWAL, mode: []const u8, cell: []const 
 /// per-key reads and the two integer parses are separate sites, and one mutation
 /// of a shared helper is proof for none of them.
 ///
+/// **That claim used to be FALSE here, and the C5z review measured it.** The
+/// first draft re-checked the argument GRAMMAR — a pair that is not `k=v`, a
+/// repeated key, an implausible number of pairs — and all three were dead:
+/// `actionArgs` refuses a malformed pair and requires keys sorted AND distinct
+/// before this function is ever reached, and with five known keys the
+/// unknown-key refusal fires long before any count bound. Three refusals with no
+/// input, sitting directly under a sentence claiming each had one.
+///
+/// The repair is to make the sentence TRUE rather than to weaken it: the
+/// argument grammar has exactly ONE authority, the parser, and this function
+/// checks only what the parser deliberately does not — the verb, the key
+/// VOCABULARY (`catalogue.ACTION_VERBS` is the authority and this engine
+/// implements a subset, so a parser list would go stale), the five required
+/// keys, the two integer parses, and the two value semantics. Eleven sites,
+/// eleven inputs. A key with no `=` cannot register, so it simply fails the
+/// required-key read rather than needing a refusal of its own.
+///
 /// `recid_label`'s VALUE is deliberately unobserved: §5.2 pins labels and not
 /// the numbers an engine hands out, so the label travels into the result line
 /// and nothing here compares it to anything.
@@ -2234,29 +2251,18 @@ pub fn runAction(ctx: *Ctx, s: *StoreWAL, verb: []const u8, arg_spec: []const u8
         return ctx.err("unknown action verb: {s}", .{verb});
     const known = [_][]const u8{ "op", "payload_id", "payload_len", "recid_label", "serializer" };
 
-    var keys: [8][]const u8 = undefined;
-    var vals: [8][]const u8 = undefined;
-    var n: usize = 0;
     var it = std.mem.splitScalar(u8, arg_spec, ',');
     while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse
-            return ctx.err("action argument is not k=v: {s}", .{pair});
-        if (n == keys.len) return ctx.err("too many action arguments: {s}", .{arg_spec});
-        keys[n] = pair[0..eq];
-        vals[n] = pair[eq + 1 ..];
-        for (keys[0..n]) |prior| {
-            if (eql(prior, keys[n])) return ctx.err("action argument repeated: {s}", .{keys[n]});
-        }
-        if (!contains(&known, keys[n]))
-            return ctx.err("unknown argument {s} for {s}; it takes op,payload_id,payload_len,recid_label,serializer", .{ keys[n], verb });
-        n += 1;
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!contains(&known, pair[0..eq]))
+            return ctx.err("unknown argument {s} for {s}; it takes op,payload_id,payload_len,recid_label,serializer", .{ pair[0..eq], verb });
     }
 
-    const op = try argValue(ctx, keys[0..n], vals[0..n], "op", verb);
-    const label = try argValue(ctx, keys[0..n], vals[0..n], "recid_label", verb);
-    const payload_id_s = try argValue(ctx, keys[0..n], vals[0..n], "payload_id", verb);
-    const payload_len_s = try argValue(ctx, keys[0..n], vals[0..n], "payload_len", verb);
-    const ser = try argValue(ctx, keys[0..n], vals[0..n], "serializer", verb);
+    const op = try argValue(ctx, arg_spec, "op", verb);
+    const label = try argValue(ctx, arg_spec, "recid_label", verb);
+    const payload_id_s = try argValue(ctx, arg_spec, "payload_id", verb);
+    const payload_len_s = try argValue(ctx, arg_spec, "payload_len", verb);
+    const ser = try argValue(ctx, arg_spec, "serializer", verb);
     const payload_id = std.fmt.parseInt(u64, payload_id_s, 10) catch
         return ctx.err("payload_id is not an integer: {s}", .{payload_id_s});
     const payload_len = std.fmt.parseInt(usize, payload_len_s, 10) catch
@@ -2273,9 +2279,14 @@ pub fn runAction(ctx: *Ctx, s: *StoreWAL, verb: []const u8, arg_spec: []const u8
         return ctx.err("commit_one_record: commit failed: {s}", .{@errorName(e)});
 }
 
-fn argValue(ctx: *Ctx, keys: []const []const u8, vals: []const []const u8, k: []const u8, verb: []const u8) Error![]const u8 {
-    for (keys, vals) |kk, vv| {
-        if (eql(kk, k)) return vv;
+/// One key's value out of a parser-validated spec. FIVE separate call sites, and
+/// a mutant on each: replacing one with a constant is invisible to a mutation of
+/// the others (C5r round 2).
+fn argValue(ctx: *Ctx, arg_spec: []const u8, k: []const u8, verb: []const u8) Error![]const u8 {
+    var it = std.mem.splitScalar(u8, arg_spec, ',');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (eql(pair[0..eq], k)) return pair[eq + 1 ..];
     }
     return ctx.err("action argument {s} is required by {s}", .{ k, verb });
 }
@@ -2757,11 +2768,15 @@ pub fn runV2CorpusCells(
     defer cells.deinit(ctx.alloc);
     var ran: std.ArrayListUnmanaged([]const u8) = .empty;
     defer ran.deinit(ctx.alloc);
+    // No `want == ran` comparison here, and its absence is deliberate. The two
+    // loops above force `applies` and `expect` to be the same set in both
+    // directions, and `runCells` runs exactly one cell per matching `expect` row
+    // or refuses — so `ran == want` holds by construction and a third comparison
+    // could never fire. The C5z review MEASURED that: deleting it left the whole
+    // suite green. C2j's rule applies — a check no input can reach is deleted
+    // rather than decorated, because leaving it in claims a guard that is not
+    // there.
     try runCells(ctx, &cells, mode, tmp, &ran, dispatch);
-    for (want.items) |w| {
-        if (!contains(ran.items, w))
-            return ctx.err("the {s}/{s} cells that ran are not the ones `applies` calls for: {s} did not run", .{ ENGINE, mode, w });
-    }
 
     // The other half of contract §2.3's consumption rule.
     try cells.requireEveryOracleRowAddressesARunCell(ctx, mode, ran.items);
@@ -2805,8 +2820,10 @@ fn runCells(
             return ctx.err("cannot create the cell dir for {s}/{s}: {s}", .{ e.fixture, mode, @errorName(err) });
         defer cell_dir.close();
         try cells.runCell(ctx, e, cell_dir, dispatch);
-        if (contains(ran.items, e.fixture))
-            return ctx.err("two {s} cells for the same fixture {s}", .{ mode, e.fixture });
+        // No duplicate-fixture check: the parser already refuses a second
+        // `expect` row for the same (fixture, engine, mode), which is exactly the
+        // key this loop filters on. Measured dead by the C5z review and removed
+        // rather than kept as a guard nothing can trip.
         try ran.append(ctx.alloc, e.fixture);
     }
 }

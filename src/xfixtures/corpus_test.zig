@@ -107,12 +107,42 @@
 //! the count and the `^#` anchor is load-bearing — unanchored it counts the
 //! runner's own header, which is the mistake C5r's round 3 caught.
 //!
-//! **Two interlocks are recorded rather than closed.** `runV2CorpusCells` checks
-//! `applies ⊆ ran` and not the converse, because `ran` is built from `expect`
-//! rows and the `expect`-has-an-`applies` loop already forbids the other
-//! direction; the two guard each other one way only. And `assertBytesRows`
-//! renders at most 32 asserted bytes, refusing a longer row loudly rather than
-//! truncating it — a bound, stated at the site, not a silent cap.
+//! `assertBytesRows` renders at most 32 asserted bytes, refusing a longer row
+//! loudly rather than truncating it — a bound, stated at the site, not a silent
+//! cap.
+//!
+//! # What round 1 of review found, and why this section is shorter than it was
+//!
+//! The brief asked the reviewer one question this list could not answer about
+//! itself: **is it COMPLETE?** The measured answer was no — seven production
+//! checks were deletable with the whole fixture suite green and appeared on
+//! neither the campaign nor this list. That is C5r round 1's finding (an
+//! undisclosed survivor) at the level of the mechanism built to prevent it: a
+//! disclosure list can be honest about every entry it contains and still be
+//! short. **Measuring the entries is not the same as measuring the set.**
+//!
+//! Three of them sat under `runAction`'s "every refusal below is its own SITE
+//! with its own input" — re-checks of the argument GRAMMAR the parser had
+//! already refused, which made that sentence false two screens from where it was
+//! written. The repair was to make the sentence true: the grammar has one
+//! authority and `runAction` now checks only what the parser deliberately does
+//! not.
+//!
+//! Two more were guards the parser already supplies — a third cardinality
+//! comparison in `runV2CorpusCells` (the two loops above it force the sets equal
+//! in both directions, so it could never fire, and the paragraph that used to be
+//! here presented it as the LIVE half of an interlock) and a duplicate-fixture
+//! check in `runCells`. Both are gone: C2j's rule is that a check no input can
+//! reach is deleted rather than decorated, because leaving it in claims a guard
+//! that is not there.
+//!
+//! Two got INPUTS instead, because they are real. `refusalOf`'s "the direct
+//! opener has no read-only mode" is REACHABLE from a doctored manifest, and
+//! without it an `ro` cell addressed to the direct opener would be opened
+//! read-write and graded as though its mode meant something. `Consumption.owe`'s
+//! duplicate-key guard is an invariant of the accountant rather than of the
+//! manifest, so it keeps the only input it can have — a direct one, stated as
+//! such.
 //!
 //! # What the campaign cost, and what it was worth
 //!
@@ -418,6 +448,38 @@ test "xfixtures corpus: the reopen row is graded" {
     }
 }
 
+// The `direct` opener has no read-only mode, and a manifest CAN ask for one.
+//
+// The C5z review found this refusal reachable and inputless — the same shape as
+// C5r's round-1 blocking finding. `reject-wal3-segment-at-direct` has a `rw`
+// cell and no `ro` one, but nothing in the grammar stops a manifest from
+// addressing an `ro` cell through the `direct` opener, and with the refusal gone
+// that cell would be opened READ-WRITE and graded as though its mode meant
+// something — which is the C3z "selecting a flag is not coverage" defect, one
+// opener over.
+test "xfixtures corpus: a direct cell addressed to the ro mode is refused" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(a);
+    try out.appendSlice(a, corpus_manifest_tsv);
+    try out.appendSlice(a, "applies\treject-wal3-segment-at-direct\tzig\tro\n");
+    try out.appendSlice(a, "expect\treject-wal3-segment-at-direct\tzig\tro\treject\tdirect\tx\n");
+
+    var sample = try loadDoctored(&ctx, out.items);
+    defer sample.deinit(a);
+    try xfix.expectRefusedSaying(
+        &ctx,
+        "a direct cell addressed to the ro mode",
+        "the direct opener has no read-only mode here",
+        xfix.runV2CorpusCells,
+        .{ &ctx, &sample, "ro", tmp.dir, xfix.Dispatch.by_manifest },
+    );
+}
+
 // A `reject` cell whose store OPENS must fail.
 //
 // No conforming corpus supplies that input — every reject cell really does
@@ -522,9 +584,11 @@ test "xfixtures corpus: the reopen family predicate discriminates" {
 // The per-cell half: an oracle row addressed to a cell that RUNS, which no arm
 // can execute.
 //
-// A `bytes` row on a REJECT cell is the cleanest instance — the cell never
-// opens, so nothing captures a store's output, and yet the row is addressed and
-// owed.
+// An `action` row on a REJECT cell is the instance, and the row TYPE matters:
+// only `runAccept` consumes an action, and a reject cell never reaches it. A
+// `bytes` row would not do — `assertBytesRows` runs for reject cells too,
+// against the capture, so a bytes row there is consumable. The C5z review caught
+// this comment naming the wrong row type for the right test.
 test "xfixtures corpus: an oracle row no arm can run fails the cell" {
     const a = testing.allocator;
     var ctx = xfix.Ctx{ .alloc = a };
@@ -601,6 +665,13 @@ test "xfixtures corpus: an unconsumed post row is a failure" {
     const row: xfix.V2Post = .{ .fixture = "f", .engine = "zig", .mode = "rw", .rel = "x", .verb = "unchanged" };
     const other: xfix.V2Post = .{ .fixture = "f", .engine = "zig", .mode = "rw", .rel = "y", .verb = "unchanged" };
     try owed.owe(&ctx, "post {s}", .{row.rel}, &row);
+    // Two rows under one key would make the books balance while a handler graded
+    // the wrong object. The parser dedups every addressed row type on exactly the
+    // fields these keys render, so no production caller can collide — the C5z
+    // review measured the guard as unkillable from the suite. It is kept because
+    // it is an invariant of the ACCOUNTANT rather than of the manifest, and it is
+    // given the only input it can have: a direct one, stated as such.
+    try xfix.expectRefused(&ctx, "two rows under one key", xfix.Consumption.owe, .{ &owed, &ctx, "post {s}", .{row.rel}, &other });
     try xfix.expectRefused(&ctx, "a debt nobody paid", xfix.Consumption.requireAllConsumed, .{ &owed, &ctx });
     // The ADDRESS is part of the identity, not just the key: a handler that
     // grades a different object still balances the books without it.
@@ -735,10 +806,13 @@ test "xfixtures corpus: a wal3 cell with no post rows is refused" {
     var it = std.mem.splitScalar(u8, corpus_manifest_tsv, '\n');
     while (it.next()) |line| {
         if (line.len == 0) continue;
-        // The d1 reject cell's post row goes, and its `x.lock` INPUT is added, so
-        // the file-set rule is satisfied and the guard is the only rule left to
-        // fire. Without that input the stray lock trips the file-set rule first
-        // and this case would measure that instead (lesson h).
+        // The d1 reject cell's only post row goes, so the cell has none. What
+        // makes the GUARD fire rather than the file-set rule is the ORDER: the
+        // guard runs before `assertPostState` (plan §5.3 item 5's amendment).
+        // The first draft of this comment claimed an `x.lock` INPUT was added —
+        // it is not, and could not be: `x.lock` is a `post created` row, never a
+        // `file` row. The C5z review caught the comment describing a mechanism
+        // the code does not have.
         if (std.mem.eql(u8, line, "post\treject-wal3-d1-barebase\tzig\trw\tx.lock\tcreated:0:" ++ xfix.EMPTY_SHA)) continue;
         try out.appendSlice(a, line);
         try out.append(a, '\n');
