@@ -77,20 +77,61 @@
 //! # What the campaign measured and could NOT kill
 //!
 //! Named, because a campaign that reports only its kills is a campaign whose
-//! coverage claim nothing checks. Each of these was applied and the whole suite
-//! stayed green:
+//! coverage claim nothing checks — and **MEASURED, because a disclosure is a
+//! claim like any other.** C5r's review filed an inaccurate one twice: once for
+//! an undisclosed survivor and once for a disclosure that counted six where the
+//! runner held seven. So each entry below has a mutant of its own in
+//! `mut_z.py`, and `campaigns/disclose_z.sh` is the runner that grades them —
+//! with the opposite convention to `mutants_z.sh`, because here a SURVIVOR
+//! confirms the claim and a KILL means this list is wrong. It reported
+//! `disclosure: 6 confirmed, 0 refuted, 0 unmeasured`.
 //!
-//! - the `ro_probed` comparison, the corpus-root file-set comparison and the
-//!   distribution-seal comparison. Each is the last statement in its group: they
-//!   are what give the probe call, the root inventory and the copy their reds,
-//!   and nothing observes THEM. This is the leaf problem — a statement no other
-//!   statement depends on is invisible to deletion — pushed DOWN by collecting
-//!   outcomes and comparing once per group, not removed.
-//! - the `v2-core` profile assertion in `runV2Cells`. The static sample carries
-//!   no oracle row, so no input reaches it; it exists for the day one appears.
-//! - `capture`'s "not a regular file" refusal. Not a leaf but SUBSUMED: deleting
-//!   it leaves the read failing on the same input with a worse message, so what
-//!   it buys is the diagnosis, not the refusal.
+//! - `leaf_rocount`, `leaf_roprobed`, `leaf_rootset`, `leaf_distseal` — the
+//!   `ro_probed` count and membership comparisons, the corpus-root file-set
+//!   comparison and the distribution-seal comparison. Each is the last statement
+//!   in its group: they are what give the probe call, the root inventory and the
+//!   copy their reds, and nothing observes THEM. This is the leaf problem — a
+//!   statement no other statement depends on is invisible to deletion — pushed
+//!   DOWN by collecting outcomes and comparing once per group, not removed.
+//! - `leaf_v2core` — the `v2-core` profile assertion in `runV2Cells`. The static
+//!   sample carries no oracle row, so no input reaches it; it exists for the day
+//!   one appears.
+//! - `leaf_capture_isfile` — `capture`'s "not a regular file" refusal. Not a
+//!   leaf but SUBSUMED: deleting it leaves the read failing on the same input
+//!   with a worse message, so what it buys is the diagnosis, not the refusal.
+//!
+//! **One check is killed only by a WEAKER signal**, and the runner names it:
+//! `bytesrange`, whose deletion makes the slice go out of bounds, so the red is
+//! the language's and not the rule's. No conforming manifest reaches that check
+//! with the slice still in range. `grep -c '^# WEAKER SIGNAL' mutants_z.sh` is
+//! the count and the `^#` anchor is load-bearing — unanchored it counts the
+//! runner's own header, which is the mistake C5r's round 3 caught.
+//!
+//! **Two interlocks are recorded rather than closed.** `runV2CorpusCells` checks
+//! `applies ⊆ ran` and not the converse, because `ran` is built from `expect`
+//! rows and the `expect`-has-an-`applies` loop already forbids the other
+//! direction; the two guard each other one way only. And `assertBytesRows`
+//! renders at most 32 asserted bytes, refusing a longer row loudly rather than
+//! truncating it — a bound, stated at the site, not a silent cap.
+//!
+//! # What the campaign cost, and what it was worth
+//!
+//! Round 1 returned **48 killed, 13 not killed**, and eleven of the thirteen
+//! were defects in the CAMPAIGN rather than in the suite: three mutants that did
+//! not COMPILE (Zig makes a deletion that orphans a binding an error, and both
+//! runners now refuse to score one as a kill), and eight expectations of mine
+//! that named the wrong red. **Two were real survivors** — checks deletable with
+//! the whole gate green — and both were masked by a neighbour: `unchanged`'s
+//! "this names an input" refusal, whose case also tripped the "gone after the
+//! cell" check, and the post-state LENGTH check, which a whole-file hash
+//! subsumes. Each now has an input that reaches it alone.
+//!
+//! Round 1 also found **four places where two mutants shared one red**.
+//! `expectRefused` returns at the first case a mutant lets through, so the ORDER
+//! of the negatives decides what each mutant can prove — and two mutants with
+//! one red between them are proof for neither site. The truncation negatives and
+//! the eleven action cases are ordered deliberately for that reason, and the
+//! `applies`/`expect` cases name the row type each one dropped.
 
 const std = @import("std");
 const testing = std.testing;
