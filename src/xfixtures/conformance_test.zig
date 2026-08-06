@@ -319,8 +319,14 @@ test "xfixtures v2: the write-gate probe fires in both directions" {
 
         var s2 = try StoreWAL.openCfg(a, base, .{ .read_only = read_only });
         defer s2.deinit();
-        // The handle satisfies the branch that matches how it was opened...
-        try xfix.assertWriteGate(&ctx, &s2, if (read_only) "ro" else "rw", "the matching mode");
+        // The handle satisfies the branch that matches how it was opened, and the
+        // WITNESS it returns names the branch it took — the executor's `ro_probed`
+        // bookkeeping is derived from that value, so a probe that skipped its
+        // assertions and returned the right tag is refused here.
+        try testing.expectEqual(
+            if (read_only) xfix.WriteGate.ro_refused else xfix.WriteGate.rw_rolled_back,
+            try xfix.assertWriteGate(&ctx, &s2, if (read_only) "ro" else "rw", "the matching mode"),
+        );
         // ...and must fail the other one, FOR THE STATED REASON. A bare "it
         // refused" is not enough here: a read-only handle graded as `rw` also
         // fails the `rollback` that follows the probe, so a probe that swallowed
@@ -839,21 +845,57 @@ test "xfixtures: the v1 grammar has its own vocabularies" {
     try refuse(&ctx, "an unknown v1 generatorEngine", "version\t1\nfixture\tf\tdirect\tgo\tc\nfile\tf\tx\t1" ++ SHAS ++ "\n");
 }
 
-// A `bytes` row is refused BY NAME, not skipped.
+// The four C5 row types PARSE, and every rule the grammar states about them can
+// fire.
 //
-// `bytes` describes a derived fixture built by `walfmt.py` from another
-// fixture's image, and C4 is the slice that introduces both the deriver and the
-// fixtures. Until then the honest thing for a reader to do is stop: a `bytes`
-// row silently ignored is a fixture the manifest says exists and that nothing
-// ever opens.
-test "xfixtures: a bytes row is refused until C4 can execute it" {
+// The `bytes` row used to be refused by name here — C3's landmine, because the
+// deriver and the fixtures it describes did not exist yet. C5s built both, so a
+// reader that still refused it would refuse the corpus, and slice C5z is where
+// this engine stops refusing and starts accounting.
+//
+// Each positive case is paired with the negative that proves the corresponding
+// rule can fail. A grammar rule with no malformed input is a rule nothing has
+// shown to be there.
+test "xfixtures: the C5 oracle rows parse and are checked" {
     const a = testing.allocator;
     var ctx = xfix.Ctx{ .alloc = a };
-    // The row must be GRAMMATICALLY VALID, or the test proves only that a
-    // malformed row is refused — which the arity and vocabulary rules already do,
-    // and which is not what the name claims.
-    try refuse(&ctx, "a v2 `bytes` row", V2_HEAD ++ V2_FILE ++
-        "bytes\tf\tzig\tro\tx.wal.0000000000000001\t0\taa\n");
+
+    const ACT = "action\tf\tzig\tro\tcommit_one_record\top=put,payload_id=1,payload_len=2,recid_label=Q,serializer=raw\n";
+
+    // The four row types, well formed, in one manifest that must PARSE.
+    try parseOk(&ctx, V2_HEAD ++ V2_FILE ++ "applies\tf\tzig\tro\n" ++ ACT ++
+        "bytes\tf\tzig\tro\tx.wal.0000000000000001\t0\taabb\n" ++
+        "reopen\tf\tzig\tro\tS2\n");
+
+    try refuse(&ctx, "a short applies row", V2_HEAD ++ V2_FILE ++ "applies\tf\tzig\n");
+    try refuse(&ctx, "an applies row for an unknown engine", V2_HEAD ++ V2_FILE ++ "applies\tf\tgo\tro\n");
+    try refuse(&ctx, "a duplicate applies row", V2_HEAD ++ V2_FILE ++ "applies\tf\tzig\tro\napplies\tf\tzig\tro\n");
+    try refuse(&ctx, "a duplicate action row for one cell and verb", V2_HEAD ++ V2_FILE ++ ACT ++ ACT);
+    try refuse(&ctx, "an action argument that is not k=v", V2_HEAD ++ V2_FILE ++
+        "action\tf\tzig\tro\tcommit_one_record\top\n");
+    try refuse(&ctx, "an action argument key that is not [a-z][a-z0-9_]*", V2_HEAD ++ V2_FILE ++
+        "action\tf\tzig\tro\tcommit_one_record\tOp=put\n");
+    try refuse(&ctx, "action argument keys out of order", V2_HEAD ++ V2_FILE ++
+        "action\tf\tzig\tro\tcommit_one_record\tserializer=raw,op=put\n");
+    try refuse(&ctx, "an action argument value outside the pinned character class", V2_HEAD ++ V2_FILE ++
+        "action\tf\tzig\tro\tcommit_one_record\top=p t\n");
+    try refuse(&ctx, "a duplicate reopen row", V2_HEAD ++ V2_FILE ++
+        "reopen\tf\tzig\tro\tS2\nreopen\tf\tzig\tro\tS2\n");
+    try refuse(&ctx, "a bytes row with an odd-length hex blob", V2_HEAD ++ V2_FILE ++
+        "bytes\tf\tzig\tro\tx.wal.0000000000000001\t0\taab\n");
+    try refuse(&ctx, "a bytes row with an uppercase hex blob", V2_HEAD ++ V2_FILE ++
+        "bytes\tf\tzig\tro\tx.wal.0000000000000001\t0\tAA\n");
+    try refuse(&ctx, "a duplicate bytes row for one cell, file and offset", V2_HEAD ++ V2_FILE ++
+        "bytes\tf\tzig\tro\tx.wal.0000000000000001\t0\taa\n" ++
+        "bytes\tf\tzig\tro\tx.wal.0000000000000001\t0\tbb\n");
+    // The fixture reference is a reference like any other row's: a row addressed
+    // to a fixture nothing declares must be refused, in all four types.
+    try refuse(&ctx, "an applies row naming an undeclared fixture", V2_HEAD ++ V2_FILE ++ "applies\tghost\tzig\tro\n");
+    try refuse(&ctx, "an action row naming an undeclared fixture", V2_HEAD ++ V2_FILE ++
+        "action\tghost\tzig\tro\tcommit_one_record\top=put\n");
+    try refuse(&ctx, "a reopen row naming an undeclared fixture", V2_HEAD ++ V2_FILE ++ "reopen\tghost\tzig\tro\tS2\n");
+    try refuse(&ctx, "a bytes row naming an undeclared fixture", V2_HEAD ++ V2_FILE ++
+        "bytes\tghost\tzig\tro\tx.wal.0000000000000001\t0\taa\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -887,40 +929,70 @@ test "xfixtures: the post-state rule fails in both directions" {
     const abc = [_]xfix.InputFile{.{ .rel = "seg", .bytes = "abc" }};
     const abd = [_]xfix.InputFile{.{ .rel = "seg", .bytes = "abd" }};
     const q = [_]xfix.InputFile{.{ .rel = "seg", .bytes = "q" }};
+    const ab = [_]xfix.InputFile{.{ .rel = "seg", .bytes = "ab" }};
+    const xy = [_]xfix.InputFile{.{ .rel = "seg", .bytes = "xy" }};
+    const abcd = [_]xfix.InputFile{.{ .rel = "seg", .bytes = "abcd" }};
     const abc_lock = [_]xfix.InputFile{ .{ .rel = "seg", .bytes = "abc" }, .{ .rel = "x.lock", .bytes = "" } };
     const abc_lockz = [_]xfix.InputFile{ .{ .rel = "seg", .bytes = "abc" }, .{ .rel = "x.lock", .bytes = "z" } };
+    const abc_lockq = [_]xfix.InputFile{ .{ .rel = "seg", .bytes = "abc" }, .{ .rel = "x.lock", .bytes = "q" } };
     const abc_new = [_]xfix.InputFile{ .{ .rel = "seg", .bytes = "abc" }, .{ .rel = "new", .bytes = "q" } };
     const surprise = [_]xfix.InputFile{ .{ .rel = "seg", .bytes = "abc" }, .{ .rel = "surprise", .bytes = "x" } };
     const none = [_]xfix.InputFile{};
-    const toolong = [_]xfix.InputFile{.{ .rel = "n" ** 300, .bytes = "" }};
 
-    // `E` is the empty-string sha and `S` the sha of "q"; expanded below so the
-    // rows stay readable.
+    // `E` is the empty-string sha, `S` the sha of "q", `A` of "ab", `X` of "xy"
+    // and `D` of "abcd"; expanded below so the rows stay readable.
     const cases = [_]PostCase{
         .{ .what = "an untouched input named by nothing", .inputs = &abc, .after = &abc, .posts = &.{}, .ok = true },
         .{ .what = "an unnamed input rewritten behind the rule's back", .inputs = &abc, .after = &abd, .posts = &.{}, .ok = false },
         .{ .what = "an unnamed input deleted behind the rule's back", .inputs = &abc, .after = &none, .posts = &.{}, .ok = false },
         .{ .what = "a file that is neither an input nor named", .inputs = &abc, .after = &surprise, .posts = &.{}, .ok = false },
         .{ .what = "a lock file the post rows do declare", .inputs = &abc, .after = &abc_lock, .posts = &.{"x.lock\tcreated:0:E"}, .ok = true },
-        .{ .what = "a `created` file whose sha does not match", .inputs = &abc, .after = &abc_lockz, .posts = &.{"x.lock\tcreated:0:E"}, .ok = false },
+        .{ .what = "a `created` file whose length does not match", .inputs = &abc, .after = &abc_lockz, .posts = &.{"x.lock\tcreated:0:E"}, .ok = false },
+        .{ .what = "a `created` file whose length is right and whose sha is not", .inputs = &abc, .after = &abc_lockq, .posts = &.{"x.lock\tcreated:1:E"}, .ok = false },
         .{ .what = "a `deleted` file that is still there", .inputs = &abc, .after = &abc, .posts = &.{"seg\tdeleted"}, .ok = false },
         .{ .what = "a `deleted` file that really is gone", .inputs = &abc, .after = &none, .posts = &.{"seg\tdeleted"}, .ok = true },
         .{ .what = "an `unchanged` file that changed", .inputs = &abc, .after = &abd, .posts = &.{"seg\tunchanged"}, .ok = false },
+        .{ .what = "an `unchanged` file that really is unchanged", .inputs = &abc, .after = &abc, .posts = &.{"seg\tunchanged"}, .ok = true },
         .{ .what = "`modified` naming a file that was never an input", .inputs = &abc, .after = &abc_new, .posts = &.{"new\tmodified:1:S"}, .ok = false },
         // §2.1's split has TWO sides: a post row is an explicit override of an
         // input, or an explicit NEW file. The three below are the ones the C3r
         // review found missing, and each was green under the old rule.
         .{ .what = "`created` naming a file that WAS an input", .inputs = &q, .after = &q, .posts = &.{"seg\tcreated:1:S"}, .ok = false },
         .{ .what = "`deleted` naming a file that was never an input", .inputs = &abc, .after = &abc, .posts = &.{"ghost\tdeleted"}, .ok = false },
+        // Presence is decided by the CAPTURE, which enumerates the directory and
+        // refuses any entry that is not a regular file. That is where a file
+        // replaced by a directory of the same name is refused now: `deleted`
+        // passing on something very much still there in another shape was the C3r
+        // finding, and moving presence from a stat-by-name to an enumeration
+        // keeps it while removing the errno-swallowing hazard the C3z review
+        // found one level down — nothing is ever stat'd by a name the kernel did
+        // not just hand back.
         .{ .what = "a `deleted` file replaced by a directory of the same name", .inputs = &abc, .after = &none, .posts = &.{"seg\tdeleted"}, .ok = false, .make_dir = true },
-        // A stat failure that is NOT "not found". `catch false` would call this
-        // absent and pass the `deleted` row on a name nothing has established
-        // anything about; the C3z review found that swallow, which is the C3r
-        // post-state finding one level down.
-        .{ .what = "a `deleted` row whose name cannot be stat'd at all", .inputs = &toolong, .after = &none, .posts = &.{("n" ** 300) ++ "\tdeleted"}, .ok = false },
+        // The two quadrants C5r's round-5 review found had no input. Equality
+        // alone cannot establish that an `unchanged` row names an input file
+        // (`null == null`), and every `created` case varied the input side and
+        // never post-file PRESENCE.
+        .{ .what = "an `unchanged` row naming a file absent before and after", .inputs = &abc, .after = &abc, .posts = &.{"ghost\tunchanged"}, .ok = false },
+        .{ .what = "an `unchanged` file that is gone after the cell", .inputs = &abc, .after = &none, .posts = &.{"seg\tunchanged"}, .ok = false },
+        .{ .what = "a `created` file that is missing after the cell", .inputs = &abc, .after = &abc, .posts = &.{"x.lock\tcreated:0:E"}, .ok = false },
+        // The verb RELATIONS (C5r round 3, and `NEXT.md` rev 26 item 8). Grading
+        // the length and hash alone leaves both verbs as decoration: a file that
+        // GREW satisfied `truncated` and an unchanged file satisfied `modified`.
+        // Each half of each collapsed conjunction gets its own input, because the
+        // collapse buys freedom from masking and not coverage (round 4).
+        .{ .what = "a `truncated` file that is a proper prefix", .inputs = &abc, .after = &ab, .posts = &.{"seg\ttruncated:2:A"}, .ok = true },
+        .{ .what = "a `truncated` file whose bytes are exactly the input", .inputs = &q, .after = &q, .posts = &.{"seg\ttruncated:1:S"}, .ok = false },
+        .{ .what = "a `truncated` file that grew", .inputs = &abc, .after = &abcd, .posts = &.{"seg\ttruncated:4:D"}, .ok = false },
+        .{ .what = "a `truncated` file that shrank but is not a PREFIX of the input", .inputs = &abc, .after = &xy, .posts = &.{"seg\ttruncated:2:X"}, .ok = false },
+        .{ .what = "a `modified` file whose bytes really changed", .inputs = &abc, .after = &xy, .posts = &.{"seg\tmodified:2:X"}, .ok = true },
+        .{ .what = "a `modified` file whose bytes are unchanged", .inputs = &q, .after = &q, .posts = &.{"seg\tmodified:1:S"}, .ok = false },
+        .{ .what = "a `modified` row describing what is really a truncation", .inputs = &abc, .after = &ab, .posts = &.{"seg\tmodified:2:A"}, .ok = false },
     };
 
     const sha_q = xfix.sha256Hex("q");
+    const sha_ab = xfix.sha256Hex("ab");
+    const sha_xy = xfix.sha256Hex("xy");
+    const sha_abcd = xfix.sha256Hex("abcd");
 
     for (cases, 0..) |c, i| {
         var name_buf: [32]u8 = undefined;
@@ -941,6 +1013,9 @@ test "xfixtures: the post-state rule fails in both directions" {
                 switch (ch) {
                     'E' => try text.appendSlice(a, xfix.EMPTY_SHA),
                     'S' => try text.appendSlice(a, &sha_q),
+                    'A' => try text.appendSlice(a, &sha_ab),
+                    'X' => try text.appendSlice(a, &sha_xy),
+                    'D' => try text.appendSlice(a, &sha_abcd),
                     else => try text.append(a, ch),
                 }
             }
@@ -949,17 +1024,32 @@ test "xfixtures: the post-state rule fails in both directions" {
 
         var loaded = try xfix.parse(&ctx, text.items);
         defer loaded.deinit(a);
-        var posts: std.ArrayListUnmanaged(xfix.V2Post) = .empty;
+        var posts: std.ArrayListUnmanaged(*const xfix.V2Post) = .empty;
         defer posts.deinit(a);
-        for (loaded.v2.posts.items) |p| try posts.append(a, p);
+        for (loaded.v2.posts.items) |*p| try posts.append(a, p);
 
         if (c.ok) {
-            try xfix.assertPostState(&ctx, dir, c.inputs, posts.items, c.what);
+            try gradePosts(&ctx, dir, c, posts.items);
+            // …and every row it graded was ACCOUNTED for. Without this the
+            // `owed.consume` call inside the rule can be deleted with the whole
+            // battery green, because nothing here would ever read the books.
         } else {
-            try xfix.expectRefused(&ctx, c.what, xfix.assertPostState, .{ &ctx, dir, c.inputs, posts.items, c.what });
+            try xfix.expectRefused(&ctx, c.what, gradePosts, .{ &ctx, dir, c, posts.items });
         }
     }
-    try testing.expectEqual(@as(usize, 14), cases.len);
+    try testing.expectEqual(@as(usize, 25), cases.len);
+}
+
+/// One battery case, through the CAPTURE and the ACCOUNTANT rather than around
+/// them — the same two pieces the executor puts in front of the rule.
+fn gradePosts(ctx: *xfix.Ctx, dir: std.fs.Dir, c: PostCase, posts: []const *const xfix.V2Post) !void {
+    var after = try xfix.capture(ctx, dir, c.what);
+    defer after.deinit(ctx.alloc);
+    var owed = xfix.Consumption.init(c.what);
+    defer owed.deinit(ctx.alloc);
+    for (posts) |p| try owed.owe(ctx, "post {s}", .{p.rel}, p);
+    try xfix.assertPostState(ctx, c.inputs, &after, posts, c.what, &owed);
+    try owed.requireAllConsumed(ctx);
 }
 
 test {

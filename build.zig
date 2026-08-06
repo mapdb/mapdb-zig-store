@@ -26,7 +26,25 @@ pub fn build(b: *std.Build) void {
         ),
     }));
 
-    const unit_tests = b.addTest(.{ .root_module = mod });
+    // The same third set for the schema-v2 PREFLIGHT CORPUS root (slice C5z).
+    // A second root needs a second listing, not a widened first one: the two
+    // roots have different profiles (`v2-core` and `v2-oracle`) and different
+    // embed tables, and one merged set would let a blob distributed under one
+    // root be explained by the other root's manifest.
+    mod.addImport("xfix_distributed_corpus", b.createModule(.{
+        .root_source_file = b.addWriteFiles().add(
+            "xfix_distributed_corpus.zig",
+            distributedGzListing(b, "src/xfixtures/data-v2-corpus"),
+        ),
+    }));
+
+    // Test-name filters, so a mutation campaign can run the xfixtures suites
+    // alone instead of all 575 tests for each of its mutants. The GATE never
+    // passes it: `ci/check.sh` runs `zig build test` with no filter, and a
+    // filtered run is a development convenience that cannot become the gate by
+    // accident.
+    const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose name contains one of these") orelse &.{};
+    const unit_tests = b.addTest(.{ .root_module = mod, .filters = test_filters });
     const run_unit = b.addRunArtifact(unit_tests);
 
     const test_step = b.step("test", "Run all tests");

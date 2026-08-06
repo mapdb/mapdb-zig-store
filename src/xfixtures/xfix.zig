@@ -62,6 +62,7 @@ const DataOutput2 = io.DataOutput2;
 const store_mod = @import("../store/mod.zig");
 const wal_mod = @import("../store/wal.zig");
 const StoreWAL = store_mod.StoreWAL;
+const StoreDirect = store_mod.StoreDirect;
 const segments = @import("../store/wal_segments.zig");
 const recover = @import("../store/wal_recover.zig");
 const iv = @import("../store/index_val.zig");
@@ -759,6 +760,56 @@ fn hexBytes(ctx: *Ctx, s: []const u8, line: []const u8) Error![]const u8 {
     return s;
 }
 
+/// `catalogue.ARG_VALUE_CHARS`, transcribed. TAB, `,` and `=` are absent by
+/// construction: they are the three separators the row is re-split on.
+const ARG_VALUE_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._@:/+-";
+
+/// An `action` row's argument spec, matching `catalogue.render_action_args`:
+/// `k=v` pairs joined by `,`, **keys in sorted order**, each key
+/// `[a-z][a-z0-9_]*`, each value nonempty and drawn from [`ARG_VALUE_CHARS`].
+///
+/// The sort order is CHECKED rather than normalised. The spec travels to
+/// [`runAction`] as a string and is compared, in todo's gate, against ONE
+/// rendering authority; a reader that accepted any order would accept a manifest
+/// python refuses, and the two roots would then disagree about what the same
+/// cell says.
+fn actionArgs(ctx: *Ctx, s: []const u8, line: []const u8) Error![]const u8 {
+    var prev: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse
+            return ctx.err("action argument `{s}` is not one k=v pair in: {s}", .{ pair, line });
+        if (eq == 0 or std.mem.count(u8, pair, "=") != 1)
+            return ctx.err("action argument `{s}` is not one k=v pair in: {s}", .{ pair, line });
+        const k = pair[0..eq];
+        const v = pair[eq + 1 ..];
+        if (k[0] < 'a' or k[0] > 'z')
+            return ctx.err("action argument key `{s}` is not [a-z][a-z0-9_]* in: {s}", .{ k, line });
+        for (k) |c| {
+            const ok = (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_';
+            if (!ok) return ctx.err("action argument key `{s}` is not [a-z][a-z0-9_]* in: {s}", .{ k, line });
+        }
+        if (prev) |p| {
+            if (!std.mem.lessThan(u8, p, k))
+                return ctx.err("action argument keys must be sorted and distinct: `{s}` follows `{s}` in: {s}", .{ k, p, line });
+        }
+        prev = k;
+        if (v.len == 0)
+            return ctx.err("action argument {s}={s}: the value must be nonempty and drawn from the pinned character class in: {s}", .{ k, v, line });
+        for (v) |c| {
+            if (std.mem.indexOfScalar(u8, ARG_VALUE_CHARS, c) == null)
+                return ctx.err("action argument {s}={s}: the value must be nonempty and drawn from the pinned character class in: {s}", .{ k, v, line });
+        }
+    }
+    return s;
+}
+
+/// The `(fixture, engine, mode)` triple two rows share when they address the
+/// same cell.
+fn cellEq(a: [3][]const u8, b: [3][]const u8) bool {
+    return eql(a[0], b[0]) and eql(a[1], b[1]) and eql(a[2], b[2]);
+}
+
 fn oneOf(ctx: *Ctx, s: []const u8, allowed: []const []const u8, what: []const u8, line: []const u8) Error![]const u8 {
     if (!contains(allowed, s))
         return ctx.err("unknown {s} `{s}` in: {s}", .{ what, s, line });
@@ -832,6 +883,54 @@ pub const V2Post = struct {
     sha: ?[]const u8 = null,
 };
 
+/// `applies <fid> <engine> <mode>` — a cell this corpus actually CONTAINS
+/// (contract §2.3, slice C5).
+///
+/// The preflight corpus's cell set is legitimately partial — 3 fixtures and 7
+/// cells for this engine, not `fixtures × modes` — so "every declared fixture
+/// owes one cell per mode" is the wrong cardinality rule for it. `applies` says
+/// which cells exist, and the corpus executor's rule becomes "the cells I ran
+/// are exactly the `applies` rows addressed to me".
+pub const V2Applies = struct {
+    fixture: []const u8,
+    engine: []const u8,
+    mode: []const u8,
+};
+
+/// `action <fid> <engine> <mode> <verb> <args>` — a post-open executor step.
+pub const V2Action = struct {
+    fixture: []const u8,
+    engine: []const u8,
+    mode: []const u8,
+    verb: []const u8,
+    /// The rendered `k=v,…` spec, kept as the STRING the row carried: todo's
+    /// gate compares it against `catalogue.render_action_args`'s single
+    /// rendering, so re-rendering it here would author a second authority.
+    arg_spec: []const u8,
+};
+
+/// `bytes <fid> <engine> <mode> <relName> <offset> <hex>` — an assertion against
+/// the CAPTURED POST bytes, never a pre-open patch (contract §2.3). Q8's input
+/// segment is 186 bytes and its assertion is at offset 187, so a pre-open
+/// reading is not merely wrong, it is out of range.
+pub const V2Bytes = struct {
+    fixture: []const u8,
+    engine: []const u8,
+    mode: []const u8,
+    rel: []const u8,
+    offset: u64,
+    hex: []const u8,
+};
+
+/// `reopen <fid> <engine> <mode> <family>` — after the cell's actions have run
+/// and the store has been closed, a SECOND open must fail with this family.
+pub const V2Reopen = struct {
+    fixture: []const u8,
+    engine: []const u8,
+    mode: []const u8,
+    family: []const u8,
+};
+
 pub const V1 = struct {
     fixtures: std.ArrayListUnmanaged(FixtureRow) = .empty,
     files: std.ArrayListUnmanaged(FileRow) = .empty,
@@ -851,18 +950,57 @@ pub const V1 = struct {
 pub const V2 = struct {
     fixtures: std.ArrayListUnmanaged(FixtureRow) = .empty,
     files: std.ArrayListUnmanaged(FileRow) = .empty,
+    applies: std.ArrayListUnmanaged(V2Applies) = .empty,
     expects: std.ArrayListUnmanaged(V2Expect) = .empty,
     posts: std.ArrayListUnmanaged(V2Post) = .empty,
+    actions: std.ArrayListUnmanaged(V2Action) = .empty,
+    byte_rows: std.ArrayListUnmanaged(V2Bytes) = .empty,
+    reopens: std.ArrayListUnmanaged(V2Reopen) = .empty,
     recids: std.ArrayListUnmanaged(RecidRow) = .empty,
     owned: Strings = .{},
 
     pub fn deinit(self: *V2, alloc: Allocator) void {
         self.fixtures.deinit(alloc);
         self.files.deinit(alloc);
+        self.applies.deinit(alloc);
         self.expects.deinit(alloc);
         self.posts.deinit(alloc);
+        self.actions.deinit(alloc);
+        self.byte_rows.deinit(alloc);
+        self.reopens.deinit(alloc);
         self.recids.deinit(alloc);
         self.owned.deinit(alloc);
+    }
+
+    /// The `action` rows addressed to one cell, in manifest order. Returned by
+    /// POINTER: the consumption accountant identifies a row by its address, so
+    /// a handler that grades a copy is a handler that graded a different object.
+    pub fn actionsOf(self: *const V2, fixture: []const u8, engine: []const u8, mode: []const u8, out: *std.ArrayListUnmanaged(*const V2Action), alloc: Allocator) !void {
+        for (self.actions.items) |*a| {
+            if (eql(a.fixture, fixture) and eql(a.engine, engine) and eql(a.mode, mode))
+                try out.append(alloc, a);
+        }
+    }
+
+    pub fn bytesOfCell(self: *const V2, fixture: []const u8, engine: []const u8, mode: []const u8, out: *std.ArrayListUnmanaged(*const V2Bytes), alloc: Allocator) !void {
+        for (self.byte_rows.items) |*b| {
+            if (eql(b.fixture, fixture) and eql(b.engine, engine) and eql(b.mode, mode))
+                try out.append(alloc, b);
+        }
+    }
+
+    pub fn reopensOf(self: *const V2, fixture: []const u8, engine: []const u8, mode: []const u8, out: *std.ArrayListUnmanaged(*const V2Reopen), alloc: Allocator) !void {
+        for (self.reopens.items) |*r| {
+            if (eql(r.fixture, fixture) and eql(r.engine, engine) and eql(r.mode, mode))
+                try out.append(alloc, r);
+        }
+    }
+
+    pub fn postsOf(self: *const V2, fixture: []const u8, engine: []const u8, mode: []const u8, out: *std.ArrayListUnmanaged(*const V2Post), alloc: Allocator) !void {
+        for (self.posts.items) |*p| {
+            if (eql(p.fixture, fixture) and eql(p.engine, engine) and eql(p.mode, mode))
+                try out.append(alloc, p);
+        }
     }
 };
 
@@ -1177,6 +1315,19 @@ fn parseV2(ctx: *Ctx, lines: *LineIter) Error!V2 {
             try arity(ctx, t, 6, line);
             try addFile(ctx, &m.files, t, line);
             try referenced.append(ctx.alloc, t.f[1]);
+        } else if (eql(tag, "applies")) {
+            try arity(ctx, t, 4, line);
+            const ap = V2Applies{
+                .fixture = t.f[1],
+                .engine = try oneOf(ctx, t.f[2], &ENGINES, "engine", line),
+                .mode = try oneOf(ctx, t.f[3], &MODES, "mode", line),
+            };
+            for (m.applies.items) |prior| {
+                if (cellEq(.{ prior.fixture, prior.engine, prior.mode }, .{ ap.fixture, ap.engine, ap.mode }))
+                    return ctx.err("duplicate applies row: {s}", .{line});
+            }
+            try m.applies.append(ctx.alloc, ap);
+            try referenced.append(ctx.alloc, t.f[1]);
         } else if (eql(tag, "expect")) {
             try arity(ctx, t, 7, line);
             const e = V2Expect{
@@ -1224,17 +1375,67 @@ fn parseV2(ctx: *Ctx, lines: *LineIter) Error!V2 {
             try referenced.append(ctx.alloc, t.f[1]);
         } else if (eql(tag, "edit")) {
             try editRow(ctx, t, line, &referenced);
+        } else if (eql(tag, "action")) {
+            try arity(ctx, t, 6, line);
+            const a = V2Action{
+                .fixture = t.f[1],
+                .engine = try oneOf(ctx, t.f[2], &ENGINES, "engine", line),
+                .mode = try oneOf(ctx, t.f[3], &MODES, "mode", line),
+                // The VERB is not vocabulary-checked here, for the reason the
+                // `reopen` family is not: `catalogue.ACTION_VERBS` is the
+                // authority, this engine implements a subset, and a parser list
+                // would accept a verb the executor then cannot run while going
+                // stale on its own. `runAction` refuses an unimplemented verb,
+                // which is both stricter and the refusal that matters.
+                .verb = t.f[4],
+                .arg_spec = try actionArgs(ctx, t.f[5], line),
+            };
+            // One row per cell per VERB, not per cell: `catalogue.actions` holds
+            // a list, so a second verb on one cell is a legal future shape and
+            // refusing it would refuse the corpus, not a defect.
+            for (m.actions.items) |prior| {
+                if (cellEq(.{ prior.fixture, prior.engine, prior.mode }, .{ a.fixture, a.engine, a.mode }) and eql(prior.verb, a.verb))
+                    return ctx.err("duplicate action row: {s}", .{line});
+            }
+            try m.actions.append(ctx.alloc, a);
+            try referenced.append(ctx.alloc, t.f[1]);
+        } else if (eql(tag, "reopen")) {
+            try arity(ctx, t, 5, line);
+            const r = V2Reopen{
+                .fixture = t.f[1],
+                .engine = try oneOf(ctx, t.f[2], &ENGINES, "engine", line),
+                .mode = try oneOf(ctx, t.f[3], &MODES, "mode", line),
+                // Not vocabulary-checked: `catalogue.FAMILIES` has eighteen
+                // members and this engine has a predicate for a handful, so a
+                // list here would accept a family `assertFamily` then refuses —
+                // two lists, one of which goes stale.
+                .family = t.f[4],
+            };
+            for (m.reopens.items) |prior| {
+                if (cellEq(.{ prior.fixture, prior.engine, prior.mode }, .{ r.fixture, r.engine, r.mode }))
+                    return ctx.err("duplicate reopen row: {s}", .{line});
+            }
+            try m.reopens.append(ctx.alloc, r);
+            try referenced.append(ctx.alloc, t.f[1]);
         } else if (eql(tag, "bytes")) {
             try arity(ctx, t, 7, line);
-            _ = try oneOf(ctx, t.f[2], &ENGINES, "engine", line);
-            _ = try oneOf(ctx, t.f[3], &MODES, "mode", line);
-            _ = try relName(ctx, t.f[4], line);
-            _ = try nat(ctx, t.f[5], line);
-            return ctx.err(
-                "a v2 `bytes` row, which this reader does not execute yet (C4 introduces the " ++
-                    "derived fixtures it describes): {s}",
-                .{line},
-            );
+            const b = V2Bytes{
+                .fixture = t.f[1],
+                .engine = try oneOf(ctx, t.f[2], &ENGINES, "engine", line),
+                .mode = try oneOf(ctx, t.f[3], &MODES, "mode", line),
+                .rel = try relName(ctx, t.f[4], line),
+                .offset = try nat(ctx, t.f[5], line),
+                .hex = try hexBytes(ctx, t.f[6], line),
+            };
+            // Keyed by cell AND (file, offset): a cell may assert several ranges,
+            // and two rows for the same range are a contradiction.
+            for (m.byte_rows.items) |prior| {
+                if (cellEq(.{ prior.fixture, prior.engine, prior.mode }, .{ b.fixture, b.engine, b.mode }) and
+                    eql(prior.rel, b.rel) and prior.offset == b.offset)
+                    return ctx.err("duplicate bytes row: {s}", .{line});
+            }
+            try m.byte_rows.append(ctx.alloc, b);
+            try referenced.append(ctx.alloc, t.f[1]);
         } else {
             return ctx.err("unknown v2 manifest row type `{s}`: {s}", .{ tag, line });
         }
@@ -1730,24 +1931,115 @@ pub fn assertEveryLoggedRecidIsClassified(
     }
 }
 
-/// Presence, symlinks NOT followed — the same discipline `wal_segments.isRegularFile`
-/// uses. `readFile(..) catch false` would turn a permission error, or the target
-/// having been replaced by a DIRECTORY, into "absent", so a `deleted` row would
-/// pass on a file that is very much still there in another shape.
+pub const InputFile = struct { rel: []const u8, bytes: []const u8 };
+
+/// Everything in the cell directory, by name, after the cell has run.
 ///
-/// Only `NotFound` means absent. Every other errno is REPORTED: `catch false`
-/// would make an I/O or permission failure indistinguishable from absence, which
-/// is the same defect one level down — a `deleted` row passing without anything
-/// having established that the file is gone. The C3z review named it.
-fn exists(ctx: *Ctx, dir: std.fs.Dir, name: []const u8, cell: []const u8) Error!bool {
-    _ = std.posix.fstatat(dir.fd, name, std.posix.AT.SYMLINK_NOFOLLOW) catch |e| switch (e) {
-        error.FileNotFound => return false,
-        else => return ctx.err("[{s}] cannot stat {s}: {s}", .{ cell, name, @errorName(e) }),
-    };
-    return true;
+/// The post-state rule reads THIS rather than the directory, because the cell's
+/// `reopen` step is an open: it happens not to rewrite a segment today, and
+/// "happens not to" is not a property to hash a corpus against. Presence is
+/// decided by the capture's key set.
+///
+/// A name that is present but is not a REGULAR file is refused here rather than
+/// read as absent — `readFile(..) catch null` would turn a permission error, or
+/// a file replaced by a directory of the same name, into "the file is gone", so
+/// a `deleted` row would pass on something very much still there in another
+/// shape. The C3r review named that one.
+pub const Capture = struct {
+    items: std.ArrayListUnmanaged(struct { name: []const u8, bytes: []u8 }) = .empty,
+    names: Strings = .{},
+
+    pub fn deinit(self: *Capture, alloc: Allocator) void {
+        for (self.items.items) |f| alloc.free(f.bytes);
+        self.items.deinit(alloc);
+        self.names.deinit(alloc);
+    }
+
+    pub fn get(self: *const Capture, name: []const u8) ?[]const u8 {
+        for (self.items.items) |f| {
+            if (eql(f.name, name)) return f.bytes;
+        }
+        return null;
+    }
+};
+
+pub fn capture(ctx: *Ctx, dir: std.fs.Dir, cell: []const u8) Error!Capture {
+    var out = Capture{};
+    errdefer out.deinit(ctx.alloc);
+    var it = dir.iterate();
+    while (it.next() catch |e| return ctx.err("[{s}] cannot list the cell dir: {s}", .{ cell, @errorName(e) })) |entry| {
+        const st = std.posix.fstatat(dir.fd, entry.name, std.posix.AT.SYMLINK_NOFOLLOW) catch |e|
+            return ctx.err("[{s}] cannot stat {s}: {s}", .{ cell, entry.name, @errorName(e) });
+        if (!std.posix.S.ISREG(st.mode))
+            return ctx.err("[{s}] {s} is not a regular file", .{ cell, entry.name });
+        const name = try out.names.add(ctx.alloc, "{s}", .{entry.name});
+        const bytes = dir.readFileAlloc(ctx.alloc, entry.name, 256 * 1024 * 1024) catch |e|
+            return ctx.err("[{s}] cannot read {s}: {s}", .{ cell, entry.name, @errorName(e) });
+        try out.items.append(ctx.alloc, .{ .name = name, .bytes = bytes });
+    }
+    return out;
 }
 
-pub const InputFile = struct { rel: []const u8, bytes: []const u8 };
+/// The oracle rows one cell owes, and which of them a handler actually ran.
+///
+/// It is the ONE mechanism standing between "executes" and "parses and drops"
+/// for three of the four addressed oracle row types — every one except `action`,
+/// which has a failure of its own. The whole-file `post` hash subsumes a
+/// byte-at-offset assertion, the two-sided unnamed-input rule silently
+/// re-verifies a file whose **`unchanged`** row was dropped, and *nothing at
+/// all* observes a dropped `reopen`.
+///
+/// A row is identified by a key AND by its ADDRESS: consuming the right key with
+/// a different row is how a handler that grades the wrong object still balances
+/// the books.
+pub const Consumption = struct {
+    const Row = struct { key: []const u8, at: usize, done: bool };
+
+    ctx_label: []const u8,
+    owed: std.ArrayListUnmanaged(Row) = .empty,
+    keys: Strings = .{},
+
+    pub fn init(label: []const u8) Consumption {
+        return .{ .ctx_label = label };
+    }
+
+    pub fn deinit(self: *Consumption, alloc: Allocator) void {
+        self.owed.deinit(alloc);
+        self.keys.deinit(alloc);
+    }
+
+    pub fn owe(self: *Consumption, ctx: *Ctx, comptime fmt: []const u8, args: anytype, row: anytype) Error!void {
+        const key = try self.keys.add(ctx.alloc, fmt, args);
+        for (self.owed.items) |o| {
+            if (eql(o.key, key)) return ctx.err("[{s}] two oracle rows share the key {s}", .{ self.ctx_label, key });
+        }
+        try self.owed.append(ctx.alloc, .{ .key = key, .at = @intFromPtr(row), .done = false });
+    }
+
+    pub fn consume(self: *Consumption, ctx: *Ctx, comptime fmt: []const u8, args: anytype, row: anytype) Error!void {
+        var buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, fmt, args) catch return ctx.err("[{s}] consumption key too long", .{self.ctx_label});
+        for (self.owed.items) |*o| {
+            if (!eql(o.key, key)) continue;
+            if (o.at != @intFromPtr(row))
+                return ctx.err("[{s}] consumed {s} with a different row", .{ self.ctx_label, key });
+            if (o.done) return ctx.err("[{s}] consumed {s} twice", .{ self.ctx_label, key });
+            o.done = true;
+            return;
+        }
+        return ctx.err("[{s}] consumed {s}, which was never owed", .{ self.ctx_label, key });
+    }
+
+    pub fn requireAllConsumed(self: *const Consumption, ctx: *Ctx) Error!void {
+        for (self.owed.items) |o| {
+            if (!o.done)
+                return ctx.err(
+                    "[{s}] no handler consumed: {s}. A parsed-and-dropped assertion is a green cell that checked nothing",
+                    .{ self.ctx_label, o.key },
+                );
+        }
+    }
+};
 
 /// The two-sided D6 post-state rule.
 ///
@@ -1758,33 +2050,53 @@ pub const InputFile = struct { rel: []const u8, bytes: []const u8 };
 /// input nor named must not exist at all. Without the second side a cell that
 /// deleted a segment and wrote three new ones would pass by saying nothing about
 /// them.
+/// **Each sized verb states a RELATION to the input, and grading the length and
+/// hash alone leaves that relation as decoration.** C5r's round-3 review found
+/// exactly that in the rust executor — a file that GREW satisfied `truncated`
+/// and a file that did not change at all satisfied `modified` — and `NEXT.md`
+/// rev 26 item 8 hands the same two relations to this engine. `truncated` means
+/// the post bytes are a PROPER PREFIX of the input (contract §10.1: "truncated
+/// back to its last valid section end"), and `modified` means the bytes changed
+/// AND are not a pure truncation, because two verbs that can describe the same
+/// shape are two verbs neither of which is a claim.
+///
+/// Each relation is ONE statement, not two. Written as a pair, the shrink half
+/// has no red of its own: a file that grew fails the prefix comparison anyway,
+/// so deleting the length half changes nothing. But the collapse buys freedom
+/// from masking and not coverage — round 4 measured `<` regressing to `<=` with
+/// a whole gate green — so each half is given its OWN input in the battery and
+/// its own mutant.
 pub fn assertPostState(
     ctx: *Ctx,
-    dir: std.fs.Dir,
     before: []const InputFile,
-    posts: []const V2Post,
+    after: *const Capture,
+    posts: []const *const V2Post,
     cell: []const u8,
+    owed: *Consumption,
 ) Error!void {
     for (posts) |p| {
-        const present = try exists(ctx, dir, p.rel, cell);
         var was_input: ?[]const u8 = null;
         for (before) |b| {
             if (eql(b.rel, p.rel)) was_input = b.bytes;
         }
+        const now_opt = after.get(p.rel);
         if (eql(p.verb, "deleted")) {
             // §2.1: a post row is an explicit OVERRIDE of an input or an explicit
             // NEW file. `deleted` is an override, so it must name something the
             // cell actually started with.
             if (was_input == null)
                 return ctx.err("[{s}] `deleted` names {s}, which was never an input", .{ cell, p.rel });
-            if (present)
+            if (now_opt != null)
                 return ctx.err("[{s}] {s} must not exist after the cell", .{ cell, p.rel });
         } else if (eql(p.verb, "unchanged")) {
             const was = was_input orelse
                 return ctx.err("[{s}] `unchanged` names {s}, which was never an input", .{ cell, p.rel });
-            const now = dir.readFileAlloc(ctx.alloc, p.rel, 256 * 1024 * 1024) catch |e|
-                return ctx.err("[{s}] cannot read {s}: {s}", .{ cell, p.rel, @errorName(e) });
-            defer ctx.alloc.free(now);
+            // Absent-before/absent-after is its own quadrant: `null == null`, so
+            // an equality alone cannot establish that an `unchanged` row names an
+            // input file at all. The check above is what refuses it, and the
+            // battery gives it an input.
+            const now = now_opt orelse
+                return ctx.err("[{s}] `unchanged` names {s}, which is gone after the cell", .{ cell, p.rel });
             if (!eql(now, was))
                 return ctx.err("[{s}] {s} must be byte-unchanged", .{ cell, p.rel });
         } else {
@@ -1806,16 +2118,29 @@ pub fn assertPostState(
                     .{ cell, p.verb, p.rel },
                 );
             }
-            if (!present) return ctx.err("[{s}] {s} must exist after the cell", .{ cell, p.rel });
-            const now = dir.readFileAlloc(ctx.alloc, p.rel, 256 * 1024 * 1024) catch |e|
-                return ctx.err("[{s}] cannot read {s}: {s}", .{ cell, p.rel, @errorName(e) });
-            defer ctx.alloc.free(now);
+            const now = now_opt orelse
+                return ctx.err("[{s}] {s} must exist after the cell", .{ cell, p.rel });
             if (now.len != p.len.?)
                 return ctx.err("[{s}] {s} length after the cell: {d}, want {d}", .{ cell, p.rel, now.len, p.len.? });
             const sha = sha256Hex(now);
             if (!eql(&sha, p.sha.?))
                 return ctx.err("[{s}] {s} content after the cell: {s}, want {s}", .{ cell, p.rel, &sha, p.sha.? });
+            if (eql(p.verb, "truncated")) {
+                const was = was_input.?;
+                if (!(now.len < was.len and eql(was[0..now.len], now)))
+                    return ctx.err(
+                        "[{s}] `truncated` must name a PROPER PREFIX of the input — {s} was {d} bytes and is now {d}",
+                        .{ cell, p.rel, was.len, now.len },
+                    );
+            } else if (eql(p.verb, "modified")) {
+                const was = was_input.?;
+                if (eql(now, was))
+                    return ctx.err("[{s}] `modified` names {s}, whose bytes did not change", .{ cell, p.rel });
+                if (now.len < was.len and eql(was[0..now.len], now))
+                    return ctx.err("[{s}] `modified` names {s}, which is a pure truncation — that is `truncated`", .{ cell, p.rel });
+            }
         }
+        try owed.consume(ctx, "post {s}", .{p.rel}, p);
     }
 
     for (before) |b| {
@@ -1824,15 +2149,13 @@ pub fn assertPostState(
             if (eql(p.rel, b.rel)) named = true;
         }
         if (named) continue;
-        const now = dir.readFileAlloc(ctx.alloc, b.rel, 256 * 1024 * 1024) catch |e|
-            return ctx.err("[{s}] {s} is named by no post row, so it must still be there: {s}", .{ cell, b.rel, @errorName(e) });
-        defer ctx.alloc.free(now);
+        const now = after.get(b.rel) orelse
+            return ctx.err("[{s}] {s} is named by no post row, so it must still be there", .{ cell, b.rel });
         if (!eql(now, b.bytes))
             return ctx.err("[{s}] unnamed input {s} changed", .{ cell, b.rel });
     }
 
-    var it = dir.iterate();
-    while (it.next() catch |e| return ctx.err("[{s}] cannot list the cell dir: {s}", .{ cell, @errorName(e) })) |entry| {
+    for (after.items.items) |entry| {
         var known = false;
         for (before) |b| {
             if (eql(b.rel, entry.name)) known = true;
@@ -1858,58 +2181,364 @@ pub fn assertPostState(
 /// gate. The `rw` half rolls back rather than committing, and the post-state rule
 /// that runs immediately afterwards is what proves the rollback left no trace: if
 /// an uncommitted preallocate ever reached the log, this cell would fail there.
-pub fn assertWriteGate(ctx: *Ctx, s: *StoreWAL, mode: []const u8, cell: []const u8) Error!void {
+/// The branch the probe actually took.
+///
+/// It is RETURNED rather than recorded by the caller from the mode it passed in,
+/// so the executor's `ro_probed` bookkeeping cannot run unless this function did:
+/// C5j's round 2 found the java form of that bookkeeping recording that its own
+/// housekeeping had run rather than that the probe had, and the answer here is to
+/// make the witness a value the probe produces.
+pub const WriteGate = enum { rw_rolled_back, ro_refused };
+
+pub fn assertWriteGate(ctx: *Ctx, s: *StoreWAL, mode: []const u8, cell: []const u8) Error!WriteGate {
     if (eql(mode, "ro")) {
         if (s.preallocate()) |recid| {
             return ctx.err("[{s}] a read-only handle preallocated recid {d}", .{ cell, recid });
         } else |e| if (e != error.ReadOnly) {
             return ctx.err("[{s}] a read-only handle refused a write with {s}, not ReadOnly", .{ cell, @errorName(e) });
         }
+        return .ro_refused;
     } else {
         _ = s.preallocate() catch |e|
             return ctx.err("[{s}] a read-write handle refused a preallocate: {s}", .{ cell, @errorName(e) });
         s.rollback() catch |e|
             return ctx.err("[{s}] rollback failed: {s}", .{ cell, @errorName(e) });
+        return .rw_rolled_back;
     }
 }
 
-/// Runs every schema-v2 cell addressed to this engine in `mode`, and asserts the
-/// set that ran is **exactly** the set the `fixture` rows call for.
+// ---------------------------------------------------------------------------
+// The oracle rows — C5z
+// ---------------------------------------------------------------------------
+
+/// The action verb this engine implements, and the arguments it takes.
 ///
-/// The expected set comes from the `fixture` rows, NOT from the `expect` rows the
-/// executor is about to run: a count, or the set of modes actually seen, is a
-/// projection of the already-truncated input, and the C3j review deleted one
-/// `expect` row and left the java suite green because another fixture still
-/// supplied that mode.
+/// **This engine ACCEPTS AND ACCOUNTS; it is not addressed.** `Cell.actions`,
+/// `Cell.byte_assertions` and `Cell.reopen` exist on exactly one cell of the
+/// corpus and are keyed `("java", "rw")`, so no corpus will ever carry an
+/// `action`, `bytes` or `reopen` row addressed to zig (C5 plan §5.3 item 2).
+/// Manufacturing one in the fixture root to give this code an input would be
+/// fixture theatre; the inputs come from SYNTHETIC manifests in the test file,
+/// routed through the production path.
 ///
-/// C-D3 costs this port nothing: `WalOptions.read_only` is `pub` and this suite
-/// is in-package, so both modes run here and neither needs new public surface.
-pub fn runV2Cells(ctx: *Ctx, sample: *const SampleV2, mode: []const u8, tmp: std.fs.Dir) Error!void {
-    const m = &sample.manifest;
-    if (m.fixtures.items.len == 0) return ctx.err("the v2 sample declares no fixtures", .{});
+/// **Every refusal below is its own SITE with its own input.** C5r needed to be
+/// told twice that one case per METHOD is not one case per BRANCH: the five
+/// per-key reads and the two integer parses are separate sites, and one mutation
+/// of a shared helper is proof for none of them.
+///
+/// `recid_label`'s VALUE is deliberately unobserved: §5.2 pins labels and not
+/// the numbers an engine hands out, so the label travels into the result line
+/// and nothing here compares it to anything.
+pub fn runAction(ctx: *Ctx, s: *StoreWAL, verb: []const u8, arg_spec: []const u8) Error!void {
+    if (!eql(verb, "commit_one_record"))
+        return ctx.err("unknown action verb: {s}", .{verb});
+    const known = [_][]const u8{ "op", "payload_id", "payload_len", "recid_label", "serializer" };
 
-    var ran: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer ran.deinit(ctx.alloc);
+    var keys: [8][]const u8 = undefined;
+    var vals: [8][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, arg_spec, ',');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse
+            return ctx.err("action argument is not k=v: {s}", .{pair});
+        if (n == keys.len) return ctx.err("too many action arguments: {s}", .{arg_spec});
+        keys[n] = pair[0..eq];
+        vals[n] = pair[eq + 1 ..];
+        for (keys[0..n]) |prior| {
+            if (eql(prior, keys[n])) return ctx.err("action argument repeated: {s}", .{keys[n]});
+        }
+        if (!contains(&known, keys[n]))
+            return ctx.err("unknown argument {s} for {s}; it takes op,payload_id,payload_len,recid_label,serializer", .{ keys[n], verb });
+        n += 1;
+    }
 
-    for (m.expects.items, 0..) |e, i| {
-        if (!eql(e.engine, ENGINE) or !eql(e.mode, mode)) continue;
+    const op = try argValue(ctx, keys[0..n], vals[0..n], "op", verb);
+    const label = try argValue(ctx, keys[0..n], vals[0..n], "recid_label", verb);
+    const payload_id_s = try argValue(ctx, keys[0..n], vals[0..n], "payload_id", verb);
+    const payload_len_s = try argValue(ctx, keys[0..n], vals[0..n], "payload_len", verb);
+    const ser = try argValue(ctx, keys[0..n], vals[0..n], "serializer", verb);
+    const payload_id = std.fmt.parseInt(u64, payload_id_s, 10) catch
+        return ctx.err("payload_id is not an integer: {s}", .{payload_id_s});
+    const payload_len = std.fmt.parseInt(usize, payload_len_s, 10) catch
+        return ctx.err("payload_len is not an integer: {s}", .{payload_len_s});
+    if (!eql(op, "put")) return ctx.err("commit_one_record: unimplemented op {s}", .{op});
+    if (!eql(ser, "raw")) return ctx.err("commit_one_record: unimplemented serializer {s}", .{ser});
+    _ = label;
 
+    const content = try payload(ctx.alloc, payload_id, payload_len);
+    defer ctx.alloc.free(content);
+    _ = s.put([]const u8, ctx.alloc, content, R) catch |e|
+        return ctx.err("commit_one_record: put failed: {s}", .{@errorName(e)});
+    s.commit() catch |e|
+        return ctx.err("commit_one_record: commit failed: {s}", .{@errorName(e)});
+}
+
+fn argValue(ctx: *Ctx, keys: []const []const u8, vals: []const []const u8, k: []const u8, verb: []const u8) Error![]const u8 {
+    for (keys, vals) |kk, vv| {
+        if (eql(kk, k)) return vv;
+    }
+    return ctx.err("action argument {s} is required by {s}", .{ k, verb });
+}
+
+/// A refused open, with the typed diagnostic the refusal carried.
+///
+/// **This is the zig deviation, and it is the stronger reading.** rust's
+/// `assert_family` matches the S2 rule's rendered MESSAGE, because `DbError`
+/// there carries a formatted payload. Here `DbError` carries no payload and the
+/// engine has a typed side channel instead (B1's `Diag`), so the family
+/// predicate asserts the reason by IDENTITY against the engine's own constant
+/// rather than by parsing prose.
+pub const Refusal = struct { err: DbError, diag: recover.Diag };
+
+/// Opens through the named opener and returns the refusal, or `null` if the
+/// store opened (and closed).
+fn refusalOf(ctx: *Ctx, opener: []const u8, mode: []const u8, base: []const u8, cell: []const u8) Error!?Refusal {
+    if (eql(opener, "direct")) {
+        if (!eql(mode, "rw"))
+            return ctx.err("[{s}] the direct opener has no read-only mode here", .{cell});
+        if (StoreDirect.openFile(ctx.alloc, base, false)) |*opened| {
+            var d = opened.*;
+            d.close() catch {};
+            d.deinit();
+            return null;
+        } else |e| return Refusal{ .err = e, .diag = .{} };
+    }
+    var diag: recover.Diag = .{};
+    const opts = wal_mod.WalOptions{ .read_only = eql(mode, "ro"), .diag = &diag };
+    if (StoreWAL.openCfg(ctx.alloc, base, opts)) |*opened| {
+        var s = opened.*;
+        s.close() catch {};
+        s.deinit();
+        return null;
+    } else |e| return Refusal{ .err = e, .diag = diag };
+}
+
+/// Asserts a refusal belongs to the named contract family.
+///
+/// The family is READ FROM THE MANIFEST ROW, never hard-coded, so editing
+/// `catalogue.reopen` stops the run instead of being graded against a constant
+/// this file happens to agree with. A family this engine has no predicate for is
+/// a **failure**: the alternative is a green cell whose reopen was checked by
+/// nothing.
+pub fn assertFamily(ctx: *Ctx, where: []const u8, family: []const u8, r: Refusal) Error!void {
+    if (eql(family, "S2")) {
+        // ONE statement for a claim with two halves: the refusal is a corruption
+        // verdict AND the diagnostic beside it is the S2 rule's reason. Written
+        // as two, either half can be deleted with the other refusing the same
+        // input — which is lesson (h) inside the predicate. Each half is given
+        // its own input by `theReopenFamilyPredicateDiscriminates`, because the
+        // collapse buys freedom from masking and not coverage.
+        if (!(r.err == error.DataCorruption and eql(r.diag.reason, recover.H_LSN_BACK)))
+            return ctx.err(
+                "{s}: not the S2 rule's refusal — it must be a corruption verdict whose diagnostic reason is `{s}`, and this is {s}/`{s}`",
+                .{ where, recover.H_LSN_BACK, @errorName(r.err), r.diag.reason },
+            );
+        return;
+    }
+    if (eql(family, "StoreFull")) {
+        // Q8's family in this engine, and the one the corpus's own reject verdict
+        // for `div-wal3-lsn-exhausted` produces — MEASURED, not inherited: a WAL
+        // segment namespace with no sequence number left is a capacity ceiling
+        // with nothing damaged, so the port refuses to call an intact store
+        // corrupt. Contract §10.1 pins it. A second family is also what makes
+        // the family READING falsifiable: a predicate with one member cannot be
+        // shown to read the row.
+        if (r.err != error.StoreFull)
+            return ctx.err("{s}: StoreFull is a capacity verdict, got {s}", .{ where, @errorName(r.err) });
+        return;
+    }
+    return ctx.err(
+        "{s}: error family {s} has no predicate in this engine. Refusing rather than accepting any refusal at all — an unimplemented family graded as `it threw something` is the check not running",
+        .{ where, family },
+    );
+}
+
+/// Grades every `bytes` row against the CAPTURED post bytes (contract §2.3).
+///
+/// Never a pre-open patch: Q8's input segment is 186 bytes and its assertion is
+/// at offset 187, so a pre-open reading is not merely wrong, it is out of range.
+/// An assertion whose range cannot be reached is a failure, never a skip.
+fn assertBytesRows(
+    ctx: *Ctx,
+    m: *const V2,
+    e: V2Expect,
+    after: *const Capture,
+    cell: []const u8,
+    owed: *Consumption,
+) Error!void {
+    var rows: std.ArrayListUnmanaged(*const V2Bytes) = .empty;
+    defer rows.deinit(ctx.alloc);
+    try m.bytesOfCell(e.fixture, ENGINE, e.mode, &rows, ctx.alloc);
+    for (rows.items) |b| {
+        const now = after.get(b.rel) orelse
+            return ctx.err("[{s}] bytes[{s}@{d}]: names a file the cell directory does not hold", .{ cell, b.rel, b.offset });
+        const len = b.hex.len / 2;
+        const end = b.offset + len;
+        if (end > now.len)
+            return ctx.err("[{s}] bytes[{s}@{d}]: the range ends at {d} and the post state is {d} bytes", .{ cell, b.rel, b.offset, end, now.len });
+        var got_buf: [64]u8 = undefined;
+        if (len > got_buf.len / 2)
+            return ctx.err("[{s}] bytes[{s}@{d}]: assertion longer than this reader renders", .{ cell, b.rel, b.offset });
+        const got = std.fmt.bufPrint(&got_buf, "{x}", .{now[b.offset..end]}) catch unreachable;
+        if (!eql(got, b.hex))
+            return ctx.err("[{s}] bytes[{s}@{d}]: the asserted bytes are {s}, want {s}", .{ cell, b.rel, b.offset, got, b.hex });
+        try owed.consume(ctx, "bytes {s}@{d}", .{ b.rel, b.offset }, b);
+    }
+}
+
+/// After the cell's actions have run and the store has been closed, a SECOND
+/// open must fail with the family the row names.
+fn assertReopen(
+    ctx: *Ctx,
+    m: *const V2,
+    e: V2Expect,
+    base: []const u8,
+    cell: []const u8,
+    owed: *Consumption,
+) Error!void {
+    var rows: std.ArrayListUnmanaged(*const V2Reopen) = .empty;
+    defer rows.deinit(ctx.alloc);
+    try m.reopensOf(e.fixture, ENGINE, e.mode, &rows, ctx.alloc);
+    for (rows.items) |r| {
+        var where_buf: [256]u8 = undefined;
+        const where = std.fmt.bufPrint(&where_buf, "[{s}] reopen[{s}]", .{ cell, r.family }) catch cell;
+        // A reopen is a WRITABLE open whatever the cell's own mode was: the claim
+        // is that the store is permanently unopenable, and a read-only probe
+        // would be a weaker one.
+        const refusal = try refusalOf(ctx, "wal3", "rw", base, where) orelse
+            return ctx.err("{s}: the store opened again", .{where});
+        try assertFamily(ctx, where, r.family, refusal);
+        try owed.consume(ctx, "reopen {s}", .{r.family}, r);
+    }
+}
+
+/// Which opener a cell is dispatched through.
+///
+/// `always_wal3` exists for §3.11's mutant and for nothing else: routing the
+/// `direct` row through the WAL opener must turn the suite red, and a deletion
+/// that merely restores an `opener == wal3` refusal proves only parser branching.
+///
+/// **C5z measured both halves of §3.11 rather than inheriting them, and zig is
+/// the ports' case exactly as the section predicts.** `StoreDirect.openFile`
+/// refuses the bare segment (`DataCorruption`, bad magic) and leaves the
+/// directory holding `{x}` — it takes no `<base>.lock`, so
+/// `catalogue.DIRECT_OPENER_LOCKS["zig"] = False` is now a measurement.
+/// `StoreWAL.openCfg` on the same path refuses it as D1 — a regular file at the
+/// WAL base path — but takes the lock BEFORE the check and leaves `{x, x.lock}`.
+/// Both openers reject, so the verdict discriminates nothing; the stray lock
+/// does, against the two-sided file-set rule.
+pub const Dispatch = enum { by_manifest, always_wal3 };
+
+/// Runs schema-v2 cells against this engine — the single executor for BOTH v2
+/// roots.
+///
+/// **Why one type and not two.** `data-v2/` is the static `v2-core` sample and
+/// `data-v2-corpus/` is the `v2-oracle` preflight root; they differ in which rows
+/// they carry, not in what a cell means. Two executors would be two
+/// implementations of the post-state rule, the opener dispatch and the reader
+/// contract, and this workstream has already shipped the consequence twice — a
+/// fix applied to one of two copies is a fix that did not happen (C2j's
+/// B-finding). What legitimately differs is the CARDINALITY rule, and that lives
+/// in the callers.
+pub const Cells = struct {
+    sample: *const SampleV2,
+    /// The `fixtureId/mode` of every `ro` accept cell whose read-only handle was
+    /// actually probed with a write.
+    ///
+    /// This exists so the probe is not a LEAF. Deleting the `if (ro) probe` call
+    /// leaves nothing to observe: the standalone discriminating test opens the
+    /// read-only handle itself, so it cannot see the executor skipping the call.
+    /// A set the caller compares against the cells it ran turns the deletion into
+    /// an empty set and a red gate.
+    ro_probed: std.ArrayListUnmanaged([]const u8) = .empty,
+    owned: Strings = .{},
+
+    pub fn deinit(self: *Cells, alloc: Allocator) void {
+        self.ro_probed.deinit(alloc);
+        self.owned.deinit(alloc);
+    }
+
+    /// Every `action`/`bytes`/`reopen`/`post` row addressed to this engine in
+    /// `mode` must name a cell the engine actually runs.
+    ///
+    /// **Per-cell consumption cannot see this**, and both C5j reviewers proved it
+    /// independently: the accountant is built from the rows addressed to the cell
+    /// BEING RUN, so a row addressed to a `(fixture, mode)` with no `expect` row
+    /// is owed by nobody, consumed by nobody and graded by nobody. Contract §2.3
+    /// says an addressed row no handler consumed is a failure, and this is the
+    /// half of that sentence per-cell accounting cannot reach.
+    pub fn requireEveryOracleRowAddressesARunCell(
+        self: *const Cells,
+        ctx: *Ctx,
+        mode: []const u8,
+        ran: []const []const u8,
+    ) Error!void {
+        const m = &self.sample.manifest;
+        for (m.actions.items) |a| {
+            if (eql(a.engine, ENGINE) and eql(a.mode, mode) and !contains(ran, a.fixture))
+                return ctx.err("an oracle row addressed to {s} whose cell this engine never ran: action {s}/{s} {s}", .{ ENGINE, a.fixture, a.mode, a.verb });
+        }
+        for (m.byte_rows.items) |b| {
+            if (eql(b.engine, ENGINE) and eql(b.mode, mode) and !contains(ran, b.fixture))
+                return ctx.err("an oracle row addressed to {s} whose cell this engine never ran: bytes {s}/{s} {s}", .{ ENGINE, b.fixture, b.mode, b.rel });
+        }
+        for (m.reopens.items) |r| {
+            if (eql(r.engine, ENGINE) and eql(r.mode, mode) and !contains(ran, r.fixture))
+                return ctx.err("an oracle row addressed to {s} whose cell this engine never ran: reopen {s}/{s} {s}", .{ ENGINE, r.fixture, r.mode, r.family });
+        }
+        // `post` is the FOURTH addressed row type. C5j's round 2 found that
+        // nothing on either side of the fence caught one addressed to a cell no
+        // engine runs; §2.3 names it now, and it has a per-cell debt as well.
+        for (m.posts.items) |p| {
+            if (eql(p.engine, ENGINE) and eql(p.mode, mode) and !contains(ran, p.fixture))
+                return ctx.err("an oracle row addressed to {s} whose cell this engine never ran: post {s}/{s} {s}", .{ ENGINE, p.fixture, p.mode, p.rel });
+        }
+    }
+
+    /// Runs ONE cell: stage the inputs, open through the opener the `expect` row
+    /// names, grade every oracle row addressed here, and account for all of them.
+    pub fn runCell(
+        self: *Cells,
+        ctx: *Ctx,
+        e: V2Expect,
+        cell_dir: std.fs.Dir,
+        dispatch: Dispatch,
+    ) Error!void {
+        const m = &self.sample.manifest;
         var cell_buf: [256]u8 = undefined;
-        const cell = std.fmt.bufPrint(&cell_buf, "v2 cell {d}: fixture={s} mode={s} verdict={s} opener={s} openArg={s}", .{
-            i, e.fixture, e.mode, e.verdict, e.opener, e.open_arg,
+        const cell = std.fmt.bufPrint(&cell_buf, "v2 cell[{s} {s} {s} {s} {s}]", .{
+            e.fixture, ENGINE, e.mode, e.verdict, e.opener,
         }) catch "v2 cell";
-        if (!eql(e.opener, "wal3"))
-            return ctx.err("[{s}] the only v2 opener this reader executes is `wal3`", .{cell});
 
-        var name_buf: [64]u8 = undefined;
-        const cell_name = std.fmt.bufPrint(&name_buf, "v2-{s}-{d}", .{ mode, i }) catch unreachable;
-        var cell_dir = tmp.makeOpenPath(cell_name, .{ .iterate = true }) catch |err|
-            return ctx.err("[{s}] cannot create the cell dir: {s}", .{ cell, @errorName(err) });
-        defer cell_dir.close();
+        // Every oracle row addressed to this cell, and nothing else. Rows are
+        // struck off as they are consumed; what is left at the end is a claim the
+        // executor was handed and dropped.
+        var owed = Consumption.init(cell);
+        defer owed.deinit(ctx.alloc);
+
+        var actions: std.ArrayListUnmanaged(*const V2Action) = .empty;
+        defer actions.deinit(ctx.alloc);
+        try m.actionsOf(e.fixture, ENGINE, e.mode, &actions, ctx.alloc);
+        for (actions.items) |a| try owed.owe(ctx, "action {s}", .{a.verb}, a);
+
+        var byte_rows: std.ArrayListUnmanaged(*const V2Bytes) = .empty;
+        defer byte_rows.deinit(ctx.alloc);
+        try m.bytesOfCell(e.fixture, ENGINE, e.mode, &byte_rows, ctx.alloc);
+        for (byte_rows.items) |b| try owed.owe(ctx, "bytes {s}@{d}", .{ b.rel, b.offset }, b);
+
+        var reopens: std.ArrayListUnmanaged(*const V2Reopen) = .empty;
+        defer reopens.deinit(ctx.alloc);
+        try m.reopensOf(e.fixture, ENGINE, e.mode, &reopens, ctx.alloc);
+        for (reopens.items) |r| try owed.owe(ctx, "reopen {s}", .{r.family}, r);
+
+        var posts: std.ArrayListUnmanaged(*const V2Post) = .empty;
+        defer posts.deinit(ctx.alloc);
+        try m.postsOf(e.fixture, ENGINE, e.mode, &posts, ctx.alloc);
+        for (posts.items) |p| try owed.owe(ctx, "post {s}", .{p.rel}, p);
 
         var before: std.ArrayListUnmanaged(InputFile) = .empty;
         defer before.deinit(ctx.alloc);
-        for (sample.files.items) |f| {
+        for (self.sample.files.items) |f| {
             if (!eql(f.fixture, e.fixture)) continue;
             cell_dir.writeFile(.{ .sub_path = f.rel, .data = f.bytes }) catch |err|
                 return ctx.err("[{s}] cannot place {s}: {s}", .{ cell, f.rel, @errorName(err) });
@@ -1924,41 +2553,262 @@ pub fn runV2Cells(ctx: *Ctx, sample: *const SampleV2, mode: []const u8, tmp: std
         const base = try std.fs.path.join(ctx.alloc, &.{ cell_abs, e.open_arg });
         defer ctx.alloc.free(base);
 
-        const opts = wal_mod.WalOptions{ .read_only = eql(mode, "ro") };
+        const opener = switch (dispatch) {
+            .always_wal3 => "wal3",
+            .by_manifest => e.opener,
+        };
         if (eql(e.verdict, "accept")) {
-            var s = StoreWAL.openCfg(ctx.alloc, base, opts) catch |err|
-                return ctx.err("[{s}] accept cell failed to open: {s}", .{ cell, @errorName(err) });
-            defer s.deinit();
-            try assertReaderContract(ctx, &s, m.recids.items, e.fixture, cell);
-            try assertEveryLoggedRecidIsClassified(ctx, &s, sample, e.fixture, cell);
-            try assertWriteGate(ctx, &s, mode, cell);
-            s.close() catch |err| return ctx.err("[{s}] close failed: {s}", .{ cell, @errorName(err) });
+            try self.runAccept(ctx, e, opener, base, cell, &owed, actions.items);
         } else if (eql(e.verdict, "reject")) {
-            if (StoreWAL.openCfg(ctx.alloc, base, opts)) |*opened| {
-                var s = opened.*;
-                s.deinit();
-                return ctx.err("[{s}] reject cell opened successfully", .{cell});
-            } else |err| if (err != error.DataCorruption) {
-                return ctx.err("[{s}] expected error.DataCorruption, got {s}", .{ cell, @errorName(err) });
-            }
+            // A `reject` cell asserts that the open FAILED. It does not assert
+            // WHICH failure, and that is a TRANSPORT HOLE rather than a widening
+            // chosen here (C5 plan §3.12). This engine's four reject cells refuse
+            // in two families — `DataCorruption` for the two derived reject
+            // images and `StoreFull` for `div-wal3-lsn-exhausted`, which contract
+            // §10.1 pins exactly — and the v2 `expect` row has NO COLUMN to carry
+            // it. Requiring `DataCorruption` here refuses the corpus; requiring
+            // nothing accepts a store that refused Q8 for a bug reason.
+            //
+            // The grammar already has the row type that would close it: a
+            // `reopen` row carries a family. Emitting one per reject cell
+            // regenerates the preflight root and both its seals, which is C5t's
+            // to do, not a reader flip's. `assertFamily` implements both families
+            // this engine produces, so the day the rows arrive there is nothing
+            // left to write.
+            _ = try refusalOf(ctx, opener, e.mode, base, cell) orelse
+                return ctx.err("[{s}] expected a refusal, but the store opened", .{cell});
         } else {
             return ctx.err("[{s}] unsupported verdict {s}", .{ cell, e.verdict });
         }
 
-        var posts: std.ArrayListUnmanaged(V2Post) = .empty;
-        defer posts.deinit(ctx.alloc);
-        for (m.posts.items) |p| {
-            if (eql(p.fixture, e.fixture) and eql(p.engine, ENGINE) and eql(p.mode, mode))
-                try posts.append(ctx.alloc, p);
-        }
-        try assertPostState(ctx, cell_dir, before.items, posts.items, cell);
-
-        if (contains(ran.items, e.fixture))
-            return ctx.err("[{s}] two {s} cells for the same fixture", .{ cell, mode });
-        try ran.append(ctx.alloc, e.fixture);
+        // THE CAPTURE, taken before the reopen — see `assertPostState`.
+        var after = try capture(ctx, cell_dir, cell);
+        defer after.deinit(ctx.alloc);
+        try assertBytesRows(ctx, m, e, &after, cell, &owed);
+        // The post-cardinality guard runs BEFORE the rule it guards, not after: a
+        // cell whose post rows were all removed also loses the row naming the lock
+        // it creates, so the two-sided file-set rule fires first and this guard
+        // would report a red it did not produce (lesson h).
+        //
+        // It keys on the MANIFEST's opener rather than the dispatched one. Plan
+        // §5.3 item 5's second relaxation is what this engine needs and java did
+        // not: `StoreDirect` here takes no `<base>.lock` — measured — so the
+        // direct cell legitimately leaves the directory as it found it and
+        // carries no post row. Keying on the DISPATCHED opener would make this
+        // guard fire first under `always_wal3` and §3.11's mutant would report a
+        // red for the wrong rule.
+        if (posts.items.len == 0 and eql(e.opener, "wal3"))
+            return ctx.err("[{s}] a wal3 cell with no post rows asserts nothing about the directory it just opened, which is not a check", .{cell});
+        try assertPostState(ctx, before.items, &after, posts.items, cell, &owed);
+        try assertReopen(ctx, m, e, base, cell, &owed);
+        try owed.requireAllConsumed(ctx);
     }
 
+    fn runAccept(
+        self: *Cells,
+        ctx: *Ctx,
+        e: V2Expect,
+        opener: []const u8,
+        base: []const u8,
+        cell: []const u8,
+        owed: *Consumption,
+        actions: []const *const V2Action,
+    ) Error!void {
+        if (!eql(opener, "wal3"))
+            return ctx.err("[{s}] an accept cell through a non-wal3 opener is a shape no corpus has and no executor here implements", .{cell});
+        const m = &self.sample.manifest;
+        const opts = wal_mod.WalOptions{ .read_only = eql(e.mode, "ro") };
+        var s = StoreWAL.openCfg(ctx.alloc, base, opts) catch |err|
+            return ctx.err("[{s}] accept cell failed to open: {s}", .{ cell, @errorName(err) });
+        defer s.deinit();
+        for (actions) |a| {
+            // Deliberately not swallowed: a store that opened and then failed its
+            // action is a different fact from one that refused to open, and
+            // collapsing the two lets a broken action be read as the verdict.
+            try runAction(ctx, &s, a.verb, a.arg_spec);
+            try owed.consume(ctx, "action {s}", .{a.verb}, a);
+        }
+        var has_recids = false;
+        for (m.recids.items) |r| {
+            if (eql(r.fixture, e.fixture)) has_recids = true;
+        }
+        try self.requireSomeOracle(ctx, e, has_recids, cell);
+        if (has_recids) {
+            try assertReaderContract(ctx, &s, m.recids.items, e.fixture, cell);
+            try assertEveryLoggedRecidIsClassified(ctx, &s, self.sample, e.fixture, cell);
+        }
+        // D7's read-only mode is observable, in the direction that matters: a
+        // write through the `ro` handle must be refused, and it must be refused
+        // for the MODE. C3z's review found the general shape this closes — `mode`
+        // was parsed, vocabulary-checked and used to select an opener, and then
+        // nothing observed the difference, so every `ro` cell in java and rust was
+        // an ordinary writable open wearing a label.
+        //
+        // The witness is the value the probe RETURNS. Deleting the call takes the
+        // recording with it and `ro_probed` goes empty, which is the red the call
+        // did not have on its own (lesson (i): a rule can be correct, directly
+        // tested, and never called).
+        switch (try assertWriteGate(ctx, &s, e.mode, cell)) {
+            .ro_refused => try self.ro_probed.append(ctx.alloc, try self.owned.add(ctx.alloc, "{s}/{s}", .{ e.fixture, e.mode })),
+            .rw_rolled_back => {},
+        }
+        s.close() catch |err| return ctx.err("[{s}] close failed: {s}", .{ cell, @errorName(err) });
+    }
+
+    /// An accept cell must assert SOMETHING about the store it just opened — the
+    /// C3j guard, as the disjunction plan §5.3 item 5 asked for.
+    ///
+    /// C5j's first draft deleted this guard for the sealed root and offered the
+    /// distribution seal as its replacement. Both reviewers refused, and proving
+    /// them right took one doctored manifest: strip a fixture's recid rows and its
+    /// accept cell passes on nothing but the universal `x.lock` post row. **The
+    /// seal proves copy fidelity and the guard proves assertion adequacy**;
+    /// artifact identity cannot buy a semantic property.
+    fn requireSomeOracle(self: *const Cells, ctx: *Ctx, e: V2Expect, has_recids: bool, cell: []const u8) Error!void {
+        const m = &self.sample.manifest;
+        var any = has_recids or eql(e.mode, "ro");
+        for (m.actions.items) |a| {
+            if (cellEq(.{ a.fixture, a.engine, a.mode }, .{ e.fixture, ENGINE, e.mode })) any = true;
+        }
+        for (m.reopens.items) |r| {
+            if (cellEq(.{ r.fixture, r.engine, r.mode }, .{ e.fixture, ENGINE, e.mode })) any = true;
+        }
+        if (!any)
+            return ctx.err("[{s}] an accept cell with no recid rows, no action, no reopen and a writable handle asserts nothing about the store it opened, which is not a check", .{cell});
+    }
+};
+
+/// Runs every schema-v2 cell addressed to this engine in `mode`, and asserts the
+/// set that ran is **exactly** the set the `fixture` rows call for.
+///
+/// This is the STATIC SAMPLE's cardinality rule. It derives what should run from
+/// a different row type than the one that says what will: a count, or the set of
+/// modes actually seen, is a projection of the already-truncated input, and the
+/// C3j review deleted one `expect` row and left the java suite green because
+/// another fixture still supplied that mode.
+///
+/// The preflight corpus cannot use this rule — its cell set is legitimately
+/// partial — which is what [`runV2CorpusCells`] and `applies` are for.
+///
+/// C-D3 costs this port nothing: `WalOptions.read_only` is `pub` and this suite
+/// is in-package, so both modes run here and neither needs new public surface.
+pub fn runV2Cells(ctx: *Ctx, sample: *const SampleV2, mode: []const u8, tmp: std.fs.Dir) Error!void {
+    const m = &sample.manifest;
+    if (m.fixtures.items.len == 0) return ctx.err("the v2 sample declares no fixtures", .{});
+    // The sample is `v2-core`, in BOTH directions. A root that grew an oracle row
+    // would be running assertions this rule never bought, and since C5 moved the
+    // profile split into the grammar that is a refusal, not a widening.
+    if (m.applies.items.len != 0 or m.actions.items.len != 0 or
+        m.byte_rows.items.len != 0 or m.reopens.items.len != 0)
+        return ctx.err("the static sample carries an oracle row; it is v2-core through C7", .{});
+
+    var cells = Cells{ .sample = sample };
+    defer cells.deinit(ctx.alloc);
+    var ran: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer ran.deinit(ctx.alloc);
+    try runCells(ctx, &cells, mode, tmp, &ran, .by_manifest);
     try assertCellSetExact(ctx, m.fixtures.items, ran.items, mode);
+}
+
+/// Runs the preflight CORPUS's cells for this engine in `mode`, under the
+/// cardinality rule its partial cell set needs, plus every rule that is about the
+/// SET of cells rather than about one of them.
+///
+/// Two row types emitted from one catalogue is a pair that moves together, so
+/// this also requires `applies == expect` per cell, in both directions. That
+/// check is deliberately absent from `manifest_v2.py` — there both sets are
+/// compared to the catalogue a few lines apart, so a third comparison could only
+/// fire after one of those already had. An engine has no catalogue, so for an
+/// engine the disagreement is the only detectable inconsistency, and without it a
+/// manifest could have this suite run a cell it holds no verdict for.
+///
+/// Every doctored-manifest case enters HERE rather than calling the rules
+/// directly. That distinction is the entire finding both C5j reviewers made: a
+/// test that calls the suite-wide check itself proves the METHOD and leaves its
+/// CALL unobserved, so deleting the call from the suite stays green.
+pub fn runV2CorpusCells(
+    ctx: *Ctx,
+    sample: *const SampleV2,
+    mode: []const u8,
+    tmp: std.fs.Dir,
+    dispatch: Dispatch,
+) Error!void {
+    const m = &sample.manifest;
+    var want: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer want.deinit(ctx.alloc);
+    for (m.applies.items) |a| {
+        if (eql(a.engine, ENGINE) and eql(a.mode, mode)) try want.append(ctx.alloc, a.fixture);
+    }
+    if (want.items.len == 0)
+        return ctx.err("the corpus declares no {s} applies rows for mode {s}", .{ ENGINE, mode });
+    for (m.expects.items) |e| {
+        if (eql(e.engine, ENGINE) and eql(e.mode, mode) and !contains(want.items, e.fixture))
+            return ctx.err("the {s}/{s} `expect` row for {s} has no `applies` row", .{ ENGINE, mode, e.fixture });
+    }
+    for (want.items) |w| {
+        var found = false;
+        for (m.expects.items) |e| {
+            if (eql(e.engine, ENGINE) and eql(e.mode, mode) and eql(e.fixture, w)) found = true;
+        }
+        if (!found) return ctx.err("the {s}/{s} `applies` row for {s} has no `expect` row", .{ ENGINE, mode, w });
+    }
+
+    var cells = Cells{ .sample = sample };
+    defer cells.deinit(ctx.alloc);
+    var ran: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer ran.deinit(ctx.alloc);
+    try runCells(ctx, &cells, mode, tmp, &ran, dispatch);
+    for (want.items) |w| {
+        if (!contains(ran.items, w))
+            return ctx.err("the {s}/{s} cells that ran are not the ones `applies` calls for: {s} did not run", .{ ENGINE, mode, w });
+    }
+
+    // The other half of contract §2.3's consumption rule.
+    try cells.requireEveryOracleRowAddressesARunCell(ctx, mode, ran.items);
+
+    // …and the ro write probe really ran on every ro ACCEPT cell. Deleting the
+    // call inside the executor leaves this list empty, which is the red that call
+    // did not have. In `rw` the expected set is empty, and comparing it is not
+    // decoration: a probe that fired on a writable handle would land here.
+    var ro_cells: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer ro_cells.deinit(ctx.alloc);
+    var keys = Strings{};
+    defer keys.deinit(ctx.alloc);
+    for (m.expects.items) |e| {
+        if (eql(e.engine, ENGINE) and eql(e.mode, mode) and eql(mode, "ro") and eql(e.verdict, "accept"))
+            try ro_cells.append(ctx.alloc, try keys.add(ctx.alloc, "{s}/{s}", .{ e.fixture, e.mode }));
+    }
+    if (eql(mode, "ro") and ro_cells.items.len == 0)
+        return ctx.err("the corpus has no {s} ro accept cell, so the read-only probe has no input", .{ENGINE});
+    if (ro_cells.items.len != cells.ro_probed.items.len)
+        return ctx.err("the {s}/{s} ro cells whose handle was probed with a write: {d} probed, {d} expected", .{ ENGINE, mode, cells.ro_probed.items.len, ro_cells.items.len });
+    for (ro_cells.items) |c| {
+        if (!contains(cells.ro_probed.items, c))
+            return ctx.err("the {s}/{s} ro accept cell {s} was never probed with a write", .{ ENGINE, mode, c });
+    }
+}
+
+fn runCells(
+    ctx: *Ctx,
+    cells: *Cells,
+    mode: []const u8,
+    tmp: std.fs.Dir,
+    ran: *std.ArrayListUnmanaged([]const u8),
+    dispatch: Dispatch,
+) Error!void {
+    const m = &cells.sample.manifest;
+    for (m.expects.items, 0..) |e, i| {
+        if (!eql(e.engine, ENGINE) or !eql(e.mode, mode)) continue;
+        var name_buf: [64]u8 = undefined;
+        const cell_name = std.fmt.bufPrint(&name_buf, "v2-{s}-{d}", .{ mode, i }) catch unreachable;
+        var cell_dir = tmp.makeOpenPath(cell_name, .{ .iterate = true }) catch |err|
+            return ctx.err("cannot create the cell dir for {s}/{s}: {s}", .{ e.fixture, mode, @errorName(err) });
+        defer cell_dir.close();
+        try cells.runCell(ctx, e, cell_dir, dispatch);
+        if (contains(ran.items, e.fixture))
+            return ctx.err("two {s} cells for the same fixture {s}", .{ mode, e.fixture });
+        try ran.append(ctx.alloc, e.fixture);
+    }
 }
 
 /// The cells that RAN must be exactly the ones the `fixture` rows call for.

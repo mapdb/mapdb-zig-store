@@ -44,6 +44,7 @@ pub const xfixtures_wal3 = @import("xfixtures/wal3_fixtures.zig");
 test {
     _ = @import("xfixtures/conformance_test.zig");
     _ = @import("xfixtures/wal3_decode_test.zig");
+    _ = @import("xfixtures/corpus_test.zig");
 }
 
 /// The single error set every public API returns.
