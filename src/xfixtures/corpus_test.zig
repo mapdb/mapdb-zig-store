@@ -12,13 +12,24 @@
 //!
 //! # What this engine executes, and what it accounts for
 //!
-//! **The corpus addresses no `action`, `bytes` or `reopen` row to zig**, and
-//! that is a property of the format rather than an oversight: `Cell.actions`,
-//! `Cell.byte_assertions` and `Cell.reopen` exist on exactly one cell and are
-//! keyed `("java", "rw")`. Revision 3 of the C5 plan claimed all three engines
+//! **The corpus addresses no `action` or `bytes` row to zig**, and that is a
+//! property of the format rather than an oversight: `Cell.actions` and
+//! `Cell.byte_assertions` exist on exactly one cell and are keyed
+//! `("java", "rw")`. Revision 3 of the C5 plan claimed all three engines
 //! execute them and both round-3 reviewers found the claim had an empty input
 //! column for two engines. Manufacturing a port-addressed assertion in the
 //! corpus to fix that would be fixture theatre.
+//!
+//! **`reopen` IS addressed to zig, and C5t is what changed that** (plan §3.12).
+//! Every eligible reject arm now carries one, derived in `catalogue.py` from the
+//! error family already pinned there — `D1` for the bare-base cell,
+//! `direct-magic` for the direct one, `StoreFull` for Q8's port arms — so this
+//! engine grades WHICH failure a reject cell produced and that the refusal is
+//! STABLE. Until then the reject arm could only assert that the open failed, and
+//! a store that refused Q8 because a bug made it refuse everything passed. The
+//! sentence above said "or `reopen`" for three slices; it was true when written
+//! and C5t made it false, which is why it is corrected here rather than left to
+//! a reader to notice.
 //!
 //! So plan §5.3 item 2 splits the flip: zig **accepts and accounts**, and its
 //! execution paths get their inputs from SYNTHETIC manifests here — where a row
@@ -51,11 +62,18 @@
 //! **The reject cells' FAMILIES were measured too** (plan §3.12): the two
 //! derived reject images refuse with `DataCorruption` and
 //! `div-wal3-lsn-exhausted` refuses with `StoreFull` in both modes, which is
-//! what contract §10.1 pins for this engine. The v2 `expect` row has no column
-//! for a family, so the reject arm can only assert that the open failed. That is
-//! recorded at the site as an open hole, and `assertFamily` implements **both**
-//! families this engine produces so the day C5t emits `reopen` rows for the
-//! reject cells there is nothing left to write.
+//! what contract §10.1 pins for this engine. **C5t transports them.** The v2
+//! `expect` row still has no family column; the derived `reopen` rows carry it
+//! instead, and `assertFamily` grew the three families those rows name.
+//!
+//! C5z left a CONSTRAINT for that work — the D1 refusal happens inside
+//! `WalSegmentSet.openWithIo`, before `wr.recover` runs, so its `Diag` is empty
+//! and no `diag.reason` predicate can be written for it. It turned out to be the
+//! DISCRIMINATOR: a refusal from the segment-set opener has no reason precisely
+//! because recovery never ran, and every refusal recovery produces notes one
+//! immediately before returning. `D1` and `DataCorruption` are exact complements
+//! on that test, and `direct-magic` is separated from both by the opener, which
+//! is why `assertFamily` takes one.
 //!
 //! # The mutation campaign
 //!
