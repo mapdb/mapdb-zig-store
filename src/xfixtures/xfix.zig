@@ -2878,14 +2878,26 @@ pub const Cells = struct {
         // would freeze an accident.
         //
         // This engine had that arm too, for one day, and round 4 measured it:
-        // **it can never fire here.** All three of the corpus's divergent
-        // (fixture, mode) groups — `div-wal3-lsn-exhausted`,
-        // `div-wal3-entry-recid0`, `div-wal3-packlong-overlong` — are java
-        // ACCEPT against ports REJECT, and this guard runs on the accept arm
-        // only. So for every zig accept cell in either root the arm was `false`
-        // outright, not masked by an earlier disjunct: deleting it cannot change
-        // any result of any run this engine has ever done, the staged one
-        // included. It went, rather than staying as a guard nothing can trip.
+        // **it can never fire here.** The corpus holds THREE divergent fixtures
+        // and therefore SIX divergent (fixture, mode) groups, since each
+        // diverges in both `rw` and `ro`: `div-wal3-lsn-exhausted`,
+        // `div-wal3-entry-recid0`, `div-wal3-packlong-overlong`. The preflight
+        // root holds the two groups of the first. All eight are java ACCEPT
+        // against ports REJECT — round 5 re-enumerated them, because round 4's
+        // census said "three groups" and a proof that miscounts its own domain
+        // is a proof to re-check. This guard runs on the accept arm only, so for
+        // every zig accept cell in either root the arm was `false` outright,
+        // not masked by an earlier disjunct: deleting it cannot change any
+        // result of any run this engine has ever done, the staged one included.
+        // It went, rather than staying as a guard nothing can trip.
+        //
+        // ONE SYNTHETIC CASE IN `corpus_test.zig` DOES BUILD a port-ACCEPT cell
+        // another engine rejects — "an accept cell whose store refuses to open"
+        // flips `reject-wal3-d1-barebase zig ro` to accept while rust's row
+        // stays reject. It still does not reach this guard: the cell fails its
+        // OPEN before `requireSomeOracle` is called, and an `ro` cell that did
+        // open satisfies the `mode == ro` disjunct anyway. Round 5 found it;
+        // round 4 had claimed no such case existed anywhere.
         //
         // What that costs, stated rather than discovered: if a future corpus
         // ever holds a cell this engine ACCEPTS and another REJECTS, this guard
