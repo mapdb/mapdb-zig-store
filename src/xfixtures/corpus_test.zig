@@ -1,14 +1,16 @@
-//! The schema-v2 **preflight corpus** against this engine — Stage C, slice
-//! **C5z**.
+//! The schema-v2 **frozen corpus** against this engine — Stage C, slice
+//! **C6z**.
 //!
 //! `src/xfixtures/data-v2-corpus/` is a byte-identical copy of the `root`-marked
-//! files of `todo/store-cross/preflight-v2/` — twelve files: `MANIFEST.tsv` and
-//! one blob per `file` row, and nothing else (C5 plan §4c) — plus, beside it,
-//! the `zig`-marked `embedded_v2_corpus.zig`, which is this engine's generated
-//! embed table and part of its distribution. It is the `v2-oracle` profile: it
-//! carries `applies`, `action`, `bytes` and `reopen` rows. The static
-//! `data-v2/` sample stays `v2-core` and is untouched by C5; `conformance_test`
-//! still owns it, through the same executor.
+//! files of `todo/store-cross/corpus-v2/` — eighty-nine files: `MANIFEST.tsv`
+//! and one blob per `file` row, and nothing else (C5 plan §4c) — plus, beside
+//! it, the `zig`-marked `embedded_v2_corpus.zig`, which is this engine's
+//! generated embed table and part of its distribution. It is the `v2-oracle`
+//! profile: it carries `applies`, `action`, `bytes` and `reopen` rows. The
+//! static `data-v2/` sample stays `v2-core` and is untouched by C6;
+//! `conformance_test` still owns it, through the same executor. The dual
+//! reader (v1 sample + v2 sample + this corpus root) is what keeps the cutover
+//! a data commit.
 //!
 //! # What this engine executes, and what it accounts for
 //!
@@ -22,17 +24,12 @@
 //!
 //! **`reopen` IS addressed to zig, and C5t is what changed that** (plan §3.12).
 //! Every eligible reject arm now carries one, derived in `catalogue.py` from the
-//! error family already pinned there. THIS ROOT carries three of the five
-//! families `catalogue.REOPEN_FAMILIES` transports — `D1` for the bare-base
-//! cell, `direct-magic` for the direct one, `StoreFull` for Q8's port arms; the
-//! other two, `DataCorruption` and `S2`, reach cells this root does not hold and
-//! are graded by the same `assertFamily` when the frozen corpus is staged. So
-//! this engine grades WHICH failure a reject cell produced and that the refusal is
-//! STABLE. Until then the reject arm could only assert that the open failed, and
-//! a store that refused Q8 because a bug made it refuse everything passed. The
-//! sentence above said "or `reopen`" for three slices; it was true when written
-//! and C5t made it false, which is why it is corrected here rather than left to
-//! a reader to notice.
+//! error family already pinned there. THIS ROOT — the full frozen corpus after
+//! C6 — carries all five families `catalogue.REOPEN_FAMILIES` transports
+//! (`D1`, `DataCorruption`, `S2`, `StoreFull`, `direct-magic`). So this engine
+//! grades WHICH failure a reject cell produced and that the refusal is STABLE.
+//! Until C5t the reject arm could only assert that the open failed, and a store
+//! that refused Q8 because a bug made it refuse everything passed.
 //!
 //! So plan §5.3 item 2 splits the flip: zig **accepts and accounts**, and its
 //! execution paths get their inputs from SYNTHETIC manifests here — where a row
@@ -217,14 +214,16 @@ const corpus_manifest_tsv: []const u8 = @embedFile("data-v2-corpus/MANIFEST.tsv"
 /// the seal cover the table that the seal's other members are reached through.
 const corpus_embed_table_src: []const u8 = @embedFile("embedded_v2_corpus.zig");
 
-/// `freeze_v2.PREFLIGHT_DIST_SEALS["zig"]`.
+/// `freeze_v2.CORPUS_DIST_SEALS["zig"]`.
 ///
 /// The per-engine seal over only the marks this engine carries — `root` and
-/// `zig`, per `freeze_v2.DIST_MARKS`. No engine can recompute `PREFLIGHT_SEAL`,
+/// `zig`, per `freeze_v2.DIST_MARKS`. No engine can recompute `CORPUS_SEAL`,
 /// because the `todo`-marked post-state blob is not distributed and its hash is
-/// in that preimage. Pinning it here is what makes "the three hand-copied roots
-/// have not drifted" a CI fact rather than a review note.
-const DIST_SEAL = "4470f2bcc4f8bec45aca3d22eb7cfde055d36f5b29218d282d3b08ede507148e";
+/// in that preimage. Pinning the corpus digest in this repository (C6) is the
+/// trust upgrade over C5t's disposable staged worktree: four repositories must
+/// move together. Regenerate with
+/// `python3 todo/store-cross/freeze_v2.py --corpus --dist-seals`.
+const DIST_SEAL = "a03ab6eb4e8ae4f3ac62fe87f2aebbd501bd463d97377335e5c1e2bd831cf1f0";
 
 fn loadCorpus(ctx: *xfix.Ctx) !xfix.SampleV2 {
     return xfix.loadSampleV2(ctx, corpus_manifest_tsv, &embedded_corpus.blobs);
@@ -1308,8 +1307,9 @@ test "xfixtures corpus: the corpus root has nothing unexplained" {
 // only by luck. The preimage is `freeze_v2.dist_preimage`'s, transcribed: the
 // domain line, the engine line, then one sorted `file` row per distributed
 // member with its size, sha256 and MARK. This engine's distribution is
-// `("root", "zig")` — the twelve files of the corpus root, plus the generated
-// embed table beside it, which is why that table is hashed here as well.
+// `("root", "zig")` — the eighty-nine files of the frozen corpus root, plus
+// the generated embed table beside it, which is why that table is hashed here
+// as well.
 test "xfixtures corpus: the corpus root matches todo's sealed tree" {
     const a = testing.allocator;
 
