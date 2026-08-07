@@ -309,8 +309,28 @@ pub const WalSegmentSet = struct {
     /// segments in the set, ascending, with no file handles held; section-level
     /// recovery is the caller's job.
     pub fn open(alloc: Allocator, base: []const u8, read_only: bool) DbError!Self {
-        return openWithIo(alloc, base, read_only, null);
+        return openWithIo(alloc, base, read_only, null, null);
     }
+
+    /// The reason a FAILED open refused, carried out of the set that is about to
+    /// be destroyed.
+    ///
+    /// The set writes every refusal into `reason`/`reason_seq` and then dies on
+    /// the error path, so until C5t the caller got the error tag and nothing
+    /// else: `StoreWAL.openCfg` returned the segment-set error before it had
+    /// even chosen the recovery `Diag`, and every refusal from this file arrived
+    /// as a bare `DataCorruption`. That made the legacy-boundary rows (D1) and
+    /// the header classifications (H5–H9, N6) indistinguishable to anything
+    /// outside — codex round 1 finding 3 on C5t, which found the fixture corpus
+    /// grading D1 by "a corruption verdict with no diagnostic", a description
+    /// four other rules also answer.
+    ///
+    /// A pointer rather than a return value because the open FAILED: there is no
+    /// `Self` left to read it from.
+    pub const OpenNote = struct {
+        reason: []const u8 = "",
+        seq: i64 = 0,
+    };
 
     /// [`open`](WalSegmentSet.open) with a durability seam installed for the
     /// whole lifetime of the set, including the create and unlink this open
@@ -320,6 +340,7 @@ pub const WalSegmentSet = struct {
         base: []const u8,
         read_only: bool,
         io: ?*const WalIo,
+        note_out: ?*OpenNote,
     ) DbError!Self {
         const abs: []u8 = if (std.fs.path.isAbsolute(base))
             (alloc.dupe(u8, base) catch return error.OutOfMemory)
@@ -360,6 +381,15 @@ pub const WalSegmentSet = struct {
             set.close();
             set.segments.deinit(alloc);
         }
+        // Declared AFTER the cleanup errdefer so it runs BEFORE it: the reason is
+        // a static string and `close` does not touch it, but reading a field of a
+        // set that has begun tearing down is a habit worth not having. The three
+        // returns above this line — a base with no file name, and the two
+        // allocation failures — have no reason to carry, and neither is a
+        // corruption verdict.
+        errdefer if (note_out) |n| {
+            n.* = .{ .reason = set.reason, .seq = set.reason_seq };
+        };
 
         try set.takeStoreLock();
         try set.refuseLegacyArtifacts();

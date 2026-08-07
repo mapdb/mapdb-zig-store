@@ -22,9 +22,12 @@
 //!
 //! **`reopen` IS addressed to zig, and C5t is what changed that** (plan §3.12).
 //! Every eligible reject arm now carries one, derived in `catalogue.py` from the
-//! error family already pinned there — `D1` for the bare-base cell,
-//! `direct-magic` for the direct one, `StoreFull` for Q8's port arms — so this
-//! engine grades WHICH failure a reject cell produced and that the refusal is
+//! error family already pinned there. THIS ROOT carries three of the five
+//! families `catalogue.REOPEN_FAMILIES` transports — `D1` for the bare-base
+//! cell, `direct-magic` for the direct one, `StoreFull` for Q8's port arms; the
+//! other two, `DataCorruption` and `S2`, reach cells this root does not hold and
+//! are graded by the same `assertFamily` when the frozen corpus is staged. So
+//! this engine grades WHICH failure a reject cell produced and that the refusal is
 //! STABLE. Until then the reject arm could only assert that the open failed, and
 //! a store that refused Q8 because a bug made it refuse everything passed. The
 //! sentence above said "or `reopen`" for three slices; it was true when written
@@ -496,6 +499,56 @@ test "xfixtures corpus: the reopen row is graded" {
     }
 }
 
+// On a REJECT cell the family is graded on the cell's OWN refusal, before the
+// reopen.
+//
+// codex round 1 finding 2: C5t's first draft graded the family only on the
+// reopen, which is a WRITABLE open whatever the cell's mode was. Every `mode=ro`
+// row was therefore graded by a retry in the other mode, and a store that
+// refuses read-only for one reason and writable for another passed.
+//
+// THE CORPUS ALONE CANNOT SHOW THE FIX. Both opens of a conforming store refuse
+// the same way, so deleting the first grading leaves the reopen's — same family,
+// same predicate, gate green. What separates them is WHERE the red comes from:
+// this doctored family reds at `family[..]` if the cell's own refusal was graded
+// and at `reopen[..]` if only the second open was. Asserting the prefix is what
+// makes the deletion visible.
+test "xfixtures corpus: a reject arm's own refusal is graded" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pfx = "reopen\treject-wal3-d1-barebase\tzig\trw\t";
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(a);
+    var dropped = false;
+    var it = std.mem.splitScalar(u8, corpus_manifest_tsv, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, pfx)) {
+            dropped = true;
+            continue;
+        }
+        try out.appendSlice(a, line);
+        try out.append(a, '\n');
+    }
+    try testing.expect(dropped);
+    try out.writer(a).print("{s}R4\n", .{pfx});
+
+    var sample = try loadDoctored(&ctx, out.items);
+    defer sample.deinit(a);
+    var dir = try tmp.dir.makeOpenPath("first-refusal", .{ .iterate = true });
+    defer dir.close();
+    try xfix.expectRefusedSaying(
+        &ctx,
+        "a reject arm whose own refusal is graded by nothing",
+        "family[R4]: error family R4 has no predicate in this engine",
+        xfix.runV2CorpusCells,
+        .{ &ctx, &sample, "rw", dir, xfix.Dispatch.by_manifest },
+    );
+}
+
 // The `direct` opener has no read-only mode, and a manifest CAN ask for one.
 //
 // The C5z review found this refusal reachable and inputless — the same shape as
@@ -732,34 +785,60 @@ test "xfixtures corpus: the reopen family predicate discriminates" {
     const s2_wrong_variant = xfix.Refusal{ .err = error.StoreFull, .diag = .{ .reason = recover.H_LSN_BACK } };
     const s2_wrong_reason = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = recover.R_CHAIN } };
     const full = xfix.Refusal{ .err = error.StoreFull, .diag = .{} };
-    // The three C5t brought here. `direct` and `d1` are the SAME `Refusal` and
-    // differ only in the opener that produced it — which is why the predicate
-    // takes one.
-    const bare = xfix.Refusal{ .err = error.DataCorruption, .diag = .{} };
+
+    // The refusals C5t brought here, each carrying the diagnostic its own opener
+    // writes. Every string is spelled out rather than imported from the store it
+    // comes from: a comparison against the constant that produced the value has
+    // compared nothing (lesson j), and these are pins.
+    const direct_magic = xfix.Refusal{ .err = error.DataCorruption, .direct = .{ .reason = "not a MapDB StoreDirect file (bad magic)" } };
+    // The direct opener's OTHER structural refusals. Same opener, same error
+    // tag, a different check — which is exactly what C5t's first draft could not
+    // tell apart, and codex round 1 finding 5 is that it could not.
+    const direct_short = xfix.Refusal{ .err = error.DataCorruption, .direct = .{ .reason = "store file smaller than the header page" } };
+    const d1_base = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "regular file at the WAL base path (the v3 opener takes a base, not a log file): no migration to v3 — open it with the release that wrote it and copy the data across, or move it aside" } };
+    const d1_ckpt = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "v1 checkpoint temp present at <base>.ckpt, possibly the only recoverable copy after a v1 crash: no migration to v3 — open it with the release that wrote it and copy the data across, or move it aside" } };
+    // N6 — Java's own row, one `for` iteration from the two above and sharing
+    // every word but the first. It is a family the catalogue names and
+    // `REOPEN_FAMILIES` does not transport, so no manifest row can present it;
+    // it is here for the claim that matters, which is that **`D1` refuses it**.
+    const n6 = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "v1 single-file WAL present at <base>.wal: no migration to v3 — open it with the release that wrote it and copy the data across, or move it aside" } };
+    // A corruption verdict with NO reason at all: what `recover` propagates when
+    // `inner.rebuildFreeRecids` refuses, since StoreDirect's corruption exits
+    // touch no recovery `Diag`. The first draft's `DataCorruption` predicate
+    // required a non-empty reason and refused this one — the other half of
+    // finding 3.
+    const undiagnosed = xfix.Refusal{ .err = error.DataCorruption, .diag = .{} };
 
     // THE WHOLE MATRIX, because a family predicate that is never shown a
-    // NEIGHBOUR's refusal has not been shown to read the family at all. Five
-    // families against five refusals, every cell stated: four accept their own
-    // and refuse the other four, and the fifth is `DataCorruption`, which admits
-    // S2 ON PURPOSE — S2 is a corruption verdict recovery diagnosed, with the
-    // reason additionally pinned, so it is a SUBSET and not a neighbour. Writing
-    // the exception down is the point; a matrix with a quietly-wrong cell reads
-    // exactly like one without.
+    // NEIGHBOUR's refusal has not been shown to read the family at all. Over the
+    // five families the corpus TRANSPORTS it is a true diagonal — codex round 1
+    // finding 4, which found `DataCorruption` admitting the S2 refusal and this
+    // battery blessing the overlap. A manifest row names ONE family, so a
+    // divergent-entry cell that wrongly refused with the S2 rule graded green.
+    //
+    // The extra columns are refusals no manifest row can name: `direct-short`,
+    // `n6` and `undiagnosed`. Two of them belong to nobody and the third,
+    // `undiagnosed`, belongs to `DataCorruption` — which is what that family
+    // means once it is stated as an exclusion.
     const Sample = struct { name: []const u8, opener: []const u8, r: xfix.Refusal };
     const samples = [_]Sample{
-        .{ .name = "direct", .opener = "direct", .r = bare },
-        .{ .name = "d1", .opener = "wal3", .r = bare },
+        .{ .name = "direct-magic", .opener = "direct", .r = direct_magic },
+        .{ .name = "direct-short", .opener = "direct", .r = direct_short },
+        .{ .name = "d1-base", .opener = "wal3", .r = d1_base },
+        .{ .name = "d1-ckpt", .opener = "wal3", .r = d1_ckpt },
+        .{ .name = "n6", .opener = "wal3", .r = n6 },
         .{ .name = "corrupt", .opener = "wal3", .r = .{ .err = error.DataCorruption, .diag = .{ .reason = recover.R_RECID_ZERO } } },
+        .{ .name = "undiagnosed", .opener = "wal3", .r = undiagnosed },
         .{ .name = "s2", .opener = "wal3", .r = s2_real },
         .{ .name = "full", .opener = "wal3", .r = full },
     };
     const Row = struct { family: []const u8, accepts: []const u8 };
     const rows = [_]Row{
-        .{ .family = "direct-magic", .accepts = "ynnnn" },
-        .{ .family = "D1", .accepts = "nynnn" },
-        .{ .family = "DataCorruption", .accepts = "nnyyn" },
-        .{ .family = "S2", .accepts = "nnnyn" },
-        .{ .family = "StoreFull", .accepts = "nnnny" },
+        .{ .family = "direct-magic", .accepts = "ynnnnnnnn" },
+        .{ .family = "D1", .accepts = "nnyynnnnn" },
+        .{ .family = "DataCorruption", .accepts = "nnnnyyynn" },
+        .{ .family = "S2", .accepts = "nnnnnnnyn" },
+        .{ .family = "StoreFull", .accepts = "nnnnnnnny" },
     };
     for (rows) |row| {
         try testing.expectEqual(samples.len, row.accepts.len);
@@ -990,6 +1069,43 @@ test "xfixtures corpus: an accept cell that asserts nothing is refused" {
     var dir2 = try tmp.dir.makeOpenPath("ro", .{ .iterate = true });
     defer dir2.close();
     try xfix.runV2CorpusCells(&ctx, &sample, "ro", dir2, .by_manifest);
+
+    // The MUTATION-CLAIM arm, which no cell in this root exercises: the staged
+    // corpus's torn-tail fixtures carry a `post ... truncated` row and nothing
+    // else, and until the staged run they were graded by a guard that refused
+    // them. The same stripped manifest with the universal lock row relabelled
+    // `modified` — the guard must let the cell through, and the red must then
+    // come from the POST check, which refuses `modified` on a file that was
+    // never an input. Asserting WHICH red fires is the whole case: delete the
+    // arm and the guard reds first with "asserts nothing".
+    const lock = "post\twal3-java-cleaned\tzig\trw\tx.lock\tcreated:";
+    var out2: std.ArrayListUnmanaged(u8) = .empty;
+    defer out2.deinit(a);
+    var relabelled = false;
+    var it2 = std.mem.splitScalar(u8, out.items, '\n');
+    while (it2.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, lock)) {
+            relabelled = true;
+            try out2.writer(a).print("post\twal3-java-cleaned\tzig\trw\tx.lock\tmodified:{s}\n", .{line[lock.len..]});
+            continue;
+        }
+        try out2.appendSlice(a, line);
+        try out2.append(a, '\n');
+    }
+    try testing.expect(relabelled);
+
+    var sample2 = try loadDoctored(&ctx, out2.items);
+    defer sample2.deinit(a);
+    var dir3 = try tmp.dir.makeOpenPath("mutclaim", .{ .iterate = true });
+    defer dir3.close();
+    try xfix.expectRefusedSaying(
+        &ctx,
+        "an accept cell whose only oracle is a mutation claim",
+        "which was never an input — only `created` may name a",
+        xfix.runV2CorpusCells,
+        .{ &ctx, &sample2, "rw", dir3, xfix.Dispatch.by_manifest },
+    );
 }
 
 // Plan §5.3 item 5's second relaxation is a guard CONDITIONED on the opener,

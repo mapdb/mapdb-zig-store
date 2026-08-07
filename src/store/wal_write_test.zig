@@ -193,7 +193,7 @@ const Fixture = struct {
     calls: usize = 0,
 
     fn init(alloc: Allocator, sc: *const Scratch, io: ?*const WalIo) !Fixture {
-        var set = try WalSegmentSet.openWithIo(alloc, sc.base, false, io);
+        var set = try WalSegmentSet.openWithIo(alloc, sc.base, false, io, null);
         errdefer set.deinit();
         _ = try set.createSegment(1);
         return .{ .alloc = alloc, .set = set };

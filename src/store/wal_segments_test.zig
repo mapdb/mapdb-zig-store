@@ -104,7 +104,7 @@ const Scratch = struct {
     }
 
     fn openIo(self: *const Scratch, read_only: bool, io: ?*const wal_io.WalIo) DbError!WalSegmentSet {
-        return WalSegmentSet.openWithIo(self.alloc, self.base, read_only, io);
+        return WalSegmentSet.openWithIo(self.alloc, self.base, read_only, io, null);
     }
 };
 

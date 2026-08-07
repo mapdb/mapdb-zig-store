@@ -2308,7 +2308,15 @@ fn argValue(ctx: *Ctx, arg_spec: []const u8, k: []const u8, verb: []const u8) Er
 /// engine has a typed side channel instead (B1's `Diag`), so the family
 /// predicate asserts the reason by IDENTITY against the engine's own constant
 /// rather than by parsing prose.
-pub const Refusal = struct { err: DbError, diag: recover.Diag };
+/// A refused open: the error tag, and whichever diagnostic the opener that
+/// produced it keeps. The WAL opener writes `diag`; `StoreDirect` has no
+/// recovery and writes `direct` — one field per opener rather than one shared
+/// one, so a predicate cannot read a reason the opener it names never wrote.
+pub const Refusal = struct {
+    err: DbError,
+    diag: recover.Diag = .{},
+    direct: StoreDirect.OpenNote = .{},
+};
 
 /// Opens through the named opener and returns the refusal, or `null` if the
 /// store opened (and closed).
@@ -2316,12 +2324,13 @@ fn refusalOf(ctx: *Ctx, opener: []const u8, mode: []const u8, base: []const u8, 
     if (eql(opener, "direct")) {
         if (!eql(mode, "rw"))
             return ctx.err("[{s}] the direct opener has no read-only mode here", .{cell});
-        if (StoreDirect.openFile(ctx.alloc, base, false)) |*opened| {
+        var note: StoreDirect.OpenNote = .{};
+        if (StoreDirect.openFileDiag(ctx.alloc, base, false, &note)) |*opened| {
             var d = opened.*;
             d.close() catch {};
             d.deinit();
             return null;
-        } else |e| return Refusal{ .err = e, .diag = .{} };
+        } else |e| return Refusal{ .err = e, .direct = note };
     }
     var diag: recover.Diag = .{};
     const opts = wal_mod.WalOptions{ .read_only = eql(mode, "ro"), .diag = &diag };
@@ -2347,46 +2356,82 @@ fn refusalOf(ctx: *Ctx, opener: []const u8, mode: []const u8, base: []const u8, 
 /// diagnostic: one from `StoreDirect.openFile`'s magic check, one from
 /// `WalSegmentSet`'s legacy-boundary rows. Nothing in the `Refusal` tells them
 /// apart, so the predicate is given the thing that does.
+/// D1's two PORT rows — the ones with no Java counterpart, because Java's base
+/// has never named a file.
+///
+/// TWO of the three, not three. The `.wal` row is family **N6**, which the
+/// catalogue names separately and this predicate must therefore refuse: a D1 arm
+/// satisfied by an N6 refusal is a family column that cannot tell the ports'
+/// upgrade-safety boundary from Java's own row. The three rows are one `for`
+/// loop apart in `wal_segments.zig` and share every word but the first.
+fn isD1Reason(reason: []const u8) bool {
+    return eql(reason, "regular file at the WAL base path (the v3 opener takes a base, not a log file): " ++
+        "no migration to v3 — open it with the release that wrote it and copy the data across, or move it aside") or
+        eql(reason, "v1 checkpoint temp present at <base>.ckpt, possibly the only recoverable copy after a v1 crash: " ++
+            "no migration to v3 — open it with the release that wrote it and copy the data across, or move it aside");
+}
+
 pub fn assertFamily(ctx: *Ctx, where: []const u8, opener: []const u8, family: []const u8, r: Refusal) Error!void {
     // The three corruption families, and what actually discriminates them.
     //
     // C5z's review recorded the D1 refusal's `Diag` as EMPTY — it happens inside
     // `WalSegmentSet.openWithIo`, before `wr.recover` ever runs — and plan §3.12
-    // wrote that down as a CONSTRAINT on C5t: a `diag.reason` predicate cannot
-    // be written for it. What it is instead is the discriminator. A refusal from
-    // the segment-set opener has no reason BECAUSE recovery never ran, and every
-    // refusal recovery produces notes one before it returns. So:
+    // wrote that down as a CONSTRAINT on C5t. C5t's first draft turned it round
+    // and used the emptiness as the DISCRIMINATOR: no reason meant the
+    // segment-set opener, a reason meant recovery.
     //
-    //     direct-magic     the DIRECT opener refused          (no diag exists there)
-    //     D1               the wal3 opener refused BEFORE recovery   reason == ""
-    //     DataCorruption   recovery refused, reason unpinned         reason != ""
-    //     S2               recovery refused with H_LSN_BACK exactly
+    // **codex round 1 finding 3 disproved both halves of that.** Emptiness is
+    // not unique to D1 — `classify` returns `DataCorruption` for a sequence-zero
+    // name and for corrupt or torn non-highest headers, and every one of those
+    // arrived empty too, so the D1 predicate accepted four other rules. And the
+    // converse is false as well: `recover` propagates `inner.rebuildFreeRecids`
+    // directly, and StoreDirect's corruption exits touch no recovery `Diag`, so
+    // a genuine recovery-diagnosed corruption can arrive with none — which the
+    // `DataCorruption` predicate then REFUSED.
     //
-    // Each pair is separated by something, which is what makes the family
-    // READING falsifiable — the property C5r and C5z both wrote down as the
-    // reason a one-member predicate proves nothing. `D1` and `DataCorruption`
-    // are exact complements on purpose: a predicate for the one that admitted
-    // the other would be a family column that grades nothing.
+    // The fix is not a cleverer reading of emptiness. It is to carry the reason
+    // the segment set already writes out of the open that failed
+    // (`WalSegmentSet.OpenNote`, mirrored into the caller's `Diag` by
+    // `StoreWAL.openCfg`) and to give the direct opener one of its own
+    // (`StoreDirect.OpenNote`, finding 5). So:
+    //
+    //     direct-magic     the DIRECT opener, reason == D_BAD_MAGIC exactly
+    //     D1               the wal3 opener, reason == one of the two D1 rows
+    //     S2               reason == H_LSN_BACK exactly
+    //     DataCorruption   the wal3 opener, reason is NONE of the above
+    //
+    // `DataCorruption` is stated as an EXCLUSION, which is what it means: a
+    // corruption verdict no TRANSPORTED refined family names. It says nothing
+    // about the reason being present, so the undiagnosed exits above are its
+    // members rather than its counterexamples. rust's `assert_family` reads the
+    // same way over messages instead of reasons.
+    //
+    // The reason texts are SPELLED OUT here rather than imported from the store:
+    // a predicate that compares a value against the constant that produced it
+    // has compared nothing (lesson j). These are pins, and a reworded refusal is
+    // supposed to red this suite.
     if (eql(family, "direct-magic")) {
-        if (!(eql(opener, "direct") and r.err == error.DataCorruption))
+        if (!(eql(opener, "direct") and r.err == error.DataCorruption and
+            eql(r.direct.reason, "not a MapDB StoreDirect file (bad magic)")))
             return ctx.err(
-                "{s}: `direct-magic` is StoreDirect's magic/min-length refusal — it must come from the direct opener as a corruption verdict, and this is {s}/{s}",
-                .{ where, opener, @errorName(r.err) },
+                "{s}: `direct-magic` is StoreDirect's BAD-MAGIC refusal — the direct opener, a corruption verdict, and that check and no other, and this is {s}/{s}/`{s}`",
+                .{ where, opener, @errorName(r.err), r.direct.reason },
             );
         return;
     }
     if (eql(family, "D1")) {
-        if (!(eql(opener, "wal3") and r.err == error.DataCorruption and r.diag.reason.len == 0))
+        if (!(eql(opener, "wal3") and r.err == error.DataCorruption and isD1Reason(r.diag.reason)))
             return ctx.err(
-                "{s}: `D1` is the legacy boundary, refused by the WAL opener BEFORE recovery runs — a corruption verdict with an empty diagnostic, and this is {s}/{s}/`{s}`",
+                "{s}: `D1` is the legacy boundary — the WAL opener refusing a v1 artifact at the base path, by that rule and no other, and this is {s}/{s}/`{s}`",
                 .{ where, opener, @errorName(r.err), r.diag.reason },
             );
         return;
     }
     if (eql(family, "DataCorruption")) {
-        if (!(eql(opener, "wal3") and r.err == error.DataCorruption and r.diag.reason.len != 0))
+        if (!(eql(opener, "wal3") and r.err == error.DataCorruption and
+            !isD1Reason(r.diag.reason) and !eql(r.diag.reason, recover.H_LSN_BACK)))
             return ctx.err(
-                "{s}: `DataCorruption` is a refusal RECOVERY diagnosed — a corruption verdict carrying a reason, and this is {s}/{s}/`{s}`",
+                "{s}: `DataCorruption` is a corruption verdict no TRANSPORTED refined family names, and this is {s}/{s}/`{s}`",
                 .{ where, opener, @errorName(r.err), r.diag.reason },
             );
         return;
@@ -2467,6 +2512,7 @@ fn assertReopen(
     base: []const u8,
     cell: []const u8,
     owed: *Consumption,
+    first: ?Refusal,
 ) Error!void {
     var rows: std.ArrayListUnmanaged(*const V2Reopen) = .empty;
     defer rows.deinit(ctx.alloc);
@@ -2474,6 +2520,22 @@ fn assertReopen(
     for (rows.items) |r| {
         var where_buf: [256]u8 = undefined;
         const where = std.fmt.bufPrint(&where_buf, "[{s}] reopen[{s}]", .{ cell, r.family }) catch cell;
+        // THE CELL'S OWN REFUSAL FIRST, where there was one. C5t's first draft
+        // graded the family on the reopen alone and threw the first refusal away;
+        // codex round 1 finding 2 is why it does not. The reopen is a WRITABLE
+        // open whatever the cell's mode was, so every `mode=ro` row was graded on
+        // a retry in the OTHER mode — a store that refuses read-only for one
+        // reason and writable for another passed, and so did a stateful one that
+        // got it wrong once and right on retry. The arm the corpus names is the
+        // first open; the second is the stability check.
+        //
+        // On an ACCEPT cell — Q8 — `first` is null and the reopen is the only
+        // grading there is, because the cell's own open succeeded.
+        if (first) |f| {
+            var fam_buf: [256]u8 = undefined;
+            const fam_where = std.fmt.bufPrint(&fam_buf, "[{s}] family[{s}]", .{ cell, r.family }) catch cell;
+            try assertFamily(ctx, fam_where, opener, r.family, f);
+        }
         // A reopen is a WRITABLE open whatever the cell's own mode was: the claim
         // is that the store is permanently unopenable, and a read-only probe
         // would be a weaker one.
@@ -2635,25 +2697,40 @@ pub const Cells = struct {
             .always_wal3 => "wal3",
             .by_manifest => e.opener,
         };
+        // The cell's OWN refusal, on a reject cell. `null` on an accept cell,
+        // where there is none and the reopen row (Q8's) is graded alone.
+        var first_refusal: ?Refusal = null;
         if (eql(e.verdict, "accept")) {
             try self.runAccept(ctx, e, opener, base, cell, &owed, actions.items);
         } else if (eql(e.verdict, "reject")) {
-            // A `reject` cell asserts that the open FAILED, and this line does not
-            // assert WHICH failure — but since C5t it is no longer the whole
-            // story, and the difference is the point of plan §3.12.
+            // A `reject` cell asserts that the open FAILED. Since C5t it can also
+            // assert WHICH failure, and that is the point of plan §3.12.
             //
             // The v2 `expect` row still has no family column. What it has now is
             // a `reopen` row per eligible reject arm, derived in `catalogue.py`
-            // from the family that was already pinned there, and `assertReopen`
-            // below opens the same tree again and hands the family to
-            // `assertFamily`. So the family reaches this engine after all, and
-            // the refusal is additionally graded as STABLE — a store that
-            // refuses once and opens on the retry now fails, and passed before.
+            // from the family that was already pinned there, and the family is
+            // graded HERE, on this arm's own refusal. `assertReopen` below then
+            // opens again and grades the same family a second time, which is the
+            // STABILITY half — a store that refuses once and opens on the retry
+            // now fails, and passed before.
             //
-            // What is NOT covered: the eleven WAL-recovery families outside
+            // Grading here rather than only on the reopen is codex round 1
+            // finding 2: the reopen is a WRITABLE open, so every `mode=ro` row
+            // was graded on a retry in the other mode, and a store that refuses
+            // read-only for one reason and writable for another passed. The arm
+            // the corpus names is this one.
+            //
+            // What is NOT covered: the thirteen families outside
             // `catalogue.REOPEN_FAMILIES`, which stay graded by "it refused"
             // alone. That is L15's remainder and its owner is C8.
-            _ = try refusalOf(ctx, opener, e.mode, base, cell) orelse
+            // The refusal is HELD rather than graded here. `assertReopen` grades
+            // it, after the capture and the post-state rules, because §3.11's
+            // mutant — the direct cell dispatched to the wal3 opener — trips both
+            // this family check and the post-row rule it was written to prove,
+            // and lesson (h) says such an input measures whichever fires first.
+            // Grading here made §3.11's mutant report the family, and §3.11's own
+            // rule went unmeasured.
+            first_refusal = try refusalOf(ctx, opener, e.mode, base, cell) orelse
                 return ctx.err("[{s}] expected a refusal, but the store opened", .{cell});
         }
         // No `else` arm: the verdict vocabulary is pinned to {accept, reject} by
@@ -2681,7 +2758,7 @@ pub const Cells = struct {
         if (posts.items.len == 0 and eql(e.opener, "wal3"))
             return ctx.err("[{s}] a wal3 cell with no post rows asserts nothing about the directory it just opened, which is not a check", .{cell});
         try assertPostState(ctx, before.items, &after, posts.items, cell, &owed);
-        try assertReopen(ctx, m, e, opener, base, cell, &owed);
+        try assertReopen(ctx, m, e, opener, base, cell, &owed, first_refusal);
         try owed.requireAllConsumed(ctx);
     }
 
@@ -2745,6 +2822,19 @@ pub const Cells = struct {
     /// accept cell passes on nothing but the universal `x.lock` post row. **The
     /// seal proves copy fidelity and the guard proves assertion adequacy**;
     /// artifact identity cannot buy a semantic property.
+    ///
+    /// The last arm is a `post` row that says the open CHANGED the tree, and
+    /// **the staged run found it** — no preflight root could have.
+    /// `mut-wal3-torn-tail` carries no recid row, no action and no reopen, and
+    /// what it asserts is a post state: the tail truncated to the last valid
+    /// section end. A byte-exact statement of what recovery left behind is an
+    /// assertion about the store, not an absence of one.
+    ///
+    /// `created` and `unchanged` are deliberately NOT in it. Every wal3 cell
+    /// carries the universal `x.lock created` row, so admitting `created` would
+    /// make the guard vacuous — it would admit the very cell the doctored proof
+    /// above uses. `unchanged` is the two-sided rule's default statement and
+    /// asserts that the open did nothing.
     fn requireSomeOracle(self: *const Cells, ctx: *Ctx, e: V2Expect, has_recids: bool, cell: []const u8) Error!void {
         const m = &self.sample.manifest;
         var any = has_recids or eql(e.mode, "ro");
@@ -2754,8 +2844,12 @@ pub const Cells = struct {
         for (m.reopens.items) |r| {
             if (cellEq(.{ r.fixture, r.engine, r.mode }, .{ e.fixture, ENGINE, e.mode })) any = true;
         }
+        for (m.posts.items) |p| {
+            if (!cellEq(.{ p.fixture, p.engine, p.mode }, .{ e.fixture, ENGINE, e.mode })) continue;
+            if (eql(p.verb, "modified") or eql(p.verb, "truncated") or eql(p.verb, "deleted")) any = true;
+        }
         if (!any)
-            return ctx.err("[{s}] an accept cell with no recid rows, no action, no reopen and a writable handle asserts nothing about the store it opened, which is not a check", .{cell});
+            return ctx.err("[{s}] an accept cell with no recid rows, no action, no reopen, no post row claiming a change and a writable handle asserts nothing about the store it opened, which is not a check", .{cell});
     }
 };
 

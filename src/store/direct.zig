@@ -137,6 +137,39 @@ pub const StoreDirect = struct {
 
     /// File-backed durable store (mmap volume); created if absent. `path` rel cwd.
     pub fn openFile(alloc: Allocator, path: []const u8, thread_safe: bool) DbError!Self {
+        return openFileDiag(alloc, path, thread_safe, null);
+    }
+
+    /// Which structural check refused a failed [`openFile`](StoreDirect.openFile).
+    ///
+    /// Zig errors carry no payload, so every one of the open-path refusals below
+    /// is the same bare `error.DataCorruption` — `wal_segments.zig` says the same
+    /// thing about its own rows and answers it with a static reason string, and
+    /// this is that answer for the direct opener. codex round 1 finding 5 on C5t
+    /// is why it exists: the fixture corpus graded its `direct-magic` family as
+    /// "the direct opener returned a corruption verdict", which every check in
+    /// `initOpen` also satisfies, so the family could not tell the magic word
+    /// from a short file or a broken checksum.
+    ///
+    /// A diagnostic, never a key: nothing branches on it.
+    pub const OpenNote = struct { reason: []const u8 = "" };
+
+    pub const D_SHORT_FILE = "store file smaller than the header page";
+    pub const D_BAD_MAGIC = "not a MapDB StoreDirect file (bad magic)";
+    pub const D_FEATURES = "unsupported feature flags";
+    pub const D_HEAD_CHECKSUM = "header checksum mismatch: not closed cleanly, or corrupted";
+    pub const D_FILE_TAIL = "bad fileTail";
+    pub const D_TRUNCATED = "file shorter than the fileTail its header states";
+    pub const D_DATA_TAIL = "bad dataTail geometry";
+    pub const D_MAX_RECID = "maxRecid has no addressable index slot";
+
+    /// [`openFile`](StoreDirect.openFile), reporting WHICH check refused.
+    pub fn openFileDiag(
+        alloc: Allocator,
+        path: []const u8,
+        thread_safe: bool,
+        note: ?*OpenNote,
+    ) DbError!Self {
         var self = try newEmpty(alloc, try Volume.openFile(alloc, path), thread_safe);
         errdefer self.freeAll();
         const length = try self.vol.length();
@@ -146,10 +179,11 @@ pub const StoreDirect = struct {
             // (06-decisions.md:271) after its first content sync.
             try self.vol.syncParentDir(path);
         } else if (length < PAGE_SIZE) {
+            if (note) |n| n.reason = D_SHORT_FILE;
             return error.DataCorruption; // store file smaller than the header page
         } else {
             try self.vol.ensureAvailable(PAGE_SIZE);
-            try self.initOpen();
+            try self.initOpen(note);
         }
         return self;
     }
@@ -211,24 +245,55 @@ pub const StoreDirect = struct {
         try self.vol.sync();
     }
 
-    fn initOpen(self: *Self) DbError!void {
-        if (try self.vol.length() < PAGE_SIZE) return error.DataCorruption;
-        if (try self.vol.getU64(0) != MAGIC) return error.DataCorruption; // bad magic
-        if (try self.vol.getI32(O_FEATURES) != 0) return error.DataCorruption; // unsupported features
-        if (try self.vol.getI32(O_HEAD_CHECKSUM) != try self.headChecksum())
+    /// `note` records which check refused, for a caller that must tell these
+    /// refusals apart — they are one error tag between them. The deeper walks
+    /// this calls (`dataTail`, `maxRecid`, `loadIndexPages`,
+    /// `recomputeFreeDataBytes`) have corruption exits of their own and note
+    /// NOTHING, so an empty reason beside a `DataCorruption` means "one of the
+    /// structural walks, not one of the header checks". A predicate that must
+    /// name a specific check therefore fails closed on them, which is the right
+    /// way round.
+    fn initOpen(self: *Self, note: ?*OpenNote) DbError!void {
+        if (try self.vol.length() < PAGE_SIZE) {
+            if (note) |n| n.reason = D_SHORT_FILE;
+            return error.DataCorruption;
+        }
+        if (try self.vol.getU64(0) != MAGIC) {
+            if (note) |n| n.reason = D_BAD_MAGIC;
+            return error.DataCorruption; // bad magic
+        }
+        if (try self.vol.getI32(O_FEATURES) != 0) {
+            if (note) |n| n.reason = D_FEATURES;
+            return error.DataCorruption; // unsupported features
+        }
+        if (try self.vol.getI32(O_HEAD_CHECKSUM) != try self.headChecksum()) {
+            if (note) |n| n.reason = D_HEAD_CHECKSUM;
             return error.DataCorruption; // not closed cleanly / corrupted
+        }
         const ft = try self.fileTail();
-        if (ft < PAGE_SIZE or ft % PAGE_SIZE != 0) return error.DataCorruption; // bad fileTail
-        if (try self.vol.length() < ft) return error.DataCorruption; // truncated
+        if (ft < PAGE_SIZE or ft % PAGE_SIZE != 0) {
+            if (note) |n| n.reason = D_FILE_TAIL;
+            return error.DataCorruption; // bad fileTail
+        }
+        if (try self.vol.length() < ft) {
+            if (note) |n| n.reason = D_TRUNCATED;
+            return error.DataCorruption; // truncated
+        }
         try self.vol.ensureAvailable(ft);
         // dataTail geometry (see Rust note): a crafted fileTail==dataTail==PAGE_SIZE
         // would make the first allocation write into an unmapped slice → reject.
         const dt = try self.dataTail(); // validates parity
-        if (!dataTailGeometryOk(dt, ft)) return error.DataCorruption; // bad dataTail
+        if (!dataTailGeometryOk(dt, ft)) {
+            if (note) |n| n.reason = D_DATA_TAIL;
+            return error.DataCorruption; // bad dataTail
+        }
         const mr = try self.maxRecid(); // validates parity
         try self.loadIndexPages(ft);
         // maxRecid must have an addressable index slot in the loaded mirror.
-        if (!(try self.maxRecidGeometryOk(mr))) return error.DataCorruption; // bad maxRecid
+        if (!(try self.maxRecidGeometryOk(mr))) {
+            if (note) |n| n.reason = D_MAX_RECID;
+            return error.DataCorruption; // bad maxRecid
+        }
         try self.recomputeFreeDataBytes();
     }
 

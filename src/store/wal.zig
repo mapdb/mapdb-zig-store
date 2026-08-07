@@ -1739,14 +1739,23 @@ pub const StoreWAL = struct {
         const base_owned = alloc.dupe(u8, base) catch return error.OutOfMemory;
         errdefer alloc.free(base_owned);
         var inner = try StoreDirect.init(alloc, opts.thread_safe);
-        var segs = WalSegmentSet.openWithIo(alloc, base, opts.read_only, opts.io) catch |e| {
+        // The caller's `Diag` is chosen BEFORE the segment-set open, not after
+        // it, so a refusal from the set reaches the caller with its reason
+        // attached. It used to be chosen on the next line and the set's own
+        // diagnostic died with the set: every legacy-boundary and header-
+        // classification refusal arrived outside as a bare `DataCorruption`,
+        // which is codex round 1 finding 3 on C5t. The reasons are static
+        // strings owned by `wal_segments.zig`, so nothing here outlives them.
+        var local_diag: Diag = .{};
+        const diag = opts.diag orelse &local_diag;
+        var seg_note: WalSegmentSet.OpenNote = .{};
+        var segs = WalSegmentSet.openWithIo(alloc, base, opts.read_only, opts.io, &seg_note) catch |e| {
             inner.deinit();
+            if (seg_note.reason.len != 0) diag.note(seg_note.reason, seg_note.seq, 0, 0, 0);
             return e;
         };
         // A failed recovery closes and frees the set, which releases the store
         // lock — Java's `finally { closeQuietly() }`.
-        var local_diag: Diag = .{};
-        const diag = opts.diag orelse &local_diag;
         const rec = wr.recover(&segs, &inner, opts.replay_buf, alloc, diag) catch |e| {
             segs.deinit();
             inner.deinit();
