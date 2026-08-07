@@ -1720,6 +1720,17 @@ pub const StoreWAL = struct {
     }
 
     pub fn openCfg(alloc: Allocator, base: []const u8, opts: WalOptions) DbError!Self {
+        // FIRST, before any refusal at all. `wr.recover` clears this too, but
+        // recovery is never entered when an earlier step failed — so without
+        // this line a `Diag` reused after a D1 refusal still reads D1 through a
+        // later `WrongConfiguration`, allocation failure, `StoreFull` or
+        // segment-set refusal that writes none. Round 2 of review found that,
+        // and found the first draft's "only write the note when it is non-empty"
+        // repairs nothing on its own. Every early return below this line now
+        // leaves the caller either THIS open's reason or an empty one.
+        var local_diag: Diag = .{};
+        const diag = opts.diag orelse &local_diag;
+        diag.* = .{};
         if (opts.segment_bytes < MIN_SEGMENT_BYTES) {
             return error.WrongConfiguration; // WAL segment size below the 61-byte minimum (a segment header plus one section header)
         }
@@ -1739,15 +1750,13 @@ pub const StoreWAL = struct {
         const base_owned = alloc.dupe(u8, base) catch return error.OutOfMemory;
         errdefer alloc.free(base_owned);
         var inner = try StoreDirect.init(alloc, opts.thread_safe);
-        // The caller's `Diag` is chosen BEFORE the segment-set open, not after
-        // it, so a refusal from the set reaches the caller with its reason
-        // attached. It used to be chosen on the next line and the set's own
+        // The caller's `Diag` is chosen at the TOP of this function, not here,
+        // so a refusal from the segment set reaches the caller with its reason
+        // attached. It used to be chosen on the line below and the set's own
         // diagnostic died with the set: every legacy-boundary and header-
         // classification refusal arrived outside as a bare `DataCorruption`,
         // which is codex round 1 finding 3 on C5t. The reasons are static
         // strings owned by `wal_segments.zig`, so nothing here outlives them.
-        var local_diag: Diag = .{};
-        const diag = opts.diag orelse &local_diag;
         var seg_note: WalSegmentSet.OpenNote = .{};
         var segs = WalSegmentSet.openWithIo(alloc, base, opts.read_only, opts.io, &seg_note) catch |e| {
             inner.deinit();

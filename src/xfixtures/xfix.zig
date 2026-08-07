@@ -2350,12 +2350,16 @@ fn refusalOf(ctx: *Ctx, opener: []const u8, mode: []const u8, base: []const u8, 
 /// a **failure**: the alternative is a green cell whose reopen was checked by
 /// nothing.
 ///
-/// **The `opener` is a parameter because it is the only thing that separates two
-/// of the five families.** C5t's `reopen` rows brought `direct-magic` and `D1`
-/// here, and in this engine both are a bare `error.DataCorruption` with no
-/// diagnostic: one from `StoreDirect.openFile`'s magic check, one from
-/// `WalSegmentSet`'s legacy-boundary rows. Nothing in the `Refusal` tells them
-/// apart, so the predicate is given the thing that does.
+/// **The `opener` is a parameter because a reason alone does not say who
+/// produced it.** C5t's `reopen` rows brought `direct-magic` and `D1` here, and
+/// in this engine both were a bare `error.DataCorruption` with no diagnostic at
+/// all: one from `StoreDirect.openFile`'s magic check, one from
+/// `WalSegmentSet`'s legacy-boundary rows. Round 1 of review found that "no
+/// diagnostic" describes four other rules too, so both openers now carry one
+/// (`StoreDirect.OpenNote`, `WalSegmentSet.OpenNote` mirrored into the caller's
+/// `Diag`) and the `Refusal` holds them in SEPARATE fields, one per opener. The
+/// opener is what says which field is the one this refusal wrote — a predicate
+/// given the wrong one would be reading a channel its opener never touches.
 /// D1's two PORT rows — the ones with no Java counterpart, because Java's base
 /// has never named a file.
 ///

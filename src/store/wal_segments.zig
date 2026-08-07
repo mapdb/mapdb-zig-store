@@ -342,6 +342,13 @@ pub const WalSegmentSet = struct {
         io: ?*const WalIo,
         note_out: ?*OpenNote,
     ) DbError!Self {
+        // CLEARED on entry, before any early return. Round 2 of review found the
+        // first draft filled the note only from an `errdefer` declared partway
+        // down, so an open that failed ABOVE that line — a base with no file
+        // name, an allocation failure — left whatever a previous open had put
+        // there. A diagnostic that can outlive the refusal it describes is worse
+        // than none.
+        if (note_out) |n| n.* = .{};
         const abs: []u8 = if (std.fs.path.isAbsolute(base))
             (alloc.dupe(u8, base) catch return error.OutOfMemory)
         else abs: {

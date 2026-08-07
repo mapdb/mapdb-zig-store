@@ -164,12 +164,21 @@ pub const StoreDirect = struct {
     pub const D_MAX_RECID = "maxRecid has no addressable index slot";
 
     /// [`openFile`](StoreDirect.openFile), reporting WHICH check refused.
+    ///
+    /// **The note is CLEARED on entry**, so what it holds afterwards is this
+    /// open's answer or nothing. Round 2 of review found the first draft did
+    /// not: a caller reusing an `OpenNote` after a bad-magic refusal saw
+    /// `D_BAD_MAGIC` reported for a later refusal from one of the deep walks,
+    /// which annotate nothing. A diagnostic that can outlive the refusal it
+    /// describes is worse than none, because a predicate reading it cannot tell
+    /// the two apart.
     pub fn openFileDiag(
         alloc: Allocator,
         path: []const u8,
         thread_safe: bool,
         note: ?*OpenNote,
     ) DbError!Self {
+        if (note) |n| n.* = .{};
         var self = try newEmpty(alloc, try Volume.openFile(alloc, path), thread_safe);
         errdefer self.freeAll();
         const length = try self.vol.length();

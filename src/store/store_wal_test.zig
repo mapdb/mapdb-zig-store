@@ -709,6 +709,44 @@ test "wal3: mid-log corruption is fatal — body and header" {
     }
 }
 
+// The recovery `Diag` is THIS open's answer or nothing.
+//
+// codex round 2 on C5t: C5t taught `openCfg` to copy the segment set's static
+// reason into the caller's `Diag` when the segment-set open fails, and wrote it
+// only when the reason was non-empty. That repairs nothing on its own — a caller
+// reusing a `Diag` then reads the PREVIOUS refusal's reason through a later one
+// that writes none, and `wr.recover` cannot clear it because recovery is never
+// entered after an earlier failure. A diagnostic that can outlive the refusal it
+// describes is worse than none: `xfix.assertFamily` grades families on exactly
+// this field.
+//
+// Two opens through ONE `Diag`. The first is D1, which writes a reason; the
+// second is `WrongConfiguration`, which is refused above every line that could
+// write one. It must leave the field empty.
+test "wal3: the recovery Diag is this open's answer or nothing" {
+    const a = testing.allocator;
+    var sc = try Scratch.init(a, "diagreset");
+    defer sc.deinit();
+
+    // A regular file AT the base path: D1's legacy boundary, refused before
+    // recovery runs, with a reason.
+    {
+        const f = try std.fs.cwd().createFile(sc.base, .{});
+        defer f.close();
+        try f.writeAll("not a segment set");
+    }
+    var d: wr.Diag = .{};
+    try testing.expectError(error.DataCorruption, StoreWAL.openCfg(a, sc.base, .{ .diag = &d }));
+    try testing.expect(d.reason.len > 0);
+
+    // …and a refusal that writes none, through the same Diag.
+    try testing.expectError(error.WrongConfiguration, StoreWAL.openCfg(a, sc.base, .{
+        .diag = &d,
+        .segment_bytes = 1,
+    }));
+    try testing.expectEqualStrings("", d.reason);
+}
+
 test "wal3: a damaged segment header below the highest name refuses the open" {
     const a = testing.allocator;
     var sc = try Scratch.init(a, "hdrlow");

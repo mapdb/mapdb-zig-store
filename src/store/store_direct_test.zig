@@ -966,6 +966,49 @@ test "differential vs StoreByteArray oracle (3000 ops)" {
     try direct.verify();
 }
 
+// The open diagnostic is THIS open's answer or nothing.
+//
+// codex round 2 on C5t: `OpenNote` was filled on the refusal paths and never
+// cleared, so a caller reusing one saw the previous open's reason reported for a
+// later refusal that annotates nothing — the deep structural walks note nothing
+// by design. A diagnostic that can outlive the refusal it describes is worse
+// than none, because a predicate reading it cannot tell the two apart, and
+// `xfix.assertFamily` is exactly such a predicate.
+//
+// Two opens through ONE note: a bad-magic refusal, then a clean open. The
+// second must leave the note empty, and it is the clear-on-entry that does it.
+test "openFileDiag: the note is this open's answer or nothing" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const bad = try tmpPath(a, &tmp, "bad-magic.sd1");
+    defer a.free(bad);
+    {
+        // A file long enough to reach the magic word and holding the wrong one.
+        const f = try std.fs.cwd().createFile(bad, .{});
+        defer f.close();
+        const filler = try a.alloc(u8, 1 << 20); // one slice: past the header page
+        defer a.free(filler);
+        @memset(filler, 0x5A);
+        try f.writeAll(filler);
+    }
+
+    var note: StoreDirect.OpenNote = .{};
+    try testing.expectError(error.DataCorruption,
+        StoreDirect.openFileDiag(a, bad, true, &note));
+    try testing.expectEqualStrings(StoreDirect.D_BAD_MAGIC, note.reason);
+
+    const good = try tmpPath(a, &tmp, "good.sd1");
+    defer a.free(good);
+    {
+        var s = try StoreDirect.openFileDiag(a, good, true, &note);
+        defer s.deinit();
+        try s.close();
+    }
+    try testing.expectEqualStrings("", note.reason);
+}
+
 test {
     testing.refAllDecls(@This());
 }

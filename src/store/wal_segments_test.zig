@@ -1427,3 +1427,35 @@ test "wal3 B0: a residue unlink that fails fails the open" {
     defer set.deinit();
     try testing.expect(!try sc.segExists(2));
 }
+
+// The open note is THIS open's answer or nothing.
+//
+// codex round 2 on C5t. The note is filled from an `errdefer` declared partway
+// down `openWithIo`, so an open that fails ABOVE that line — a base with no
+// file-name component, an allocation failure — writes nothing, and a caller
+// reusing the note would read the previous refusal's reason through it.
+// `StoreWAL.openCfg` clears the caller's `Diag` on entry and would mask this,
+// which is exactly why the guard belongs here too: `openWithIo` is public and
+// its contract is its own.
+//
+// Two opens through ONE note. The first is D1, refused with a reason; the
+// second is refused above every line that could write one.
+test "wal3 B0: the open note is this open's answer or nothing" {
+    const a = testing.allocator;
+    var sc = try Scratch.init(a, "notereset");
+    defer sc.deinit();
+    {
+        const f = try std.fs.cwd().createFile(sc.base, .{});
+        defer f.close();
+        try f.writeAll("a v1 log where a base belongs");
+    }
+
+    var note: WalSegmentSet.OpenNote = .{};
+    try testing.expectError(error.DataCorruption,
+        WalSegmentSet.openWithIo(a, sc.base, false, null, &note));
+    try testing.expect(note.reason.len > 0);
+
+    try testing.expectError(error.WrongConfiguration,
+        WalSegmentSet.openWithIo(a, "/", false, null, &note));
+    try testing.expectEqualStrings("", note.reason);
+}
