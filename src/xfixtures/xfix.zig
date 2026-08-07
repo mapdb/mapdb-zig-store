@@ -2868,24 +2868,32 @@ pub const Cells = struct {
             if (!cellEq(.{ p.fixture, p.engine, p.mode }, .{ e.fixture, ENGINE, e.mode })) continue;
             if (eql(p.verb, "modified") or eql(p.verb, "truncated") or eql(p.verb, "deleted")) any = true;
         }
-        // A DIVERGENCE: another engine reaches a different verdict on this same
-        // fixture and mode. Read from `expect` rows the manifest already holds —
-        // it needs no column of its own, because the divergence IS the
-        // disagreement between two rows both already there.
+        // THE SIXTH ARM IS JAVA'S ALONE, AND IT IS DELIBERATELY ABSENT HERE.
         //
-        // The staged run found this arm, on the next cell of the same shape once
-        // the post-row arm let it get that far — lesson (h) at corpus scale.
-        // `div-wal3-entry-recid0` carries only the universal `x.lock` row, and
-        // the catalogue says why: java's behaviour on it is UNDEFINED
+        // java's `requireSomeOracle` carries a DIVERGENCE arm: another engine
+        // reaches a different verdict on this same fixture and mode, so the
+        // cell's claim is the verdict itself. It was written for
+        // `div-wal3-entry-recid0`, where java's behaviour is UNDEFINED
         // (`recidToOffset` computes `recid - 1`) and pinning a logical state
-        // would freeze an accident. The claim is the verdict, and it is graded —
-        // an engine that changed its mind fails the `expect` row.
-        for (m.expects.items) |o| {
-            if (eql(o.fixture, e.fixture) and eql(o.mode, e.mode) and
-                !eql(o.engine, ENGINE) and !eql(o.verdict, e.verdict)) any = true;
-        }
+        // would freeze an accident.
+        //
+        // This engine had that arm too, for one day, and round 4 measured it:
+        // **it can never fire here.** All three of the corpus's divergent
+        // (fixture, mode) groups — `div-wal3-lsn-exhausted`,
+        // `div-wal3-entry-recid0`, `div-wal3-packlong-overlong` — are java
+        // ACCEPT against ports REJECT, and this guard runs on the accept arm
+        // only. So for every zig accept cell in either root the arm was `false`
+        // outright, not masked by an earlier disjunct: deleting it cannot change
+        // any result of any run this engine has ever done, the staged one
+        // included. It went, rather than staying as a guard nothing can trip.
+        //
+        // What that costs, stated rather than discovered: if a future corpus
+        // ever holds a cell this engine ACCEPTS and another REJECTS, this guard
+        // refuses it and java's does not. That refusal is the right red — it
+        // says the arm is now reachable and owes a doctored input of its own
+        // before it comes back.
         if (!any)
-            return ctx.err("[{s}] an accept cell with no recid rows, no action, no reopen, no post row claiming a change, no engine disagreeing about the verdict and a writable handle asserts nothing about the store it opened, which is not a check", .{cell});
+            return ctx.err("[{s}] an accept cell with no recid rows, no action, no reopen, no post row claiming a change and a writable handle asserts nothing about the store it opened, which is not a check. If this cell is one another engine REJECTS, the divergence arm this engine deliberately does not carry is now reachable and owes a doctored input", .{cell});
     }
 };
 
