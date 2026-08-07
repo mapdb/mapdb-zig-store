@@ -604,6 +604,10 @@ test "xfixtures corpus: the preconditions and bounds each refuse" {
         drop2: []const u8 = "",
         drop_contains: []const u8 = "",
         drop_ro: bool = false,
+        // Every zig/ro cell whose verdict is ACCEPT — found by reading the
+        // manifest, not by naming one. Naming one is what the preflight root
+        // allowed and the frozen corpus does not: see the case that uses this.
+        drop_ro_accept: bool = false,
         add: []const u8 = "",
     };
     const cases = [_]Case{
@@ -654,12 +658,24 @@ test "xfixtures corpus: the preconditions and bounds each refuse" {
             .what = "a corpus with no ro accept cell",
             .saying = "has no zig ro accept cell",
             .mode = "ro",
-            // EVERY row of that cell, not two of its three: leaving its `post`
-            // row behind makes the suite-wide addressing rule fire first, and
-            // the case measures that instead (lesson h, caught by running it —
-            // for the third time in this slice, which is why every one of these
+            // EVERY row of EVERY such cell, and both halves of that matter.
+            //
+            // Every ROW of a cell, not two of its three: leaving its `post` row
+            // behind makes the suite-wide addressing rule fire first, and the
+            // case measures that instead (lesson h, caught by running it — for
+            // the third time in this slice, which is why every one of these
             // cases asserts the MESSAGE and not merely "it refused").
-            .drop_contains = "wal3-java-cleaned\tzig\tro",
+            //
+            // Every such CELL, found by reading the manifest. This case named
+            // `wal3-java-cleaned` outright, which was the preflight root's only
+            // zig/ro accept cell — so against the thirty-fixture corpus it
+            // dropped one of several, left the precondition satisfied, and the
+            // probe got an acceptance where it wanted a refusal. **The staged
+            // run found it, and only the staged run could have**: a doctoring
+            // written against a four-fixture root under-doctors a thirty-fixture
+            // one, and the case passed for four slices meaning something
+            // narrower than it said.
+            .drop_ro_accept = true,
         },
         // A `bytes` row longer than this reader renders. The bound is REACHABLE —
         // `hexBytes` permits any whole number of bytes — and the module doc
@@ -676,6 +692,22 @@ test "xfixtures corpus: the preconditions and bounds each refuse" {
     for (cases, 0..) |c, i| {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(a);
+        // Which fixtures have a zig/ro ACCEPT cell — read off the manifest, so
+        // the doctoring scales with the corpus instead of naming what one root
+        // happened to hold.
+        var ro_accept: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer ro_accept.deinit(a);
+        if (c.drop_ro_accept) {
+            var scan = std.mem.splitScalar(u8, corpus_manifest_tsv, '\n');
+            while (scan.next()) |line| {
+                if (!std.mem.startsWith(u8, line, "expect\t")) continue;
+                if (std.mem.indexOf(u8, line, "\tzig\tro\taccept\t") == null) continue;
+                var f = std.mem.splitScalar(u8, line, '\t');
+                _ = f.next();
+                if (f.next()) |fix| try ro_accept.append(a, fix);
+            }
+            try testing.expect(ro_accept.items.len > 0);
+        }
         var it = std.mem.splitScalar(u8, corpus_manifest_tsv, '\n');
         while (it.next()) |line| {
             if (line.len == 0) continue;
@@ -684,10 +716,22 @@ test "xfixtures corpus: the preconditions and bounds each refuse" {
             if (c.drop_contains.len != 0 and std.mem.indexOf(u8, line, c.drop_contains) != null) continue;
             if (c.drop_ro and (std.mem.startsWith(u8, line, "applies\t") or std.mem.startsWith(u8, line, "expect\t")) and
                 std.mem.indexOf(u8, line, "\tzig\tro") != null) continue;
+            if (c.drop_ro_accept) {
+                var dropped = false;
+                for (ro_accept.items) |fix| {
+                    // `<fixture>\tzig\tro` catches `applies`, `expect`, `post`,
+                    // `reopen`, `bytes` and `action` alike — every row type that
+                    // addresses a cell puts those three fields adjacent.
+                    var key_buf: [128]u8 = undefined;
+                    const key = try std.fmt.bufPrint(&key_buf, "{s}\tzig\tro", .{fix});
+                    if (std.mem.indexOf(u8, line, key) != null) dropped = true;
+                }
+                if (dropped) continue;
+            }
             try out.appendSlice(a, line);
             try out.append(a, '\n');
         }
-        if (c.drop.len != 0 or c.drop_ro or c.drop_contains.len != 0)
+        if (c.drop.len != 0 or c.drop_ro or c.drop_contains.len != 0 or c.drop_ro_accept)
             try testing.expect(out.items.len < corpus_manifest_tsv.len);
         try out.appendSlice(a, c.add);
 
