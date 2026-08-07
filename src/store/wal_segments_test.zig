@@ -1451,11 +1451,9 @@ test "wal3 B0: the open note is this open's answer or nothing" {
     }
 
     var note: WalSegmentSet.OpenNote = .{};
-    try testing.expectError(error.DataCorruption,
-        WalSegmentSet.openWithIo(a, sc.base, false, null, &note));
+    try testing.expectError(error.DataCorruption, WalSegmentSet.openWithIo(a, sc.base, false, null, &note));
     try testing.expect(note.reason.len > 0);
 
-    try testing.expectError(error.WrongConfiguration,
-        WalSegmentSet.openWithIo(a, "/", false, null, &note));
+    try testing.expectError(error.WrongConfiguration, WalSegmentSet.openWithIo(a, "/", false, null, &note));
     try testing.expectEqualStrings("", note.reason);
 }

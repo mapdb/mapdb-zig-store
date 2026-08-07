@@ -995,8 +995,7 @@ test "openFileDiag: the note is this open's answer or nothing" {
     }
 
     var note: StoreDirect.OpenNote = .{};
-    try testing.expectError(error.DataCorruption,
-        StoreDirect.openFileDiag(a, bad, true, &note));
+    try testing.expectError(error.DataCorruption, StoreDirect.openFileDiag(a, bad, true, &note));
     try testing.expectEqualStrings(StoreDirect.D_BAD_MAGIC, note.reason);
 
     const good = try tmpPath(a, &tmp, "good.sd1");
