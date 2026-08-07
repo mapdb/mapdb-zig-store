@@ -2868,8 +2868,24 @@ pub const Cells = struct {
             if (!cellEq(.{ p.fixture, p.engine, p.mode }, .{ e.fixture, ENGINE, e.mode })) continue;
             if (eql(p.verb, "modified") or eql(p.verb, "truncated") or eql(p.verb, "deleted")) any = true;
         }
+        // A DIVERGENCE: another engine reaches a different verdict on this same
+        // fixture and mode. Read from `expect` rows the manifest already holds —
+        // it needs no column of its own, because the divergence IS the
+        // disagreement between two rows both already there.
+        //
+        // The staged run found this arm, on the next cell of the same shape once
+        // the post-row arm let it get that far — lesson (h) at corpus scale.
+        // `div-wal3-entry-recid0` carries only the universal `x.lock` row, and
+        // the catalogue says why: java's behaviour on it is UNDEFINED
+        // (`recidToOffset` computes `recid - 1`) and pinning a logical state
+        // would freeze an accident. The claim is the verdict, and it is graded —
+        // an engine that changed its mind fails the `expect` row.
+        for (m.expects.items) |o| {
+            if (eql(o.fixture, e.fixture) and eql(o.mode, e.mode) and
+                !eql(o.engine, ENGINE) and !eql(o.verdict, e.verdict)) any = true;
+        }
         if (!any)
-            return ctx.err("[{s}] an accept cell with no recid rows, no action, no reopen, no post row claiming a change and a writable handle asserts nothing about the store it opened, which is not a check", .{cell});
+            return ctx.err("[{s}] an accept cell with no recid rows, no action, no reopen, no post row claiming a change, no engine disagreeing about the verdict and a writable handle asserts nothing about the store it opened, which is not a check", .{cell});
     }
 };
 
