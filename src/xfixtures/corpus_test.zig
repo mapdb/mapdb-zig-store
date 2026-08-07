@@ -84,7 +84,7 @@
 //! `mut_z.py`, and `campaigns/disclose_z.sh` is the runner that grades them —
 //! with the opposite convention to `mutants_z.sh`, because here a SURVIVOR
 //! confirms the claim and a KILL means this list is wrong. It reported
-//! `disclosure: 6 confirmed, 0 refuted, 0 unmeasured`.
+//! `disclosure: 7 confirmed, 0 refuted, 0 unmeasured`.
 //!
 //! - `leaf_rocount`, `leaf_roprobed`, `leaf_rootset`, `leaf_distseal` — the
 //!   `ro_probed` count and membership comparisons, the corpus-root file-set
@@ -99,6 +99,20 @@
 //! - `leaf_capture_isfile` — `capture`'s "not a regular file" refusal. Not a
 //!   leaf but SUBSUMED: deleting it leaves the read failing on the same input
 //!   with a worse message, so what it buys is the diagnosis, not the refusal.
+//! - `leaf_keybound` — `Consumption.consume`'s key-length bound, added by round
+//!   2. Subsumed the same way: a `relName` long enough to overflow the 256-byte
+//!   key buffer fails placement or the missing-file rules first. It is an
+//!   invariant of the accountant rather than of the manifest, so it is disclosed
+//!   with a mutant rather than deleted.
+//!
+//! **This paragraph was itself wrong for two commits**, and that is worth
+//! leaving on the record: round 2 added the seventh entry to the runner and this
+//! doc went on saying six and naming six. An inaccurate disclosure is a claim
+//! like any other — the defect C5r's review filed twice and this whole mechanism
+//! exists to prevent — and the way it recurred here is the way it always does:
+//! the runner and its description are two places, and only one of them was
+//! edited. The count is `grep -c '^case_ ' disclose_z.sh`; do not trust this
+//! sentence over that command.
 //!
 //! **One check is killed only by a WEAKER signal**, and the runner names it:
 //! `bytesrange`, whose deletion makes the slice go out of bounds, so the red is
