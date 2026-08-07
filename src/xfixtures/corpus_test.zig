@@ -480,6 +480,126 @@ test "xfixtures corpus: a direct cell addressed to the ro mode is refused" {
     );
 }
 
+// Five corpus PRECONDITIONS and bounds, each with the input round 2 of review
+// measured it did not have.
+//
+// Round 1 found the disclosure list short by seven and the repair enumerated the
+// EXECUTOR; round 2 found eleven more, because the slice's touched surface is
+// also the parser, the corpus preconditions and the bounds. Measuring the
+// entries is not the same as measuring the set, and measuring the executor is
+// not the same as measuring the slice. These are the reachable half of round 2's
+// finding 3, each routed through the production path.
+test "xfixtures corpus: the preconditions and bounds each refuse" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const Case = struct {
+        what: []const u8,
+        saying: []const u8,
+        mode: []const u8,
+        drop: []const u8 = "",
+        drop2: []const u8 = "",
+        drop_contains: []const u8 = "",
+        drop_ro: bool = false,
+        add: []const u8 = "",
+    };
+    const cases = [_]Case{
+        // An `accept` cell through the DIRECT opener. `V2_OPENERS` and `VERDICTS`
+        // are vocabulary-checked independently, so nothing in the grammar stops
+        // this — and without the refusal the cell is opened through the WAL
+        // opener and fully graded, which is dispatch-by-manifest ignored for the
+        // accept arm: C3z's "selecting a flag is not coverage", one verdict over.
+        .{
+            .what = "an accept cell through the direct opener",
+            .saying = "an accept cell through a non-wal3 opener",
+            .mode = "ro",
+            .add = "applies\treject-wal3-segment-at-direct\tzig\tro\nexpect\treject-wal3-segment-at-direct\tzig\tro\taccept\tdirect\tx\n",
+        },
+        // A fixture whose only rows are `applies`+`expect`: the parser requires
+        // that SOME row refer to each fixture and that the manifest have file
+        // rows, not that every fixture have one.
+        .{
+            .what = "a fixture with no file rows",
+            .saying = "fixture has no file rows",
+            .mode = "ro",
+            .add = "fixture\tghost\treject\tjava\tc\napplies\tghost\tzig\tro\nexpect\tghost\tzig\tro\treject\twal3\tx\n",
+        },
+        // An accept cell over an image this engine refuses.
+        .{
+            .what = "an accept cell whose store refuses to open",
+            .saying = "accept cell failed to open",
+            .mode = "ro",
+            .drop = "expect\treject-wal3-d1-barebase\tzig\tro\treject\twal3\tx",
+            .add = "expect\treject-wal3-d1-barebase\tzig\tro\taccept\twal3\tx\n",
+        },
+        // `applies` rows in one mode only, run in the other. EVERY zig/ro row
+        // goes, not one: dropping a single `applies` row leaves its `expect`
+        // orphaned and the applies/expect comparison fires first, so the case
+        // would measure that instead (lesson h, caught by running it).
+        .{
+            .what = "a mode the corpus declares no applies rows for",
+            .saying = "declares no zig applies rows for mode",
+            .mode = "ro",
+            .drop_ro = true,
+        },
+        // Every zig/ro ACCEPT cell gone, leaving only reject cells: the
+        // read-only write probe then has no input at all, which is the thing
+        // this precondition exists to refuse. Its two NEIGHBOURS
+        // (`leaf_rocount`, `leaf_roprobed`) are on the measured disclosure list
+        // and it was on neither.
+        .{
+            .what = "a corpus with no ro accept cell",
+            .saying = "has no zig ro accept cell",
+            .mode = "ro",
+            // EVERY row of that cell, not two of its three: leaving its `post`
+            // row behind makes the suite-wide addressing rule fire first, and
+            // the case measures that instead (lesson h, caught by running it —
+            // for the third time in this slice, which is why every one of these
+            // cases asserts the MESSAGE and not merely "it refused").
+            .drop_contains = "wal3-java-cleaned\tzig\tro",
+        },
+        // A `bytes` row longer than this reader renders. The bound is REACHABLE —
+        // `hexBytes` permits any whole number of bytes — and the module doc
+        // describes it, so a described mechanism with no red is the C2j B-finding
+        // shape this slice corrected twice in comments and left here in code.
+        .{
+            .what = "a bytes row longer than this reader renders",
+            .saying = "assertion longer than this reader renders",
+            .mode = "rw",
+            .add = "bytes\twal3-java-cleaned\tzig\trw\tx.wal.0000000000000004\t0\t" ++ ("ab" ** 40) ++ "\n",
+        },
+    };
+
+    for (cases, 0..) |c, i| {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(a);
+        var it = std.mem.splitScalar(u8, corpus_manifest_tsv, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            if (c.drop.len != 0 and std.mem.eql(u8, line, c.drop)) continue;
+            if (c.drop2.len != 0 and std.mem.eql(u8, line, c.drop2)) continue;
+            if (c.drop_contains.len != 0 and std.mem.indexOf(u8, line, c.drop_contains) != null) continue;
+            if (c.drop_ro and (std.mem.startsWith(u8, line, "applies\t") or std.mem.startsWith(u8, line, "expect\t")) and
+                std.mem.indexOf(u8, line, "\tzig\tro") != null) continue;
+            try out.appendSlice(a, line);
+            try out.append(a, '\n');
+        }
+        if (c.drop.len != 0 or c.drop_ro or c.drop_contains.len != 0)
+            try testing.expect(out.items.len < corpus_manifest_tsv.len);
+        try out.appendSlice(a, c.add);
+
+        var sample = try loadDoctored(&ctx, out.items);
+        defer sample.deinit(a);
+        var name_buf: [32]u8 = undefined;
+        var dir = try tmp.dir.makeOpenPath(try std.fmt.bufPrint(&name_buf, "pre-{d}", .{i}), .{ .iterate = true });
+        defer dir.close();
+        try xfix.expectRefusedSaying(&ctx, c.what, c.saying, xfix.runV2CorpusCells, .{ &ctx, &sample, c.mode, dir, xfix.Dispatch.by_manifest });
+    }
+    try testing.expectEqual(@as(usize, 6), cases.len);
+}
+
 // A `reject` cell whose store OPENS must fail.
 //
 // No conforming corpus supplies that input — every reject cell really does

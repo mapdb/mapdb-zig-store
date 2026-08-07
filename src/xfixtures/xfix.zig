@@ -779,11 +779,20 @@ fn actionArgs(ctx: *Ctx, s: []const u8, line: []const u8) Error![]const u8 {
     while (it.next()) |pair| {
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse
             return ctx.err("action argument `{s}` is not one k=v pair in: {s}", .{ pair, line });
-        if (eq == 0 or std.mem.count(u8, pair, "=") != 1)
+        // TWO statements, not one: an empty key and a second `=` are different
+        // malformations and a conjunction gives neither its own red. Measured —
+        // the collapsed form's deletion made `k[0]` index an empty slice and the
+        // mutant died by a PANIC rather than by a rule.
+        if (eq == 0)
+            return ctx.err("action argument `{s}` has an empty key in: {s}", .{ pair, line });
+        if (std.mem.count(u8, pair, "=") != 1)
             return ctx.err("action argument `{s}` is not one k=v pair in: {s}", .{ pair, line });
         const k = pair[0..eq];
         const v = pair[eq + 1 ..];
-        if (k[0] < 'a' or k[0] > 'z')
+        // `k.len == 0` FIRST, so deleting the empty-key refusal above lands here
+        // with a named message instead of an out-of-bounds index. A guard whose
+        // removal is a panic is a guard whose red belongs to the language.
+        if (k.len == 0 or k[0] < 'a' or k[0] > 'z')
             return ctx.err("action argument key `{s}` is not [a-z][a-z0-9_]* in: {s}", .{ k, line });
         for (k) |c| {
             const ok = (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_';
@@ -2390,7 +2399,8 @@ fn assertBytesRows(
         var got_buf: [64]u8 = undefined;
         if (len > got_buf.len / 2)
             return ctx.err("[{s}] bytes[{s}@{d}]: assertion longer than this reader renders", .{ cell, b.rel, b.offset });
-        const got = std.fmt.bufPrint(&got_buf, "{x}", .{now[b.offset..end]}) catch unreachable;
+        const got = std.fmt.bufPrint(&got_buf, "{x}", .{now[b.offset..end]}) catch
+            return ctx.err("[{s}] bytes[{s}@{d}]: the rendered assertion does not fit", .{ cell, b.rel, b.offset });
         if (!eql(got, b.hex))
             return ctx.err("[{s}] bytes[{s}@{d}]: the asserted bytes are {s}, want {s}", .{ cell, b.rel, b.offset, got, b.hex });
         try owed.consume(ctx, "bytes {s}@{d}", .{ b.rel, b.offset }, b);
@@ -2588,9 +2598,12 @@ pub const Cells = struct {
             // left to write.
             _ = try refusalOf(ctx, opener, e.mode, base, cell) orelse
                 return ctx.err("[{s}] expected a refusal, but the store opened", .{cell});
-        } else {
-            return ctx.err("[{s}] unsupported verdict {s}", .{ cell, e.verdict });
         }
+        // No `else` arm: the verdict vocabulary is pinned to {accept, reject} by
+        // `oneOf` at parse time and both are handled above, so an unsupported
+        // verdict cannot reach here. Round 2 of review measured the arm deletable
+        // with the gate green; C2j's rule is that a check no input can reach goes
+        // rather than stays as a guard nothing can trip.
 
         // THE CAPTURE, taken before the reopen — see `assertPostState`.
         var after = try capture(ctx, cell_dir, cell);

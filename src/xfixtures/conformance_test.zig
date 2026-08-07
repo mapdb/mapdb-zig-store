@@ -871,12 +871,33 @@ test "xfixtures: the C5 oracle rows parse and are checked" {
     try refuse(&ctx, "an applies row for an unknown engine", V2_HEAD ++ V2_FILE ++ "applies\tf\tgo\tro\n");
     try refuse(&ctx, "a duplicate applies row", V2_HEAD ++ V2_FILE ++ "applies\tf\tzig\tro\napplies\tf\tzig\tro\n");
     try refuse(&ctx, "a duplicate action row for one cell and verb", V2_HEAD ++ V2_FILE ++ ACT ++ ACT);
-    try refuse(&ctx, "an action argument that is not k=v", V2_HEAD ++ V2_FILE ++
+    // ONE NEGATIVE PER SITE, not per rule. Round 2 of review measured four of
+    // these sites deletable with the whole suite green, because each rule had a
+    // single negative that reached only its FIRST site — "one case per METHOD is
+    // not one case per BRANCH" (C5r's recurring shape) inside the parser this
+    // time. And this is the authority `runAction` was restructured to lean on,
+    // so an unmeasured half here is an unmeasured foundation under that repair:
+    // the DISTINCT half below is the exact guarantee that let `runAction`'s own
+    // repeated-key check be deleted.
+    try refuse(&ctx, "an action argument with no `=` at all", V2_HEAD ++ V2_FILE ++
         "action\tf\tzig\tro\tcommit_one_record\top\n");
-    try refuse(&ctx, "an action argument key that is not [a-z][a-z0-9_]*", V2_HEAD ++ V2_FILE ++
-        "action\tf\tzig\tro\tcommit_one_record\tOp=put\n");
+    try refuse(&ctx, "an action argument whose key is empty", V2_HEAD ++ V2_FILE ++
+        "action\tf\tzig\tro\tcommit_one_record\t=put\n");
+    try refuse(&ctx, "an action argument with two `=`", V2_HEAD ++ V2_FILE ++
+        "action\tf\tzig\tro\tcommit_one_record\top=a=b\n");
+    // `0p`, not `Op`: `O` is refused by the character-class LOOP as well, so it
+    // measured the loop and left the first-character rule deletable green —
+    // measured. `0` is IN [a-z0-9_], so only the first-character rule refuses it.
+    try refuse(&ctx, "an action argument key whose FIRST character is not [a-z]", V2_HEAD ++ V2_FILE ++
+        "action\tf\tzig\tro\tcommit_one_record\t0p=put\n");
+    try refuse(&ctx, "an action argument key whose LATER character is not [a-z0-9_]", V2_HEAD ++ V2_FILE ++
+        "action\tf\tzig\tro\tcommit_one_record\toP=put\n");
     try refuse(&ctx, "action argument keys out of order", V2_HEAD ++ V2_FILE ++
         "action\tf\tzig\tro\tcommit_one_record\tserializer=raw,op=put\n");
+    try refuse(&ctx, "action argument keys REPEATED", V2_HEAD ++ V2_FILE ++
+        "action\tf\tzig\tro\tcommit_one_record\top=a,op=b\n");
+    try refuse(&ctx, "an action argument value that is EMPTY", V2_HEAD ++ V2_FILE ++
+        "action\tf\tzig\tro\tcommit_one_record\top=\n");
     try refuse(&ctx, "an action argument value outside the pinned character class", V2_HEAD ++ V2_FILE ++
         "action\tf\tzig\tro\tcommit_one_record\top=p t\n");
     try refuse(&ctx, "a duplicate reopen row", V2_HEAD ++ V2_FILE ++
