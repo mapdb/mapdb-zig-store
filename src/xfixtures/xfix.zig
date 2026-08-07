@@ -109,14 +109,12 @@ pub const VERDICTS = [_][]const u8{ "accept", "reject" };
 /// `wal3-namespace`", and `port-wal`/`java-wal-namespace` are **retained as
 /// valid tokens** though no v2 fixture uses them — retiring a fixture family is
 /// not a reason to make a version-dispatch parser reject the token.
-pub const V1_KINDS = [_][]const u8{ "direct", "reject", "port-wal", "java-wal-namespace" };
 pub const V2_KINDS = [_][]const u8{ "direct", "reject", "wal3-namespace", "port-wal", "java-wal-namespace" };
 
 /// A v2 fixture no engine wrote records `derived` here, and then owes exactly
 /// one `derived` row (contract §2, amendment 3).
 pub const V2_GENERATORS = [_][]const u8{ "java", "rust", "zig", "derived" };
 
-pub const V1_OPENERS = [_][]const u8{ "direct", "wal" };
 pub const V2_OPENERS = [_][]const u8{ "direct", "wal3" };
 
 /// sha256 of the empty byte string — the zero-length-content marker that has to
@@ -858,20 +856,7 @@ pub const FileRow = struct {
     gz_sha: []const u8,
 };
 
-/// `expect <fid> <engine> <verdict> <opener> <placeAs> <openArg>` — seven
-/// fields, and the SAME arity as a v2 `expect` row with different columns in
-/// them. That collision is why the version line is a hard dispatch and not a
-/// hint; see [`parse`].
-pub const V1Expect = struct {
-    fixture: []const u8,
-    engine: []const u8,
-    verdict: []const u8,
-    opener: []const u8,
-    place_as: []const u8,
-    open_arg: []const u8,
-};
-
-/// `expect <fid> <engine> <mode> <verdict> <opener> <openArg>`.
+/// `expect <fid> <engine> <mode> <verdict> <opener> <openArg>` — schema v2.
 pub const V2Expect = struct {
     fixture: []const u8,
     engine: []const u8,
@@ -940,22 +925,6 @@ pub const V2Reopen = struct {
     family: []const u8,
 };
 
-pub const V1 = struct {
-    fixtures: std.ArrayListUnmanaged(FixtureRow) = .empty,
-    files: std.ArrayListUnmanaged(FileRow) = .empty,
-    expects: std.ArrayListUnmanaged(V1Expect) = .empty,
-    recids: std.ArrayListUnmanaged(RecidRow) = .empty,
-    owned: Strings = .{},
-
-    pub fn deinit(self: *V1, alloc: Allocator) void {
-        self.fixtures.deinit(alloc);
-        self.files.deinit(alloc);
-        self.expects.deinit(alloc);
-        self.recids.deinit(alloc);
-        self.owned.deinit(alloc);
-    }
-};
-
 pub const V2 = struct {
     fixtures: std.ArrayListUnmanaged(FixtureRow) = .empty,
     files: std.ArrayListUnmanaged(FileRow) = .empty,
@@ -1014,19 +983,16 @@ pub const V2 = struct {
 };
 
 pub const Loaded = union(enum) {
-    v1: V1,
     v2: V2,
 
     pub fn deinit(self: *Loaded, alloc: Allocator) void {
         switch (self.*) {
-            .v1 => |*m| m.deinit(alloc),
             .v2 => |*m| m.deinit(alloc),
         }
     }
 
     pub fn version(self: *const Loaded) u32 {
         return switch (self.*) {
-            .v1 => 1,
             .v2 => 2,
         };
     }
@@ -1194,87 +1160,21 @@ pub fn parse(ctx: *Ctx, text: []const u8) Error!Loaded {
     const t = split(head);
     if (t.n != 2 or !eql(t.f[0], "version"))
         return ctx.err("the first data line must be `version<TAB><n>`, not: {s}", .{head});
-    if (eql(t.f[1], "1")) return .{ .v1 = try parseV1(ctx, &lines) };
+    if (eql(t.f[1], "1"))
+        return ctx.err(
+            "manifest schema version 1 is retired (Stage C, C7z) — this reader speaks only schema 2; " ++
+                "the dual v1/v2 dispatch is gone",
+            .{},
+        );
     if (eql(t.f[1], "2")) return .{ .v2 = try parseV2(ctx, &lines) };
     return ctx.err(
-        "unsupported manifest schema version {s} — this reader speaks 1 and 2, and refuses rather " ++
-            "than guessing: the two grammars share row arities, so a newer schema would be misread " ++
-            "field by field without a single check firing",
+        "unsupported manifest schema version {s} — this reader speaks only schema 2, and refuses " ++
+            "rather than guessing at the columns",
         .{t.f[1]},
     );
 }
 
 const LineIter = std.mem.SplitIterator(u8, .scalar);
-
-fn parseV1(ctx: *Ctx, lines: *LineIter) Error!V1 {
-    var m = V1{};
-    errdefer m.deinit(ctx.alloc);
-    var referenced: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer referenced.deinit(ctx.alloc);
-
-    while (lines.next()) |raw| {
-        const line = std.mem.trimRight(u8, raw, "\r");
-        if (line.len == 0 or line[0] == '#') continue;
-        const t = split(line);
-        const tag = t.f[0];
-        if (eql(tag, "version")) {
-            return ctx.err("a second version row: {s}", .{line});
-        } else if (eql(tag, "fixture")) {
-            try arity(ctx, t, 5, line);
-            _ = try oneOf(ctx, t.f[2], &V1_KINDS, "fixture kind", line);
-            _ = try oneOf(ctx, t.f[3], &ENGINES, "generatorEngine", line);
-            try declareFixture(ctx, &m.fixtures, t, line);
-        } else if (eql(tag, "file")) {
-            try arity(ctx, t, 6, line);
-            try addFile(ctx, &m.files, t, line);
-            try referenced.append(ctx.alloc, t.f[1]);
-        } else if (eql(tag, "expect")) {
-            try arity(ctx, t, 7, line);
-            const e = V1Expect{
-                .fixture = t.f[1],
-                .engine = try oneOf(ctx, t.f[2], &ENGINES, "engine", line),
-                .verdict = try oneOf(ctx, t.f[3], &VERDICTS, "verdict", line),
-                .opener = try oneOf(ctx, t.f[4], &V1_OPENERS, "opener", line),
-                .place_as = try relName(ctx, t.f[5], line),
-                .open_arg = try relName(ctx, t.f[6], line),
-            };
-            // A v1 cell is identified by (fixture, engine, opener, placeAs), NOT
-            // by (fixture, engine): the live tree has both a `direct` and a `wal`
-            // cell for the same engine on `wal-v1-rust-tail`, which is exactly
-            // what the v1 `opener` column is for. A narrower key rejects the real
-            // manifest.
-            for (m.expects.items) |p| {
-                if (eql(p.fixture, e.fixture) and eql(p.engine, e.engine) and
-                    eql(p.opener, e.opener) and eql(p.place_as, e.place_as))
-                    return ctx.err("duplicate expect row for {s}/{s}/{s}: {s}", .{ e.fixture, e.engine, e.opener, line });
-            }
-            try m.expects.append(ctx.alloc, e);
-            try referenced.append(ctx.alloc, t.f[1]);
-        } else if (eql(tag, "recid")) {
-            try arity(ctx, t, 7, line);
-            try addRecid(ctx, &m.recids, .{
-                .fixture = t.f[1],
-                .label = t.f[2],
-                .recid = try nat(ctx, t.f[3], line),
-                .state = try parseState(ctx, t.f[4], line),
-                .payload_id = try nat(ctx, t.f[5], line),
-                .len = @intCast(try nat(ctx, t.f[6], line)),
-            }, line);
-            try referenced.append(ctx.alloc, t.f[1]);
-        } else if (eql(tag, "recidrange")) {
-            try arity(ctx, t, 8, line);
-            try pushRange(ctx, &m.recids, &m.owned, t, line);
-            try referenced.append(ctx.alloc, t.f[1]);
-        } else if (eql(tag, "edit")) {
-            try editRow(ctx, t, line, &referenced);
-        } else {
-            return ctx.err("unknown v1 manifest row type `{s}`: {s}", .{ tag, line });
-        }
-    }
-    if (m.files.items.len == 0) return ctx.err("a v1 manifest with no file rows", .{});
-    try referentialIntegrity(ctx, m.fixtures.items, referenced.items);
-    return m;
-}
 
 fn parseV2(ctx: *Ctx, lines: *LineIter) Error!V2 {
     var m = V2{};
@@ -1573,7 +1473,7 @@ pub fn loadSampleV2(ctx: *Ctx, manifest_tsv: []const u8, table: []const Blob) Er
     var loaded = try parse(ctx, manifest_tsv);
     if (loaded.version() != 2) {
         loaded.deinit(ctx.alloc);
-        return ctx.err("the v2 sample root is schema v1", .{});
+        return ctx.err("the sample root is not schema v2", .{});
     }
     var sample = SampleV2{ .manifest = loaded.v2 };
     errdefer sample.deinit(ctx.alloc);

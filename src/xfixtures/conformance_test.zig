@@ -1,16 +1,12 @@
-//! Cross-port conformance harness — **both manifest schemas**, dispatched on
-//! the version line (Stage C slice **C3z**).
+//! Cross-port conformance harness — schema **v2 only** (Stage C slice **C7z**).
 //!
-//! `src/xfixtures/data/` is the live schema-v1 tree; `src/xfixtures/data-v2/` is
-//! the shared static schema-v2 sample (`todo/store-cross/sample-v2/`, byte for
-//! byte). Keeping both roots in the suite at once is deliberate: C6 is a data
-//! commit, and a reader that only ever saw the schema it was written for would
-//! discover the other one on cutover day.
+//! `src/xfixtures/data-v2/` is the shared static schema-v2 sample
+//! (`todo/store-cross/sample-v2/`, byte for byte). Schema v1, its skip list, and
+//! the dual dispatch retired at C7z after the corpus cutover (C6) was green.
+//! The frozen corpus runs in `corpus_test.zig`.
 //!
 //! What runs here:
 //!
-//! - **v1 cells** — accept/reject, `direct` and `wal` openers, as before, but
-//!   now through the SHARED parser in `xfix.zig` rather than a bespoke one.
 //! - **v2 `rw` and `ro` cells** — both here. Decision C-D3 costs this port
 //!   nothing: `WalOptions.read_only` is `pub` and this suite is in-package, so
 //!   neither mode needs new public surface (rust had to move its `ro` executor
@@ -18,12 +14,10 @@
 //! - **the two §11.2 comparisons** — framing against `GOLDEN-DECODE.tsv`,
 //!   decoded bodies against `GOLDEN-BODY.tsv`, which the frozen Java reader
 //!   authored.
-//! - **C-D4** — the generated `embedded_v2.zig` table, graded by three-way set
-//!   equality against the manifest and against what `build.zig` finds on disk.
+//! - **C-D4** — the generated `embedded_v2.zig` table, graded by three-way
+//!   set equality against the embedded names and the on-disk directory listing.
 //!
-//! Fixture data is consumed via `@embedFile` (no cwd assumption). A MISSING
-//! manifest or data file is a COMPILE error by construction, which is the
-//! strongest possible "the sync step was never run".
+//! The schema-v1 tree and `retired_v1_accepts` skip list are gone (contract §9).
 
 const std = @import("std");
 const testing = std.testing;
@@ -50,194 +44,6 @@ const ENGINE = xfix.ENGINE;
 /// where it was found. The C3z review named it.
 const SHAS = "\t" ++ "a" ** 64 ++ "\t" ++ "b" ** 64;
 const SHAS2 = "\t" ++ "c" ** 64 ++ "\t" ++ "d" ** 64;
-
-// ---------------------------------------------------------------------------
-// schema v1 — the live tree
-// ---------------------------------------------------------------------------
-
-const v1_manifest_tsv: []const u8 = @embedFile("data/MANIFEST.tsv");
-
-const EmbeddedGz = struct { rel_name: []const u8, gz: []const u8 };
-/// This list MUST cover every `file` row of data/MANIFEST.tsv. `@embedFile`
-/// needs comptime-known names, so it is static; the runtime preflight hard-fails
-/// on any manifest file row missing here.
-///
-/// Surplus is TOLERATED on this v1 root and refused on the v2 one, which is not
-/// an inconsistency: the v1 tree is live data that the sync step rewrites
-/// generation by generation, so a not-yet-referenced fixture needs a placeholder
-/// `.gz` and no code change. The v2 sample is STATIC and generated, which is why
-/// C-D4 can demand set equality there.
-const embedded_gz = [_]EmbeddedGz{
-    .{ .rel_name = "direct-v1-java.db", .gz = @embedFile("data/direct-v1-java.db.gz") },
-    .{ .rel_name = "direct-v1-rust.db", .gz = @embedFile("data/direct-v1-rust.db.gz") },
-    .{ .rel_name = "direct-v1-zig.db", .gz = @embedFile("data/direct-v1-zig.db.gz") },
-    .{ .rel_name = "reject-mdb5-sd1.db", .gz = @embedFile("data/reject-mdb5-sd1.db.gz") },
-    .{ .rel_name = "reject-sd1-badfeatures.db", .gz = @embedFile("data/reject-sd1-badfeatures.db.gz") },
-    .{ .rel_name = "reject-sd1-badchecksum.db", .gz = @embedFile("data/reject-sd1-badchecksum.db.gz") },
-    .{ .rel_name = "reject-sd1-short.db", .gz = @embedFile("data/reject-sd1-short.db.gz") },
-    .{ .rel_name = "wal-v1-rust-tail.wal", .gz = @embedFile("data/wal-v1-rust-tail.wal.gz") },
-    .{ .rel_name = "wal-v1-rust-ckpt.wal", .gz = @embedFile("data/wal-v1-rust-ckpt.wal.gz") },
-    .{ .rel_name = "wal-v1-zig-tail.wal", .gz = @embedFile("data/wal-v1-zig-tail.wal.gz") },
-    .{ .rel_name = "wal-v1-zig-ckpt.wal", .gz = @embedFile("data/wal-v1-zig-ckpt.wal.gz") },
-    .{ .rel_name = "reject-mdb5-wal.wal", .gz = @embedFile("data/reject-mdb5-wal.wal.gz") },
-    .{ .rel_name = "reject-wal-v1-badflags.wal", .gz = @embedFile("data/reject-wal-v1-badflags.wal.gz") },
-    .{ .rel_name = "reject-wal-java-v3.walseg", .gz = @embedFile("data/reject-wal-java-v3.walseg.gz") },
-};
-
-/// The `wal-v1-*` accept cells RETIRE at this engine's WAL v3 cutover: the port
-/// refuses format v1 outright (there is no migration, by design) and its opener
-/// no longer takes a WAL FILE path at all, so the cell cannot even be expressed.
-/// D6 retires these IDs family-wide at Stage C; until the java and zig
-/// generators stop emitting v1 rows they stay in the shared manifest for the
-/// engines that still speak v1, and this engine skips them. The list is EXACT
-/// and asserted below: a new accept row addressed to zig must not be silently
-/// dropped by a prefix match, and a retired cell vanishing from the manifest
-/// means Stage C has begun and this skip list must go with it.
-const retired_v1_accepts = [_][]const u8{
-    "wal-v1-rust-tail",
-    "wal-v1-rust-ckpt",
-    "wal-v1-zig-tail",
-    "wal-v1-zig-ckpt",
-};
-
-fn v1Baseline(ctx: *xfix.Ctx, row: xfix.FileRow) ![]u8 {
-    const gz: []const u8 = for (embedded_gz) |e| {
-        if (std.mem.eql(u8, e.rel_name, row.rel)) break e.gz;
-    } else {
-        std.debug.print("[xfixtures] file `{s}` is not in the embedded_gz list\n", .{row.rel});
-        return error.XFixtures;
-    };
-    const gz_sha = xfix.sha256Hex(gz);
-    try testing.expectEqualStrings(row.gz_sha, &gz_sha);
-    const raw = try xfix.gunzip(ctx, gz, row.raw_len, row.rel);
-    errdefer ctx.alloc.free(raw);
-    try testing.expectEqual(row.raw_len, raw.len);
-    const raw_sha = xfix.sha256Hex(raw);
-    try testing.expectEqualStrings(row.raw_sha, &raw_sha);
-    return raw;
-}
-
-test "xfixtures v1: cross-port conformance cells (engine=zig)" {
-    const a = testing.allocator;
-    var ctx = xfix.Ctx{ .alloc = a };
-
-    var loaded = try xfix.parse(&ctx, v1_manifest_tsv);
-    defer loaded.deinit(a);
-    try testing.expectEqual(@as(u32, 1), loaded.version());
-    const m = &loaded.v1;
-
-    // gunzip every fixture file ONCE, verifying gz sha, raw length and raw sha
-    // before any cell runs: a damaged fixture must fail the preflight even when
-    // its expect row appears late.
-    var baselines: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (baselines.items) |b| a.free(b);
-        baselines.deinit(a);
-    }
-    for (m.files.items) |f| try baselines.append(a, try v1Baseline(&ctx, f));
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var retired_seen = [_]bool{false} ** retired_v1_accepts.len;
-    var ran: usize = 0;
-
-    for (m.expects.items, 0..) |e, idx| {
-        if (!std.mem.eql(u8, e.engine, ENGINE)) continue;
-        if (std.mem.eql(u8, e.verdict, "accept") and std.mem.eql(u8, e.opener, "wal")) {
-            const at = for (retired_v1_accepts, 0..) |r, i| {
-                if (std.mem.eql(u8, e.fixture, r)) break i;
-            } else {
-                std.debug.print(
-                    "[xfixtures] accept-wal fixture {s} is not one of the four v1 cells retired at " ++
-                        "the v3 cutover — a new WAL accept row needs a v3 (base-path) cell, not a skip\n",
-                    .{e.fixture},
-                );
-                return error.XFixtures;
-            };
-            retired_seen[at] = true;
-            continue;
-        }
-        ran += 1;
-
-        // a v1 fixture has exactly one file row
-        var file: ?xfix.FileRow = null;
-        var pristine: []const u8 = undefined;
-        for (m.files.items, 0..) |f, i| {
-            if (!std.mem.eql(u8, f.fixture, e.fixture)) continue;
-            try testing.expect(file == null);
-            file = f;
-            pristine = baselines.items[i];
-        }
-        try testing.expect(file != null);
-
-        var name_buf: [64]u8 = undefined;
-        const cell_name = try std.fmt.bufPrint(&name_buf, "v1-{d}", .{idx});
-        var cell_dir = try tmp.dir.makeOpenPath(cell_name, .{ .iterate = true });
-        defer cell_dir.close();
-        try cell_dir.writeFile(.{ .sub_path = e.place_as, .data = pristine });
-
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cell_abs = try cell_dir.realpath(".", &path_buf);
-        const target = try std.fs.path.join(a, &.{ cell_abs, e.open_arg });
-        defer a.free(target);
-
-        var cell_buf: [192]u8 = undefined;
-        const cell = try std.fmt.bufPrint(&cell_buf, "v1 cell {d}: fixture={s} verdict={s} opener={s} placeAs={s}", .{
-            idx, e.fixture, e.verdict, e.opener, e.place_as,
-        });
-
-        if (std.mem.eql(u8, e.verdict, "accept")) {
-            try testing.expectEqualStrings("direct", e.opener);
-            var s = StoreDirect.openFile(a, target, true) catch |err| {
-                std.debug.print("[xfixtures] {s}: open failed: {s}\n", .{ cell, @errorName(err) });
-                return error.XFixtures;
-            };
-            defer s.deinit();
-            try xfix.assertReaderContract(&ctx, &s, m.recids.items, e.fixture, cell);
-            try s.close();
-        } else {
-            // The v3 opener takes a BASE path. Every v1 reject row's openArg
-            // names a regular file the cell placed there, so each now refuses
-            // through D1's bare-base row rather than through a v1 header check —
-            // the same verdict for the same image, which is what the cell asserts.
-            if (std.mem.eql(u8, e.opener, "direct")) {
-                if (StoreDirect.openFile(a, target, true)) |*opened| {
-                    var s = opened.*;
-                    s.deinit();
-                    std.debug.print("[xfixtures] {s}: open unexpectedly succeeded\n", .{cell});
-                    return error.XFixtures;
-                } else |err| try testing.expectEqual(error.DataCorruption, err);
-            } else {
-                if (StoreWAL.open(a, target, true)) |*opened| {
-                    var s = opened.*;
-                    s.deinit();
-                    std.debug.print("[xfixtures] {s}: open unexpectedly succeeded\n", .{cell});
-                    return error.XFixtures;
-                } else |err| try testing.expectEqual(error.DataCorruption, err);
-            }
-        }
-
-        // working copy byte-identical, and no files beyond `.lock` sidecars.
-        // `.ckpt` is deliberately NOT on the allowed list: a clean StoreWAL close
-        // must leave no checkpoint temp behind.
-        const after = try cell_dir.readFileAlloc(a, e.place_as, 256 * 1024 * 1024);
-        defer a.free(after);
-        try testing.expectEqualSlices(u8, pristine, after);
-        var it = cell_dir.iterate();
-        while (try it.next()) |entry| {
-            if (std.mem.eql(u8, entry.name, e.place_as)) continue;
-            if (std.mem.endsWith(u8, entry.name, ".lock")) continue;
-            std.debug.print("[xfixtures] {s}: unexpected new file `{s}`\n", .{ cell, entry.name });
-            return error.XFixtures;
-        }
-    }
-
-    // The manifest must drive at least one zig cell — an empty run means the sync
-    // step produced a manifest this engine silently ignores.
-    try testing.expect(ran > 0);
-    for (retired_seen) |seen| try testing.expect(seen);
-}
 
 // ---------------------------------------------------------------------------
 // schema v2 — the shared static sample
@@ -360,9 +166,10 @@ test "xfixtures v2: the loader refuses cleanly once it owns the manifest" {
     for (embedded_v2.blobs, 0..) |b, i| wrong[i] = .{ .name = b.name, .gz = "not a gzip stream" };
     try xfix.expectRefused(&ctx, "a blob whose gz hash does not match", xfix.loadSampleV2, .{ &ctx, v2_manifest_tsv, @as([]const xfix.Blob, &wrong) });
 
-    // (c) a schema-v1 manifest handed to the v2 loader — a refusal BEFORE the
-    // ownership transfer, which is the other side of the same defect.
-    try xfix.expectRefused(&ctx, "a schema-v1 manifest in the v2 loader", xfix.loadSampleV2, .{ &ctx, v1_manifest_tsv, @as([]const xfix.Blob, &embedded_v2.blobs) });
+    // (c) a schema-v1 manifest handed to the loader — refused at the version
+    // gate (C7z), before any ownership transfer.
+    const v1_text = "version\t1\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1" ++ SHAS ++ "\n";
+    try xfix.expectRefused(&ctx, "a schema-v1 manifest in the v2 loader", xfix.loadSampleV2, .{ &ctx, v1_text, @as([]const xfix.Blob, &embedded_v2.blobs) });
 }
 
 // The executor really does compare the cell set it ran against the fixture rows.
@@ -689,36 +496,28 @@ fn refuseSaying(ctx: *xfix.Ctx, what: []const u8, saying: []const u8, text: []co
     try xfix.expectRefusedSaying(ctx, what, saying, parseOk, .{ ctx, text });
 }
 
-// The version line is a HARD dispatch, and the reason is the arity collision.
+// Schema version 1 is retired; schema version 2 is the only accepted form (C7z).
 //
-// `expect <fid> <engine> <verdict> <opener> <placeAs> <openArg>` (v1) and
-// `expect <fid> <engine> <mode> <verdict> <opener> <openArg>` (v2) are both
-// seven fields. Guessing the schema from a row's shape would read `accept` as a
-// mode and `wal3` as a verdict without a single arity check firing, so the
-// version line decides and an unknown version is refused rather than assumed to
-// be the newest.
-test "xfixtures: the two schemas are told apart by their version line only" {
+// The historical reason the version line is a hard gate: v1 and v2 `expect` rows
+// were both seven fields with different columns. A reader that keyed on arity
+// would put `mode` where `verdict` belongs.
+test "xfixtures: the reader accepts only schema v2" {
     const a = testing.allocator;
     var ctx = xfix.Ctx{ .alloc = a };
 
-    const v1 = "version\t1\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1" ++ SHAS ++ "\n" ++
-        "expect\tf\tzig\taccept\tdirect\tx.db\tx.db\n";
     const v2 = "version\t2\nfixture\tf\twal3-namespace\tjava\tc\nfile\tf\tx\t1" ++ SHAS ++ "\n" ++
         "expect\tf\tzig\tro\taccept\twal3\tx\n";
-
-    var l1 = try xfix.parse(&ctx, v1);
-    defer l1.deinit(a);
-    try testing.expectEqual(@as(u32, 1), l1.version());
     var l2 = try xfix.parse(&ctx, v2);
     defer l2.deinit(a);
     try testing.expectEqual(@as(u32, 2), l2.version());
+    try testing.expectEqualStrings("ro", l2.v2.expects.items[0].mode);
+    try testing.expectEqualStrings("accept", l2.v2.expects.items[0].verdict);
 
-    // The v1 rows, read as v2, are not merely different — the third column is a
-    // verdict where v2 wants a mode, so the vocabulary check catches it. That is
-    // the collision made visible rather than assumed away.
-    const v1_as_v2 = "version\t2\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1" ++ SHAS ++ "\n" ++
-        "expect\tf\tzig\taccept\tdirect\tx.db\tx.db\n";
-    try refuse(&ctx, "v1 expect rows under a v2 version line", v1_as_v2);
+    try refuse(&ctx, "retired schema version 1", "version\t1\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1" ++ SHAS ++ "\n" ++
+        "expect\tf\tzig\taccept\tdirect\tx.db\tx.db\n");
+    // A v1-shaped expect under a v2 version line is still refused (vocabulary).
+    try refuse(&ctx, "v1 expect rows under a v2 version line", "version\t2\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1" ++ SHAS ++ "\n" ++
+        "expect\tf\tzig\taccept\tdirect\tx.db\tx.db\n");
     try refuse(&ctx, "an unknown schema version", "version\t3\n");
     try refuse(&ctx, "a manifest with no version line", "fixture\tf\tdirect\tjava\tc\n");
     try refuse(&ctx, "a version line with a trailing field", "version\t2\tx\n");
@@ -827,36 +626,6 @@ test "xfixtures: every referenced fixture must be declared and every declared on
     try refuse(&ctx, "a post row naming a fixture with no fixture row", V2_HEAD ++ V2_FILE ++ "post\tg\tzig\tro\tx.lock\tunchanged\n");
     try refuse(&ctx, "a recid row naming a fixture with no fixture row", V2_HEAD ++ V2_FILE ++ "recid\tg\tr1\t1\tlive\t1\t8\n");
     try refuse(&ctx, "a declared fixture no row refers to", V2_HEAD ++ V2_FILE ++ "fixture\tg\twal3-namespace\tjava\tc\n");
-
-    // The same rule guards the v1 tree, where the live manifest satisfies it.
-    const v1 = "version\t1\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1" ++ SHAS ++ "\n";
-    try parseOk(&ctx, v1);
-    try refuse(&ctx, "a v1 recid row naming a fixture with no fixture row", v1 ++ "recid\tg\tr1\t1\tlive\t1\t8\n");
-}
-
-// The v1 grammar's own vocabularies, which are NOT the v2 ones.
-//
-// v1's opener set is `{direct, wal}` where v2's is `{direct, wal3}`, and v1's
-// kind set is v2's minus `wal3-namespace`. Sharing one reader across two
-// grammars makes it easy to validate against the wrong set — or against no set
-// at all — and the live v1 tree cannot notice, because every value in it is
-// correct.
-test "xfixtures: the v1 grammar has its own vocabularies" {
-    const a = testing.allocator;
-    var ctx = xfix.Ctx{ .alloc = a };
-
-    const head = "version\t1\nfixture\tf\tport-wal\tjava\tc\n";
-    const file = "file\tf\tx.wal\t1" ++ SHAS ++ "\n";
-    inline for (.{ "direct", "wal" }) |opener| {
-        try parseOk(&ctx, head ++ file ++ "expect\tf\tzig\taccept\t" ++ opener ++ "\tx.wal\tx.wal\n");
-    }
-    // `wal3` is the V2 opener token and must NOT be accepted under v1.
-    try refuse(&ctx, "the v2 opener token on a v1 row", head ++ file ++ "expect\tf\tzig\taccept\twal3\tx.wal\tx.wal\n");
-    try refuse(&ctx, "an unknown v1 opener on a java row", head ++ file ++ "expect\tf\tjava\taccept\twalrus\tx.wal\tx.wal\n");
-    try refuse(&ctx, "an unknown v1 verdict", head ++ file ++ "expect\tf\tzig\tmaybe\tdirect\tx.wal\tx.wal\n");
-    // `wal3-namespace` is the kind v2 ADDED; a v1 manifest must not carry it.
-    try refuse(&ctx, "the v2-only fixture kind on a v1 row", "version\t1\nfixture\tf\twal3-namespace\tjava\tc\nfile\tf\tx\t1" ++ SHAS ++ "\n");
-    try refuse(&ctx, "an unknown v1 generatorEngine", "version\t1\nfixture\tf\tdirect\tgo\tc\nfile\tf\tx\t1" ++ SHAS ++ "\n");
 }
 
 // The four C5 row types PARSE, and every rule the grammar states about them can

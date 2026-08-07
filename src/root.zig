@@ -39,7 +39,7 @@ pub const xfixtures_wal3 = @import("xfixtures/wal3_fixtures.zig");
 // depend on shapes that exist to be rewritten every time the fixture protocol
 // moves. The C3z review found exactly that, and the fix is that a test root
 // references a test module rather than exporting it. Golden files live in
-// src/xfixtures/data/ and src/xfixtures/data-v2/ and are consumed via
+// src/xfixtures/data-v2/ and src/xfixtures/data-v2-corpus/ and are consumed via
 // @embedFile; the generator is wired as `zig build fixtures`.
 test {
     _ = @import("xfixtures/conformance_test.zig");
