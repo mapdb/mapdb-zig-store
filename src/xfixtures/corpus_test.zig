@@ -203,7 +203,7 @@ const corpus_embed_table_src: []const u8 = @embedFile("embedded_v2_corpus.zig");
 /// because the `todo`-marked post-state blob is not distributed and its hash is
 /// in that preimage. Pinning it here is what makes "the three hand-copied roots
 /// have not drifted" a CI fact rather than a review note.
-const DIST_SEAL = "f2ef720435ffb67fb222d3297fc0c5ab59f218c55619283ac5a4714444c96cd8";
+const DIST_SEAL = "4470f2bcc4f8bec45aca3d22eb7cfde055d36f5b29218d282d3b08ede507148e";
 
 fn loadCorpus(ctx: *xfix.Ctx) !xfix.SampleV2 {
     return xfix.loadSampleV2(ctx, corpus_manifest_tsv, &embedded_corpus.blobs);
@@ -698,17 +698,52 @@ test "xfixtures corpus: the reopen family predicate discriminates" {
     const s2_wrong_variant = xfix.Refusal{ .err = error.StoreFull, .diag = .{ .reason = recover.H_LSN_BACK } };
     const s2_wrong_reason = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = recover.R_CHAIN } };
     const full = xfix.Refusal{ .err = error.StoreFull, .diag = .{} };
+    // The three C5t brought here. `direct` and `d1` are the SAME `Refusal` and
+    // differ only in the opener that produced it — which is why the predicate
+    // takes one.
+    const bare = xfix.Refusal{ .err = error.DataCorruption, .diag = .{} };
 
-    try xfix.assertFamily(&ctx, "S2 positive", "S2", s2_real);
-    try xfix.assertFamily(&ctx, "StoreFull positive", "StoreFull", full);
+    // THE WHOLE MATRIX, because a family predicate that is never shown a
+    // NEIGHBOUR's refusal has not been shown to read the family at all. Five
+    // families against five refusals, every cell stated: four accept their own
+    // and refuse the other four, and the fifth is `DataCorruption`, which admits
+    // S2 ON PURPOSE — S2 is a corruption verdict recovery diagnosed, with the
+    // reason additionally pinned, so it is a SUBSET and not a neighbour. Writing
+    // the exception down is the point; a matrix with a quietly-wrong cell reads
+    // exactly like one without.
+    const Sample = struct { name: []const u8, opener: []const u8, r: xfix.Refusal };
+    const samples = [_]Sample{
+        .{ .name = "direct", .opener = "direct", .r = bare },
+        .{ .name = "d1", .opener = "wal3", .r = bare },
+        .{ .name = "corrupt", .opener = "wal3", .r = .{ .err = error.DataCorruption, .diag = .{ .reason = recover.R_RECID_ZERO } } },
+        .{ .name = "s2", .opener = "wal3", .r = s2_real },
+        .{ .name = "full", .opener = "wal3", .r = full },
+    };
+    const Row = struct { family: []const u8, accepts: []const u8 };
+    const rows = [_]Row{
+        .{ .family = "direct-magic", .accepts = "ynnnn" },
+        .{ .family = "D1", .accepts = "nynnn" },
+        .{ .family = "DataCorruption", .accepts = "nnyyn" },
+        .{ .family = "S2", .accepts = "nnnyn" },
+        .{ .family = "StoreFull", .accepts = "nnnny" },
+    };
+    for (rows) |row| {
+        try testing.expectEqual(samples.len, row.accepts.len);
+        for (samples, row.accepts) |s, want| {
+            var buf: [96]u8 = undefined;
+            const what = try std.fmt.bufPrint(&buf, "{s} graded as {s}", .{ s.name, row.family });
+            if (want == 'y')
+                try xfix.assertFamily(&ctx, what, s.opener, row.family, s.r)
+            else
+                try xfix.expectRefused(&ctx, what, xfix.assertFamily, .{ &ctx, "w", s.opener, row.family, s.r });
+        }
+    }
 
-    // Each half of the collapsed S2 conjunction, alone.
-    try xfix.expectRefused(&ctx, "an operational failure wearing the S2 reason", xfix.assertFamily, .{ &ctx, "w", "S2", s2_wrong_variant });
-    try xfix.expectRefused(&ctx, "a corruption verdict carrying a different reason", xfix.assertFamily, .{ &ctx, "w", "S2", s2_wrong_reason });
-    // …and the two families really are told apart, in both directions.
-    try xfix.expectRefused(&ctx, "StoreFull graded as S2", xfix.assertFamily, .{ &ctx, "w", "S2", full });
-    try xfix.expectRefused(&ctx, "an S2 corruption graded as StoreFull", xfix.assertFamily, .{ &ctx, "w", "StoreFull", s2_real });
-    try xfix.expectRefused(&ctx, "a family with no predicate", xfix.assertFamily, .{ &ctx, "w", "R4", s2_real });
+    // Each half of the collapsed S2 conjunction, alone — neither is a member of
+    // the matrix above, because no opener produces them.
+    try xfix.expectRefused(&ctx, "an operational failure wearing the S2 reason", xfix.assertFamily, .{ &ctx, "w", "wal3", "S2", s2_wrong_variant });
+    try xfix.expectRefused(&ctx, "a corruption verdict carrying a different reason", xfix.assertFamily, .{ &ctx, "w", "wal3", "S2", s2_wrong_reason });
+    try xfix.expectRefused(&ctx, "a family with no predicate", xfix.assertFamily, .{ &ctx, "w", "wal3", "R4", s2_real });
 }
 
 // ---------------------------------------------------------------------------
