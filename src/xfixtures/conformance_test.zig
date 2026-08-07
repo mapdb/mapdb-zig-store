@@ -675,6 +675,20 @@ fn refuse(ctx: *xfix.Ctx, what: []const u8, text: []const u8) !void {
     try xfix.expectRefused(ctx, what, parseOk, .{ ctx, text });
 }
 
+/// [`refuse`], plus the demand that the refusal NAMES the rule that fired.
+///
+/// A bare "the parser refused" cannot tell two rules apart, and several of the
+/// grammar's rules refuse each other's inputs: an empty key is also a key whose
+/// first character is not `[a-z]`, and a pair with two `=` also has a value
+/// carrying a character outside the pinned class. The C5z campaign measured the
+/// consequence — with only `refuse`, deleting either of those two rules left the
+/// whole suite green, because its neighbour refused the same input. This is
+/// lesson (h) in the parser battery, and the same fix the corpus cases already
+/// use.
+fn refuseSaying(ctx: *xfix.Ctx, what: []const u8, saying: []const u8, text: []const u8) !void {
+    try xfix.expectRefusedSaying(ctx, what, saying, parseOk, .{ ctx, text });
+}
+
 // The version line is a HARD dispatch, and the reason is the arity collision.
 //
 // `expect <fid> <engine> <verdict> <opener> <placeAs> <openArg>` (v1) and
@@ -879,26 +893,26 @@ test "xfixtures: the C5 oracle rows parse and are checked" {
     // so an unmeasured half here is an unmeasured foundation under that repair:
     // the DISTINCT half below is the exact guarantee that let `runAction`'s own
     // repeated-key check be deleted.
-    try refuse(&ctx, "an action argument with no `=` at all", V2_HEAD ++ V2_FILE ++
+    try refuseSaying(&ctx, "an action argument with no `=` at all", "is not one k=v pair", V2_HEAD ++ V2_FILE ++
         "action\tf\tzig\tro\tcommit_one_record\top\n");
-    try refuse(&ctx, "an action argument whose key is empty", V2_HEAD ++ V2_FILE ++
+    try refuseSaying(&ctx, "an action argument whose key is empty", "has an empty key", V2_HEAD ++ V2_FILE ++
         "action\tf\tzig\tro\tcommit_one_record\t=put\n");
-    try refuse(&ctx, "an action argument with two `=`", V2_HEAD ++ V2_FILE ++
+    try refuseSaying(&ctx, "an action argument with two `=`", "is not one k=v pair", V2_HEAD ++ V2_FILE ++
         "action\tf\tzig\tro\tcommit_one_record\top=a=b\n");
     // `0p`, not `Op`: `O` is refused by the character-class LOOP as well, so it
     // measured the loop and left the first-character rule deletable green —
     // measured. `0` is IN [a-z0-9_], so only the first-character rule refuses it.
-    try refuse(&ctx, "an action argument key whose FIRST character is not [a-z]", V2_HEAD ++ V2_FILE ++
+    try refuseSaying(&ctx, "an action argument key whose FIRST character is not [a-z]", "is not [a-z][a-z0-9_]*", V2_HEAD ++ V2_FILE ++
         "action\tf\tzig\tro\tcommit_one_record\t0p=put\n");
-    try refuse(&ctx, "an action argument key whose LATER character is not [a-z0-9_]", V2_HEAD ++ V2_FILE ++
+    try refuseSaying(&ctx, "an action argument key whose LATER character is not [a-z0-9_]", "is not [a-z][a-z0-9_]*", V2_HEAD ++ V2_FILE ++
         "action\tf\tzig\tro\tcommit_one_record\toP=put\n");
-    try refuse(&ctx, "action argument keys out of order", V2_HEAD ++ V2_FILE ++
+    try refuseSaying(&ctx, "action argument keys out of order", "must be sorted and distinct", V2_HEAD ++ V2_FILE ++
         "action\tf\tzig\tro\tcommit_one_record\tserializer=raw,op=put\n");
-    try refuse(&ctx, "action argument keys REPEATED", V2_HEAD ++ V2_FILE ++
+    try refuseSaying(&ctx, "action argument keys REPEATED", "must be sorted and distinct", V2_HEAD ++ V2_FILE ++
         "action\tf\tzig\tro\tcommit_one_record\top=a,op=b\n");
-    try refuse(&ctx, "an action argument value that is EMPTY", V2_HEAD ++ V2_FILE ++
+    try refuseSaying(&ctx, "an action argument value that is EMPTY", "must be nonempty", V2_HEAD ++ V2_FILE ++
         "action\tf\tzig\tro\tcommit_one_record\top=\n");
-    try refuse(&ctx, "an action argument value outside the pinned character class", V2_HEAD ++ V2_FILE ++
+    try refuseSaying(&ctx, "an action argument value outside the pinned character class", "must be nonempty", V2_HEAD ++ V2_FILE ++
         "action\tf\tzig\tro\tcommit_one_record\top=p t\n");
     try refuse(&ctx, "a duplicate reopen row", V2_HEAD ++ V2_FILE ++
         "reopen\tf\tzig\tro\tS2\nreopen\tf\tzig\tro\tS2\n");
