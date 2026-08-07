@@ -461,11 +461,27 @@ test "xfixtures corpus: the reopen row is graded" {
         .{ .what = "a family the reopen does not produce", .family = "S2", .ok = false },
         .{ .what = "a family this engine has no predicate for", .family = "R4", .ok = false },
     };
+    // The row is REPLACED, not appended. C5t made the positive case real — the
+    // checked-in corpus now carries this exact line, derived from the family
+    // pinned in `catalogue.py` — and a second copy is a duplicate the parser
+    // refuses, which would grade the two negatives for the wrong reason.
+    const pfx = "reopen\tdiv-wal3-lsn-exhausted\tzig\trw\t";
     for (cases, 0..) |c, i| {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(a);
-        try out.appendSlice(a, corpus_manifest_tsv);
-        try out.writer(a).print("reopen\tdiv-wal3-lsn-exhausted\tzig\trw\t{s}\n", .{c.family});
+        var dropped = false;
+        var it = std.mem.splitScalar(u8, corpus_manifest_tsv, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, pfx)) {
+                dropped = true;
+                continue;
+            }
+            try out.appendSlice(a, line);
+            try out.append(a, '\n');
+        }
+        try testing.expect(dropped);
+        try out.writer(a).print("{s}{s}\n", .{ pfx, c.family });
 
         var sample = try loadDoctored(&ctx, out.items);
         defer sample.deinit(a);
