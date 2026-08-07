@@ -832,6 +832,12 @@ test "xfixtures corpus: the reopen family predicate discriminates" {
         .{ .name = "s2", .opener = "wal3", .r = s2_real },
         .{ .name = "full", .opener = "wal3", .r = full },
     };
+    // `DataCorruption` is an EXCLUSION arm, so the sample that proves its opener
+    // conjunct is load-bearing must be a refusal from the OTHER opener whose
+    // every exclusion passes: `direct-magic` has an empty `diag.reason`, which
+    // is neither a D1 reason nor `H_LSN_BACK`. The two arms above it need no
+    // opener conjunct — they require a reason to be PRESENT in a field only
+    // their own opener writes — and the campaign proved both deletable.
     const Row = struct { family: []const u8, accepts: []const u8 };
     const rows = [_]Row{
         .{ .family = "direct-magic", .accepts = "ynnnnnnnn" },

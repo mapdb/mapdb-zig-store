@@ -2414,23 +2414,39 @@ pub fn assertFamily(ctx: *Ctx, where: []const u8, opener: []const u8, family: []
     // a predicate that compares a value against the constant that produced it
     // has compared nothing (lesson j). These are pins, and a reworded refusal is
     // supposed to red this suite.
+    // NO `opener` conjunct in these two, and the campaign is why. Each opener
+    // writes its OWN field of the `Refusal` — `direct` is written only by
+    // `StoreDirect.openFileDiag`, `diag` only by `StoreWAL.openCfg` — so a
+    // refusal from the wrong opener leaves the field this predicate reads EMPTY
+    // and fails the reason check anyway. Deleting `eql(opener, "direct")` and
+    // `eql(opener, "wal3")` left the whole suite green, which is C2j's rule
+    // exactly: a check no input can reach goes, rather than staying as a guard
+    // nothing can trip. The third arm below KEEPS its opener conjunct, and the
+    // asymmetry is the point — see there.
     if (eql(family, "direct-magic")) {
-        if (!(eql(opener, "direct") and r.err == error.DataCorruption and
+        if (!(r.err == error.DataCorruption and
             eql(r.direct.reason, "not a MapDB StoreDirect file (bad magic)")))
             return ctx.err(
-                "{s}: `direct-magic` is StoreDirect's BAD-MAGIC refusal — the direct opener, a corruption verdict, and that check and no other, and this is {s}/{s}/`{s}`",
+                "{s}: `direct-magic` is StoreDirect's BAD-MAGIC refusal — a corruption verdict from the direct opener, by that check and no other, and this is {s}/{s}/`{s}`",
                 .{ where, opener, @errorName(r.err), r.direct.reason },
             );
         return;
     }
     if (eql(family, "D1")) {
-        if (!(eql(opener, "wal3") and r.err == error.DataCorruption and isD1Reason(r.diag.reason)))
+        if (!(r.err == error.DataCorruption and isD1Reason(r.diag.reason)))
             return ctx.err(
                 "{s}: `D1` is the legacy boundary — the WAL opener refusing a v1 artifact at the base path, by that rule and no other, and this is {s}/{s}/`{s}`",
                 .{ where, opener, @errorName(r.err), r.diag.reason },
             );
         return;
     }
+    // THIS one keeps its opener conjunct, and it is load-bearing rather than
+    // decorative: this arm is an EXCLUSION, and a refusal from the direct opener
+    // leaves `diag.reason` empty — which is not a D1 reason and not
+    // `H_LSN_BACK`, so every exclusion passes and the family would accept a
+    // refusal the WAL opener never made. The two arms above discriminate by a
+    // reason they require to be PRESENT; this one by reasons it requires to be
+    // absent, and absence is what the wrong opener also gives you.
     if (eql(family, "DataCorruption")) {
         if (!(eql(opener, "wal3") and r.err == error.DataCorruption and
             !isD1Reason(r.diag.reason) and !eql(r.diag.reason, recover.H_LSN_BACK)))
