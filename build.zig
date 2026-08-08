@@ -88,6 +88,20 @@ pub fn build(b: *std.Build) void {
     });
     const probe_step = b.step("sync-probe", "Build the WAL sync probe (run it under strace; see ci/check.sh)");
     probe_step.dependOn(&b.addInstallArtifact(probe_exe, .{}).step);
+
+    // C8x cross-engine lock matrix probe (hold/open CLI). Dedicated target so
+    // the fixture generator is not overloaded; never part of `zig build test`.
+    const lock_probe_exe = b.addExecutable(.{
+        .name = "wal3-lock-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/store/wal3_lock_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "mapdb_zig_store", .module = mod }},
+        }),
+    });
+    const lock_probe_step = b.step("lock-probe", "Build the C8x WAL lock matrix probe");
+    lock_probe_step.dependOn(&b.addInstallArtifact(lock_probe_exe, .{}).step);
 }
 
 /// The `*.gz` basenames in `rel_dir`, sorted, as a zig source file.
