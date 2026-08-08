@@ -755,6 +755,23 @@ test "wal3 decode: a malformed entry stream is refused, not truncated" {
         defer a.free(raw);
         try xfix.expectRefused(&ctx, "a T_APPEND with delta outside [1, lsn-1]", decodeEntries, .{ &ctx, raw, "append-bad-delta" });
     }
+    // Legal delta, overlong len: claims more payload than remains (C9a §4.3).
+    {
+        var o = DataOutput2.init(a);
+        defer o.deinit();
+        try o.writeU8(xfix.T_APPEND);
+        try o.packLong(1);
+        try o.packLong(1);
+        try o.packLong(100);
+        const e = try o.copyBytes(a);
+        defer a.free(e);
+        var b = SegBuilder.init(a, 1, 5, 0);
+        defer b.deinit();
+        try b.push(xfix.TAG_SECTION, 5, e);
+        const raw = try b.bytes();
+        defer a.free(raw);
+        try xfix.expectRefused(&ctx, "a T_APPEND whose len overruns the section body", decodeEntries, .{ &ctx, raw, "append-over-len" });
+    }
 
     // A 'K' body is a mark, not an entry stream, and must not be decoded as one.
     {
