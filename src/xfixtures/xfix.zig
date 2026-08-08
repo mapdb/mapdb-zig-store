@@ -28,12 +28,10 @@
 //!
 //! It is WEAKER for anything the corpus does not exercise, because then the
 //! reader and the thing under test move together and nothing external notices.
-//! `T_APPEND` is the concrete case: no golden row contains one, [`entries`]
-//! refuses it before decoding its remaining fields, and the synthetic battery
-//! encodes it with the same imported constant it then decodes with — so a drift
-//! in the engine's opcode would be followed, not caught. The battery therefore
-//! pins the four entry opcodes as literals, which is the one place this file
-//! deliberately does not borrow. The C3z review drew the line.
+//! C9a closed the prior `T_APPEND` hole: the sample now carries an equal-base
+//! append, [`entries`] decodes it, and GOLDEN-BODY pins the four O1 columns.
+//! The synthetic battery still pins the four entry opcodes as literals, which
+//! is the one place this file deliberately does not borrow.
 //!
 //! # What the decoder validates, and what it does not
 //!
@@ -286,6 +284,13 @@ pub const GOLDEN_BODY_HEADER = [_][]const u8{
     "#",
     "#   sec  <bundle> <relName> <index> <tag> <entryCount>",
     "#   ent  <bundle> <relName> <index> <ord> <kind> <recid> <cap> <lenPlus> <contentSha256>",
+    "#       Non-APPEND rows: 9 fields after the `ent` token (kind-dependent columns).",
+    "#   ent  <bundle> <relName> <index> <ord> APPEND <recid> <delta> <baseLsn> <len> <contentSha256>",
+    "#       APPEND-only: 10 fields after `ent`. Parsers BRANCH ON KIND.",
+    "#       delta = wire packLong(sectionLsn - baseLsn); baseLsn = section.lsn - delta;",
+    "#       len = wire append length (NOT RECORD's lenPlus); contentSha256 hashes the",
+    "#       len payload bytes (empty-string sha when len==0). APPEND never reuses the",
+    "#       cap/lenPlus column positions.",
     "#   mark <bundle> <relName> <index> <cleanedThroughSeq> <logStartLsn>",
     "#",
     "# GOLDEN-DECODE.tsv pins FRAMING and deliberately stops there: walfmt.py is a",
@@ -415,7 +420,14 @@ pub const Entry = struct {
     recid: u64,
     cap: ?u64 = null,
     len_plus: ?u64 = null,
-    /// Borrowed from the section body.
+    /// Wire `packLong(sectionLsn - baseLsn)` for `T_APPEND` only.
+    delta: ?u64 = null,
+    /// Absolute `section.lsn - delta` for `T_APPEND` only.
+    base_lsn: ?i64 = null,
+    /// Wire append length for `T_APPEND` only (not RECORD `len_plus`).
+    append_len: ?u64 = null,
+    /// Borrowed from the section body. RECORD sized content, or APPEND payload
+    /// (empty slice when `append_len == 0`).
     content: ?[]const u8 = null,
 
     pub fn kind(self: Entry) []const u8 {
@@ -430,6 +442,10 @@ pub const Entry = struct {
 
     pub fn isRecord(self: Entry) bool {
         return self.tag == T_RECORD;
+    }
+
+    pub fn isAppend(self: Entry) bool {
+        return self.tag == T_APPEND;
     }
 };
 
@@ -571,11 +587,24 @@ pub fn entries(ctx: *Ctx, s: *const Section, where: []const u8, out: *std.ArrayL
                         return ctx.err("{s} section {d}: {d} content bytes at {d} run past the {d}-byte body", .{ where, s.index, n, at, s.body.len });
                 }
             },
-            T_APPEND => return ctx.err(
-                "{s} section {d}: T_APPEND at {d} is not decoded here — the C3 body dump has no " ++
-                    "columns for it and no fixture exercises it; extend both together",
-                .{ where, s.index, at },
-            ),
+            T_APPEND => {
+                // Wire: tag | packLong(recid) | packLong(delta) | packLong(len) | bytes
+                // (StoreWAL.java:1878-1895). base_lsn = section.lsn - delta with
+                // 1 <= delta <= lsn - 1. C9a / O1.
+                const delta = in.unpackLong() catch
+                    return ctx.err("{s} section {d}: entry at {d} ends mid-append-delta", .{ where, s.index, at });
+                if (delta < 1 or delta > @as(u64, @intCast(s.lsn - 1)))
+                    return ctx.err("{s} section {d}: append delta {d} outside [1, {d}] for section LSN {d}", .{ where, s.index, delta, s.lsn - 1, s.lsn });
+                e.delta = delta;
+                e.base_lsn = s.lsn - @as(i64, @intCast(delta));
+                const len = in.unpackLong() catch
+                    return ctx.err("{s} section {d}: entry at {d} ends mid-append-len", .{ where, s.index, at });
+                const n = std.math.cast(usize, len) orelse
+                    return ctx.err("{s} section {d}: append len {d} at {d} is not a length", .{ where, s.index, len, at });
+                e.append_len = len;
+                e.content = in.takeBytes(n) catch
+                    return ctx.err("{s} section {d}: {d} append bytes at {d} run past the {d}-byte body", .{ where, s.index, n, at, s.body.len });
+            },
             else => return ctx.err("{s} section {d}: unknown entry tag {d} at {d}", .{ where, s.index, tag, at }),
         }
         try out.append(ctx.alloc, e);
@@ -1661,21 +1690,49 @@ pub fn renderBody(ctx: *Ctx, sample: *const SampleV2, out: *Strings) Error!void 
                     return ctx.err("{s} section {d}: an entry references the reserved recid 0", .{ where, s.index });
                 if (!contains64(seen.items, e.recid)) try seen.append(ctx.alloc, e.recid);
                 const ectx = try scratch.add(ctx.alloc, "{s} section {d} entry {d}", .{ where, s.index, i });
-                var shabuf: [64]u8 = undefined;
-                const sha = try contentSha(ctx, e, ectx, &shabuf);
-                var capbuf: [24]u8 = undefined;
-                var lenbuf: [24]u8 = undefined;
-                _ = try out.add(ctx.alloc, "ent\t{s}\t{s}\t{d}\t{d}\t{s}\t{d}\t{s}\t{s}\t{s}", .{
-                    f.fixture,
-                    f.rel,
-                    s.index,
-                    i,
-                    e.kind(),
-                    e.recid,
-                    optNum(&capbuf, e.cap),
-                    optNum(&lenbuf, e.len_plus),
-                    sha orelse "-",
-                });
+                if (e.isAppend()) {
+                    const delta = e.delta.?;
+                    const base_lsn = e.base_lsn.?;
+                    const alen = e.append_len.?;
+                    if (base_lsn != s.lsn - @as(i64, @intCast(delta)))
+                        return ctx.err("{s}: base_lsn {d} != section.lsn {d} - delta {d}", .{ ectx, base_lsn, s.lsn, delta });
+                    if (delta < 1 or delta > @as(u64, @intCast(s.lsn - 1)))
+                        return ctx.err("{s}: delta {d} outside [1, {d}]", .{ ectx, delta, s.lsn - 1 });
+                    const c = e.content orelse
+                        return ctx.err("{s}: APPEND carries no content slice", .{ectx});
+                    if (c.len != alen)
+                        return ctx.err("{s}: append content length {d} != len {d}", .{ ectx, c.len, alen });
+                    var shabuf: [64]u8 = undefined;
+                    shabuf = sha256Hex(c);
+                    _ = try out.add(ctx.alloc, "ent\t{s}\t{s}\t{d}\t{d}\t{s}\t{d}\t{d}\t{d}\t{d}\t{s}", .{
+                        f.fixture,
+                        f.rel,
+                        s.index,
+                        i,
+                        e.kind(),
+                        e.recid,
+                        delta,
+                        base_lsn,
+                        alen,
+                        shabuf[0..],
+                    });
+                } else {
+                    var shabuf: [64]u8 = undefined;
+                    const sha = try contentSha(ctx, e, ectx, &shabuf);
+                    var capbuf: [24]u8 = undefined;
+                    var lenbuf: [24]u8 = undefined;
+                    _ = try out.add(ctx.alloc, "ent\t{s}\t{s}\t{d}\t{d}\t{s}\t{d}\t{s}\t{s}\t{s}", .{
+                        f.fixture,
+                        f.rel,
+                        s.index,
+                        i,
+                        e.kind(),
+                        e.recid,
+                        optNum(&capbuf, e.cap),
+                        optNum(&lenbuf, e.len_plus),
+                        sha orelse "-",
+                    });
+                }
             }
         }
     }

@@ -733,15 +733,27 @@ test "wal3 decode: a malformed entry stream is refused, not truncated" {
         try xfix.expectRefused(&ctx, "an unknown entry tag", decodeEntries, .{ &ctx, raw, "unknown-tag" });
     }
 
-    // T_APPEND is a real engine op that no fixture exercises and the body dump
-    // has no columns for. Refusing by name is the honest answer: decoding it into
-    // a row shape that was never designed would be a silent guess.
+    // Truncated T_APPEND (tag+recid only) fails mid-delta.
     {
         const e = try tagged(a, xfix.T_APPEND, 1);
         defer a.free(e);
         const raw = try oneSection(a, xfix.TAG_SECTION, e);
         defer a.free(raw);
-        try xfix.expectRefused(&ctx, "a T_APPEND entry", decodeEntries, .{ &ctx, raw, "append" });
+        try xfix.expectRefused(&ctx, "a truncated T_APPEND entry", decodeEntries, .{ &ctx, raw, "append-trunc" });
+    }
+    // delta must be in [1, lsn-1]; at section LSN 1 no legal delta exists.
+    {
+        var o = DataOutput2.init(a);
+        defer o.deinit();
+        try o.writeU8(xfix.T_APPEND);
+        try o.packLong(1);
+        try o.packLong(1);
+        try o.packLong(0);
+        const e = try o.copyBytes(a);
+        defer a.free(e);
+        const raw = try oneSection(a, xfix.TAG_SECTION, e);
+        defer a.free(raw);
+        try xfix.expectRefused(&ctx, "a T_APPEND with delta outside [1, lsn-1]", decodeEntries, .{ &ctx, raw, "append-bad-delta" });
     }
 
     // A 'K' body is a mark, not an entry stream, and must not be decoded as one.
@@ -754,6 +766,39 @@ test "wal3 decode: a malformed entry stream is refused, not truncated" {
         defer a.free(raw);
         try xfix.expectRefused(&ctx, "a 'K' body read as an entry stream", decodeEntries, .{ &ctx, raw, "k-as-entries" });
     }
+}
+
+test "wal3 decode: APPEND entries decode four O1 fields" {
+    const a = testing.allocator;
+    var ctx = xfix.Ctx{ .alloc = a };
+    var o = DataOutput2.init(a);
+    defer o.deinit();
+    try o.writeU8(xfix.T_APPEND);
+    try o.packLong(7);
+    try o.packLong(1); // delta
+    try o.packLong(3); // len
+    try o.writeAll(&.{ 10, 20, 30 });
+    const body = try o.copyBytes(a);
+    defer a.free(body);
+    var b = SegBuilder.init(a, 1, 5, 0);
+    defer b.deinit();
+    try b.push(xfix.TAG_SECTION, 5, body);
+    const raw = try b.bytes();
+    defer a.free(raw);
+    var seg = xfix.Segment{};
+    defer seg.deinit(a);
+    try xfix.decode(&ctx, raw, "append", &seg);
+    var es: std.ArrayListUnmanaged(xfix.Entry) = .empty;
+    defer es.deinit(a);
+    try xfix.entries(&ctx, &seg.sections.items[0], "append", &es);
+    try testing.expectEqual(@as(usize, 1), es.items.len);
+    const e = es.items[0];
+    try testing.expectEqualStrings("APPEND", e.kind());
+    try testing.expectEqual(@as(u64, 7), e.recid);
+    try testing.expectEqual(@as(u64, 1), e.delta.?);
+    try testing.expectEqual(@as(i64, 4), e.base_lsn.?);
+    try testing.expectEqual(@as(u64, 3), e.append_len.?);
+    try testing.expectEqualSlices(u8, &.{ 10, 20, 30 }, e.content.?);
 }
 
 test "wal3 decode: 'C' sections carry an ordinary entry stream" {

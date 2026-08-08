@@ -357,16 +357,20 @@ test "xfixtures v2: decoded bodies match GOLDEN-BODY.tsv" {
     var saw_null = false;
     var saw_empty = false;
     var saw_mark = false;
+    var saw_append = false;
     var empty_suffix_buf: [80]u8 = undefined;
     const empty_suffix = try std.fmt.bufPrint(&empty_suffix_buf, "\t1\t{s}", .{xfix.EMPTY_SHA});
     for (want.items) |r| {
         if (std.mem.indexOf(u8, r, "\tRECORD\t12\t0\t0\t-") != null) saw_null = true;
         if (std.mem.endsWith(u8, r, empty_suffix)) saw_empty = true;
         if (std.mem.startsWith(u8, r, "mark\t")) saw_mark = true;
+        if (std.mem.indexOf(u8, r, "\tAPPEND\t") != null) saw_append = true;
     }
     try testing.expect(saw_null);
     try testing.expect(saw_empty);
     try testing.expect(saw_mark);
+    // C9a / O1: four-field APPEND body oracle is not vacuous.
+    try testing.expect(saw_append);
 }
 
 // ---------------------------------------------------------------------------
