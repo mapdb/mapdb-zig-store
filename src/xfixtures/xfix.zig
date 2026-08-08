@@ -2348,8 +2348,9 @@ pub fn assertFamily(ctx: *Ctx, where: []const u8, opener: []const u8, family: []
     // reason they require to be PRESENT; this one by reasons it requires to be
     // absent, and absence is what the wrong opener also gives you.
     if (eql(family, "DataCorruption")) {
-        if (!(eql(opener, "wal3") and r.err == error.DataCorruption and
-            !isD1Reason(r.diag.reason) and !eql(r.diag.reason, recover.H_LSN_BACK)))
+        // C8f f0: every L15 family has a predicate, so all of them are excluded
+        // here (N6 included). A refinement another arm can name is a neighbour.
+        if (!(eql(opener, "wal3") and r.err == error.DataCorruption and !isRefinedReason(r.diag.reason)))
             return ctx.err(
                 "{s}: `DataCorruption` is a corruption verdict no TRANSPORTED refined family names, and this is {s}/{s}/`{s}`",
                 .{ where, opener, @errorName(r.err), r.diag.reason },
@@ -2363,10 +2364,13 @@ pub fn assertFamily(ctx: *Ctx, where: []const u8, opener: []const u8, family: []
         // input — which is lesson (h) inside the predicate. Each half is given
         // its own input by `theReopenFamilyPredicateDiscriminates`, because the
         // collapse buys freedom from masking and not coverage.
-        if (!(r.err == error.DataCorruption and eql(r.diag.reason, recover.H_LSN_BACK)))
+        //
+        // The reason is SPELLED OUT (lesson j): a comparison against the store
+        // constant that produced the value has compared nothing.
+        if (!(r.err == error.DataCorruption and eql(r.diag.reason, "section LSN does not follow the previous one")))
             return ctx.err(
-                "{s}: not the S2 rule's refusal — it must be a corruption verdict whose diagnostic reason is `{s}`, and this is {s}/`{s}`",
-                .{ where, recover.H_LSN_BACK, @errorName(r.err), r.diag.reason },
+                "{s}: not the S2 rule's refusal — it must be a corruption verdict whose diagnostic reason is the S2 pin, and this is {s}/`{s}`",
+                .{ where, @errorName(r.err), r.diag.reason },
             );
         return;
     }
@@ -2382,10 +2386,116 @@ pub fn assertFamily(ctx: *Ctx, where: []const u8, opener: []const u8, family: []
             return ctx.err("{s}: StoreFull is a capacity verdict, got {s}", .{ where, @errorName(r.err) });
         return;
     }
+    // ---- C8f f0: L15 remainder (thirteen families) ----
+    // Segment-set open notes and recovery Diag reasons are SPELLED OUT pins
+    // (lesson j), not imported from the store constants that produce them.
+    if (eql(family, "N6")) {
+        if (!(r.err == error.DataCorruption and eql(r.diag.reason, "v1 single-file WAL present at <base>.wal: no migration to v3 — open it with the release that wrote it and copy the data across, or move it aside")))
+            return ctx.err("{s}: not the N6 rule's refusal — this is {s}/`{s}`", .{ where, @errorName(r.err), r.diag.reason });
+        return;
+    }
+    if (eql(family, "H5")) {
+        if (!(r.err == error.DataCorruption and eql(r.diag.reason, "unsupported WAL format version")))
+            return ctx.err("{s}: not the H5 rule's refusal — this is {s}/`{s}`", .{ where, @errorName(r.err), r.diag.reason });
+        return;
+    }
+    if (eql(family, "H6")) {
+        if (!(r.err == error.DataCorruption and eql(r.diag.reason, "unknown segment flags")))
+            return ctx.err("{s}: not the H6 rule's refusal — this is {s}/`{s}`", .{ where, @errorName(r.err), r.diag.reason });
+        return;
+    }
+    if (eql(family, "H7")) {
+        if (!(r.err == error.DataCorruption and eql(r.diag.reason, "header sequence does not match its name")))
+            return ctx.err("{s}: not the H7 rule's refusal — this is {s}/`{s}`", .{ where, @errorName(r.err), r.diag.reason });
+        return;
+    }
+    if (eql(family, "H9")) {
+        if (!(r.err == error.DataCorruption and eql(r.diag.reason, "header firstLsn is not a valid LSN")))
+            return ctx.err("{s}: not the H9 rule's refusal — this is {s}/`{s}`", .{ where, @errorName(r.err), r.diag.reason });
+        return;
+    }
+    if (eql(family, "K4")) {
+        if (!(r.err == error.DataCorruption and eql(r.diag.reason, "clean mark authorizes removing its own segment")))
+            return ctx.err("{s}: not the K4 rule's refusal — this is {s}/`{s}`", .{ where, @errorName(r.err), r.diag.reason });
+        return;
+    }
+    if (eql(family, "S8/K-bounds")) {
+        // Four disjuncts on the 'K' body (length, truncated, through, logStart).
+        const ok = r.err == error.DataCorruption and (eql(r.diag.reason, "clean mark body is not 16 bytes") or
+            eql(r.diag.reason, "clean mark body is truncated") or
+            eql(r.diag.reason, "clean mark attests a non-positive cleanedThroughSeq") or
+            eql(r.diag.reason, "clean mark attests a logStartLsn that is not at or below its own LSN"));
+        if (!ok)
+            return ctx.err("{s}: not an S8/K-bounds refusal — this is {s}/`{s}`", .{ where, @errorName(r.err), r.diag.reason });
+        return;
+    }
+    if (eql(family, "S9")) {
+        if (!(r.err == error.DataCorruption and eql(r.diag.reason, "section LSNs must be consecutive")))
+            return ctx.err("{s}: not the S9 rule's refusal — this is {s}/`{s}`", .{ where, @errorName(r.err), r.diag.reason });
+        return;
+    }
+    if (eql(family, "S4/mid-log")) {
+        // Non-final body CRC, or active mid-log body CRC with a valid follower.
+        const ok = r.err == error.DataCorruption and (eql(r.diag.reason, "section body CRC mismatch in a non-final segment") or
+            eql(r.diag.reason, "mid-log corruption: section body CRC mismatch but valid sections follow"));
+        if (!ok)
+            return ctx.err("{s}: not an S4/mid-log refusal — this is {s}/`{s}`", .{ where, @errorName(r.err), r.diag.reason });
+        return;
+    }
+    if (eql(family, "R4-floor")) {
+        if (!(r.err == error.DataCorruption and eql(r.diag.reason, "the retained log does not begin where the mark attests: sections below it are gone")))
+            return ctx.err("{s}: not the R4-floor refusal — this is {s}/`{s}`", .{ where, @errorName(r.err), r.diag.reason });
+        return;
+    }
+    if (eql(family, "R4-chain")) {
+        if (!(r.err == error.DataCorruption and eql(r.diag.reason, "segment does not begin where its predecessor ended: sections between them are gone")))
+            return ctx.err("{s}: not the R4-chain refusal — this is {s}/`{s}`", .{ where, @errorName(r.err), r.diag.reason });
+        return;
+    }
+    if (eql(family, "R4-self")) {
+        if (!(r.err == error.DataCorruption and eql(r.diag.reason, "segment's first section is not the LSN its header states: its leading sections are gone")))
+            return ctx.err("{s}: not the R4-self refusal — this is {s}/`{s}`", .{ where, @errorName(r.err), r.diag.reason });
+        return;
+    }
+    if (eql(family, "R6-audit")) {
+        if (!(r.err == error.DataCorruption and eql(r.diag.reason, "replay skipped append(s) whose base image is absent and which no later entry superseded")))
+            return ctx.err("{s}: not the R6-audit refusal — this is {s}/`{s}`", .{ where, @errorName(r.err), r.diag.reason });
+        return;
+    }
     return ctx.err(
         "{s}: error family {s} has no predicate in this engine. Refusing rather than accepting any refusal at all — an unimplemented family graded as `it threw something` is the check not running",
         .{ where, family },
     );
+}
+
+/// True when a Diag reason belongs to any refined family this engine grades.
+/// Used by the generic `DataCorruption` arm as an exclusion set (C8f f0).
+fn isRefinedReason(reason: []const u8) bool {
+    if (isD1Reason(reason)) return true;
+    // S2 pin (spelled out)
+    if (eql(reason, "section LSN does not follow the previous one")) return true;
+    // N6
+    if (eql(reason, "v1 single-file WAL present at <base>.wal: no migration to v3 — open it with the release that wrote it and copy the data across, or move it aside")) return true;
+    // H5–H9
+    if (eql(reason, "unsupported WAL format version")) return true;
+    if (eql(reason, "unknown segment flags")) return true;
+    if (eql(reason, "header sequence does not match its name")) return true;
+    if (eql(reason, "header firstLsn is not a valid LSN")) return true;
+    // K4 / S8 / S9 / S4
+    if (eql(reason, "clean mark authorizes removing its own segment")) return true;
+    if (eql(reason, "clean mark body is not 16 bytes")) return true;
+    if (eql(reason, "clean mark body is truncated")) return true;
+    if (eql(reason, "clean mark attests a non-positive cleanedThroughSeq")) return true;
+    if (eql(reason, "clean mark attests a logStartLsn that is not at or below its own LSN")) return true;
+    if (eql(reason, "section LSNs must be consecutive")) return true;
+    if (eql(reason, "section body CRC mismatch in a non-final segment")) return true;
+    if (eql(reason, "mid-log corruption: section body CRC mismatch but valid sections follow")) return true;
+    // R4 triad + R6
+    if (eql(reason, "the retained log does not begin where the mark attests: sections below it are gone")) return true;
+    if (eql(reason, "segment does not begin where its predecessor ended: sections between them are gone")) return true;
+    if (eql(reason, "segment's first section is not the LSN its header states: its leading sections are gone")) return true;
+    if (eql(reason, "replay skipped append(s) whose base image is absent and which no later entry superseded")) return true;
+    return false;
 }
 
 /// Grades every `bytes` row against the CAPTURED post bytes (contract §2.3).

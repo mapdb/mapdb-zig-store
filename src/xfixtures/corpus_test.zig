@@ -458,10 +458,12 @@ test "xfixtures corpus: the reopen row is graded" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // H99 is outside the catalogue vocabulary — every real family now has a
+    // predicate (C8f f0), so the no-predicate red needs a token none of them is.
     const cases = [_]struct { what: []const u8, family: []const u8, ok: bool }{
         .{ .what = "the family the reopen really produces", .family = "StoreFull", .ok = true },
         .{ .what = "a family the reopen does not produce", .family = "S2", .ok = false },
-        .{ .what = "a family this engine has no predicate for", .family = "R4", .ok = false },
+        .{ .what = "a family this engine has no predicate for", .family = "H99", .ok = false },
     };
     // The row is REPLACED, not appended. C5t made the positive case real — the
     // checked-in corpus now carries this exact line, derived from the family
@@ -533,7 +535,7 @@ test "xfixtures corpus: a reject arm's own refusal is graded" {
         try out.append(a, '\n');
     }
     try testing.expect(dropped);
-    try out.writer(a).print("{s}R4\n", .{pfx});
+    try out.writer(a).print("{s}H99\n", .{pfx});
 
     var sample = try loadDoctored(&ctx, out.items);
     defer sample.deinit(a);
@@ -542,7 +544,7 @@ test "xfixtures corpus: a reject arm's own refusal is graded" {
     try xfix.expectRefusedSaying(
         &ctx,
         "a reject arm whose own refusal is graded by nothing",
-        "family[R4]: error family R4 has no predicate in this engine",
+        "family[H99]: error family H99 has no predicate in this engine",
         xfix.runV2CorpusCells,
         .{ &ctx, &sample, "rw", dir, xfix.Dispatch.by_manifest },
     );
@@ -822,77 +824,89 @@ test "xfixtures corpus: a reopen row on a store that opens again is refused" {
 test "xfixtures corpus: the reopen family predicate discriminates" {
     const a = testing.allocator;
     var ctx = xfix.Ctx{ .alloc = a };
-    const recover = @import("../store/wal_recover.zig");
 
-    const s2_real = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = recover.H_LSN_BACK } };
-    const s2_wrong_variant = xfix.Refusal{ .err = error.StoreFull, .diag = .{ .reason = recover.H_LSN_BACK } };
-    const s2_wrong_reason = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = recover.R_CHAIN } };
+    // All reasons SPELLED OUT (lesson j) — pins, not store constants.
+    const s2_real = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "section LSN does not follow the previous one" } };
+    const s2_wrong_variant = xfix.Refusal{ .err = error.StoreFull, .diag = .{ .reason = "section LSN does not follow the previous one" } };
+    const s2_wrong_reason = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "segment does not begin where its predecessor ended: sections between them are gone" } };
     const full = xfix.Refusal{ .err = error.StoreFull, .diag = .{} };
 
-    // The refusals C5t brought here, each carrying the diagnostic its own opener
-    // writes. Every string is spelled out rather than imported from the store it
-    // comes from: a comparison against the constant that produced the value has
-    // compared nothing (lesson j), and these are pins.
     const direct_magic = xfix.Refusal{ .err = error.DataCorruption, .direct = .{ .reason = "not a MapDB StoreDirect file (bad magic)" } };
-    // The direct opener's OTHER structural refusals. Same opener, same error
-    // tag, a different check — which is exactly what C5t's first draft could not
-    // tell apart, and codex round 1 finding 5 is that it could not.
     const direct_short = xfix.Refusal{ .err = error.DataCorruption, .direct = .{ .reason = "store file smaller than the header page" } };
     const d1_base = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "regular file at the WAL base path (the v3 opener takes a base, not a log file): no migration to v3 — open it with the release that wrote it and copy the data across, or move it aside" } };
     const d1_ckpt = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "v1 checkpoint temp present at <base>.ckpt, possibly the only recoverable copy after a v1 crash: no migration to v3 — open it with the release that wrote it and copy the data across, or move it aside" } };
-    // N6 — Java's own row, one `for` iteration from the two above and sharing
-    // every word but the first. It is a family the catalogue names and
-    // `REOPEN_FAMILIES` does not transport, so no manifest row can present it;
-    // it is here for the claim that matters, which is that **`D1` refuses it**.
     const n6 = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "v1 single-file WAL present at <base>.wal: no migration to v3 — open it with the release that wrote it and copy the data across, or move it aside" } };
-    // A corruption verdict with NO reason at all: what `recover` propagates when
-    // `inner.rebuildFreeRecids` refuses, since StoreDirect's corruption exits
-    // touch no recovery `Diag`. The first draft's `DataCorruption` predicate
-    // required a non-empty reason and refused this one — the other half of
-    // finding 3.
+    // Unrefined corruption (entry-level) and undiagnosed recovery exits.
+    const corrupt = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "entry references the reserved recid 0" } };
     const undiagnosed = xfix.Refusal{ .err = error.DataCorruption, .diag = .{} };
 
-    // THE WHOLE MATRIX, because a family predicate that is never shown a
-    // NEIGHBOUR's refusal has not been shown to read the family at all. Over the
-    // five families the corpus TRANSPORTS it is a true diagonal — codex round 1
-    // finding 4, which found `DataCorruption` admitting the S2 refusal and this
-    // battery blessing the overlap. A manifest row names ONE family, so a
-    // divergent-entry cell that wrongly refused with the S2 rule graded green.
-    //
-    // The extra columns are refusals no manifest row can name: `direct-short`,
-    // `n6` and `undiagnosed`. Two of them belong to nobody and the third,
-    // `undiagnosed`, belongs to `DataCorruption` — which is what that family
-    // means once it is stated as an exclusion.
+    // C8f f0 representative samples for the thirteen L15 families.
+    const h5 = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "unsupported WAL format version" } };
+    const h6 = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "unknown segment flags" } };
+    const h7 = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "header sequence does not match its name" } };
+    const h9 = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "header firstLsn is not a valid LSN" } };
+    const k4 = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "clean mark authorizes removing its own segment" } };
+    const s8 = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "clean mark attests a non-positive cleanedThroughSeq" } };
+    const s9 = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "section LSNs must be consecutive" } };
+    const s4 = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "section body CRC mismatch in a non-final segment" } };
+    const r4_floor = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "the retained log does not begin where the mark attests: sections below it are gone" } };
+    const r4_chain = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "segment does not begin where its predecessor ended: sections between them are gone" } };
+    const r4_self = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "segment's first section is not the LSN its header states: its leading sections are gone" } };
+    const r6 = xfix.Refusal{ .err = error.DataCorruption, .diag = .{ .reason = "replay skipped append(s) whose base image is absent and which no later entry superseded" } };
+
+    // Column order for accepts strings below.
     const Sample = struct { name: []const u8, opener: []const u8, r: xfix.Refusal };
     const samples = [_]Sample{
-        .{ .name = "direct-magic", .opener = "direct", .r = direct_magic },
-        .{ .name = "direct-short", .opener = "direct", .r = direct_short },
-        .{ .name = "d1-base", .opener = "wal3", .r = d1_base },
-        .{ .name = "d1-ckpt", .opener = "wal3", .r = d1_ckpt },
-        .{ .name = "n6", .opener = "wal3", .r = n6 },
-        .{ .name = "corrupt", .opener = "wal3", .r = .{ .err = error.DataCorruption, .diag = .{ .reason = recover.R_RECID_ZERO } } },
-        .{ .name = "undiagnosed", .opener = "wal3", .r = undiagnosed },
-        .{ .name = "s2", .opener = "wal3", .r = s2_real },
-        .{ .name = "full", .opener = "wal3", .r = full },
+        .{ .name = "direct-magic", .opener = "direct", .r = direct_magic }, // 0
+        .{ .name = "direct-short", .opener = "direct", .r = direct_short }, // 1
+        .{ .name = "d1-base", .opener = "wal3", .r = d1_base }, // 2
+        .{ .name = "d1-ckpt", .opener = "wal3", .r = d1_ckpt }, // 3
+        .{ .name = "n6", .opener = "wal3", .r = n6 }, // 4
+        .{ .name = "corrupt", .opener = "wal3", .r = corrupt }, // 5
+        .{ .name = "undiagnosed", .opener = "wal3", .r = undiagnosed }, // 6
+        .{ .name = "s2", .opener = "wal3", .r = s2_real }, // 7
+        .{ .name = "full", .opener = "wal3", .r = full }, // 8
+        .{ .name = "h5", .opener = "wal3", .r = h5 }, // 9
+        .{ .name = "h6", .opener = "wal3", .r = h6 }, // 10
+        .{ .name = "h7", .opener = "wal3", .r = h7 }, // 11
+        .{ .name = "h9", .opener = "wal3", .r = h9 }, // 12
+        .{ .name = "k4", .opener = "wal3", .r = k4 }, // 13
+        .{ .name = "s8", .opener = "wal3", .r = s8 }, // 14
+        .{ .name = "s9", .opener = "wal3", .r = s9 }, // 15
+        .{ .name = "s4", .opener = "wal3", .r = s4 }, // 16
+        .{ .name = "r4-floor", .opener = "wal3", .r = r4_floor }, // 17
+        .{ .name = "r4-chain", .opener = "wal3", .r = r4_chain }, // 18
+        .{ .name = "r4-self", .opener = "wal3", .r = r4_self }, // 19
+        .{ .name = "r6", .opener = "wal3", .r = r6 }, // 20
     };
-    // `DataCorruption` is an EXCLUSION arm, so the sample that proves its opener
-    // conjunct is load-bearing must be a refusal from the OTHER opener whose
-    // every exclusion passes: `direct-magic` has an empty `diag.reason`, which
-    // is neither a D1 reason nor `H_LSN_BACK`. The two arms above it need no
-    // opener conjunct — they require a reason to be PRESENT in a field only
-    // their own opener writes — and the campaign proved both deletable.
+    // 21 columns. DataCorruption accepts corrupt + undiagnosed only among the
+    // refined-unclaimed samples; N6 is now refined (C8f f0).
     const Row = struct { family: []const u8, accepts: []const u8 };
     const rows = [_]Row{
-        .{ .family = "direct-magic", .accepts = "ynnnnnnnn" },
-        .{ .family = "D1", .accepts = "nnyynnnnn" },
-        .{ .family = "DataCorruption", .accepts = "nnnnyyynn" },
-        .{ .family = "S2", .accepts = "nnnnnnnyn" },
-        .{ .family = "StoreFull", .accepts = "nnnnnnnny" },
+        .{ .family = "direct-magic", .accepts = "ynnnnnnnnnnnnnnnnnnnn" },
+        .{ .family = "D1", .accepts = "nnyynnnnnnnnnnnnnnnnn" },
+        .{ .family = "N6", .accepts = "nnnnynnnnnnnnnnnnnnnn" },
+        // DataCorruption: corrupt(5)+undiagnosed(6) only; N6(4) and S2(7) excluded.
+        .{ .family = "DataCorruption", .accepts = "nnnnnyynnnnnnnnnnnnnn" },
+        .{ .family = "S2", .accepts = "nnnnnnnynnnnnnnnnnnnn" },
+        .{ .family = "StoreFull", .accepts = "nnnnnnnnynnnnnnnnnnnn" },
+        .{ .family = "H5", .accepts = "nnnnnnnnnynnnnnnnnnnn" },
+        .{ .family = "H6", .accepts = "nnnnnnnnnnynnnnnnnnnn" },
+        .{ .family = "H7", .accepts = "nnnnnnnnnnnynnnnnnnnn" },
+        .{ .family = "H9", .accepts = "nnnnnnnnnnnnynnnnnnnn" },
+        .{ .family = "K4", .accepts = "nnnnnnnnnnnnnynnnnnnn" },
+        .{ .family = "S8/K-bounds", .accepts = "nnnnnnnnnnnnnnynnnnnn" },
+        .{ .family = "S9", .accepts = "nnnnnnnnnnnnnnnynnnnn" },
+        .{ .family = "S4/mid-log", .accepts = "nnnnnnnnnnnnnnnnynnnn" },
+        .{ .family = "R4-floor", .accepts = "nnnnnnnnnnnnnnnnnynnn" },
+        .{ .family = "R4-chain", .accepts = "nnnnnnnnnnnnnnnnnnynn" },
+        .{ .family = "R4-self", .accepts = "nnnnnnnnnnnnnnnnnnnyn" },
+        .{ .family = "R6-audit", .accepts = "nnnnnnnnnnnnnnnnnnnny" },
     };
     for (rows) |row| {
         try testing.expectEqual(samples.len, row.accepts.len);
         for (samples, row.accepts) |s, want| {
-            var buf: [96]u8 = undefined;
+            var buf: [128]u8 = undefined;
             const what = try std.fmt.bufPrint(&buf, "{s} graded as {s}", .{ s.name, row.family });
             if (want == 'y')
                 try xfix.assertFamily(&ctx, what, s.opener, row.family, s.r)
@@ -901,11 +915,15 @@ test "xfixtures corpus: the reopen family predicate discriminates" {
         }
     }
 
-    // Each half of the collapsed S2 conjunction, alone — neither is a member of
-    // the matrix above, because no opener produces them.
+    // Each half of the collapsed S2 conjunction, alone.
     try xfix.expectRefused(&ctx, "an operational failure wearing the S2 reason", xfix.assertFamily, .{ &ctx, "w", "wal3", "S2", s2_wrong_variant });
     try xfix.expectRefused(&ctx, "a corruption verdict carrying a different reason", xfix.assertFamily, .{ &ctx, "w", "wal3", "S2", s2_wrong_reason });
-    try xfix.expectRefused(&ctx, "a family with no predicate", xfix.assertFamily, .{ &ctx, "w", "wal3", "R4", s2_real });
+    try xfix.expectRefused(&ctx, "a family with no predicate", xfix.assertFamily, .{ &ctx, "w", "wal3", "H99", s2_real });
+
+    // S8 / S4 extra disjuncts.
+    try xfix.assertFamily(&ctx, "S8 logStart", "wal3", "S8/K-bounds", .{ .err = error.DataCorruption, .diag = .{ .reason = "clean mark attests a logStartLsn that is not at or below its own LSN" } });
+    try xfix.assertFamily(&ctx, "S4 mid-log active", "wal3", "S4/mid-log", .{ .err = error.DataCorruption, .diag = .{ .reason = "mid-log corruption: section body CRC mismatch but valid sections follow" } });
+    try xfix.expectRefused(&ctx, "K4 as S8", xfix.assertFamily, .{ &ctx, "w", "wal3", "S8/K-bounds", k4 });
 }
 
 // ---------------------------------------------------------------------------
