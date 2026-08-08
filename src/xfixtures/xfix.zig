@@ -918,7 +918,19 @@ pub const V2Bytes = struct {
 
 /// `reopen <fid> <engine> <mode> <family>` — after the cell's actions have run
 /// and the store has been closed, a SECOND open must fail with this family.
+/// Stability / second grade only; first-open family is the `family` row (C8f f1).
 pub const V2Reopen = struct {
+    fixture: []const u8,
+    engine: []const u8,
+    mode: []const u8,
+    family: []const u8,
+};
+
+/// `family <fid> <engine> <mode> <familyName>` — first-open family grade on every
+/// reject arm (C8f f1). Bijection with reject arms is catalogue-side; this engine
+/// requires exactly one row per rejected open it runs, grades it once, and fails
+/// suite-end on missing / unconsumed keys. Mutating R6-audit/rw is family-only.
+pub const V2Family = struct {
     fixture: []const u8,
     engine: []const u8,
     mode: []const u8,
@@ -934,6 +946,7 @@ pub const V2 = struct {
     actions: std.ArrayListUnmanaged(V2Action) = .empty,
     byte_rows: std.ArrayListUnmanaged(V2Bytes) = .empty,
     reopens: std.ArrayListUnmanaged(V2Reopen) = .empty,
+    families: std.ArrayListUnmanaged(V2Family) = .empty,
     recids: std.ArrayListUnmanaged(RecidRow) = .empty,
     owned: Strings = .{},
 
@@ -946,6 +959,7 @@ pub const V2 = struct {
         self.actions.deinit(alloc);
         self.byte_rows.deinit(alloc);
         self.reopens.deinit(alloc);
+        self.families.deinit(alloc);
         self.recids.deinit(alloc);
         self.owned.deinit(alloc);
     }
@@ -969,6 +983,13 @@ pub const V2 = struct {
 
     pub fn reopensOf(self: *const V2, fixture: []const u8, engine: []const u8, mode: []const u8, out: *std.ArrayListUnmanaged(*const V2Reopen), alloc: Allocator) !void {
         for (self.reopens.items) |*r| {
+            if (eql(r.fixture, fixture) and eql(r.engine, engine) and eql(r.mode, mode))
+                try out.append(alloc, r);
+        }
+    }
+
+    pub fn familiesOf(self: *const V2, fixture: []const u8, engine: []const u8, mode: []const u8, out: *std.ArrayListUnmanaged(*const V2Family), alloc: Allocator) !void {
+        for (self.families.items) |*r| {
             if (eql(r.fixture, fixture) and eql(r.engine, engine) and eql(r.mode, mode))
                 try out.append(alloc, r);
         }
@@ -1325,6 +1346,26 @@ fn parseV2(ctx: *Ctx, lines: *LineIter) Error!V2 {
                     return ctx.err("duplicate reopen row: {s}", .{line});
             }
             try m.reopens.append(ctx.alloc, r);
+            try referenced.append(ctx.alloc, t.f[1]);
+        } else if (eql(tag, "family")) {
+            // C8f f1: first-open family grade. Same shape as `reopen`; oracle
+            // profile only on the catalogue side, but this parser accepts the
+            // row wherever a v2 root carries it (fail-closed on unknown was the
+            // pre-f1 behaviour engines still had until consumers landed).
+            try arity(ctx, t, 5, line);
+            const r = V2Family{
+                .fixture = t.f[1],
+                .engine = try oneOf(ctx, t.f[2], &ENGINES, "engine", line),
+                .mode = try oneOf(ctx, t.f[3], &MODES, "mode", line),
+                // Not vocabulary-checked — same reason as `reopen`: catalogue is
+                // the authority; `assertFamily` refuses an unimplemented name.
+                .family = t.f[4],
+            };
+            for (m.families.items) |prior| {
+                if (cellEq(.{ prior.fixture, prior.engine, prior.mode }, .{ r.fixture, r.engine, r.mode }))
+                    return ctx.err("duplicate family row: {s}", .{line});
+            }
+            try m.families.append(ctx.alloc, r);
             try referenced.append(ctx.alloc, t.f[1]);
         } else if (eql(tag, "bytes")) {
             try arity(ctx, t, 7, line);
@@ -2532,8 +2573,53 @@ fn assertBytesRows(
     }
 }
 
+/// First-open family grade (C8f f1 plan §4.2).
+///
+/// On every rejected open: look up exactly one `family` key for
+/// `(fixture, zig, mode)`; absence is failure; `assertFamily`; consume once.
+/// Accept cells must not carry a family row — any present stays unconsumed and
+/// reds at the per-cell accountant (suite-wide orphan accounting covers rows
+/// addressed to cells this engine never ran).
+///
+/// Graded AFTER post-state, for the same lesson-(h) reason the first-open grade
+/// used to live inside `assertReopen`: §3.11's mutant must report the file-set
+/// rule, not a family miss that fires earlier.
+fn assertFirstOpenFamily(
+    ctx: *Ctx,
+    m: *const V2,
+    e: V2Expect,
+    opener: []const u8,
+    cell: []const u8,
+    owed: *Consumption,
+    first: ?Refusal,
+) Error!void {
+    var rows: std.ArrayListUnmanaged(*const V2Family) = .empty;
+    defer rows.deinit(ctx.alloc);
+    try m.familiesOf(e.fixture, ENGINE, e.mode, &rows, ctx.alloc);
+    if (eql(e.verdict, "reject")) {
+        // Fail-closed: a reject arm without a family row is not "graded by
+        // refused alone" any more — that was L15's remainder, closed by C8f.
+        if (rows.items.len == 0)
+            return ctx.err("[{s}] reject arm has no family row for ({s}, {s}, {s})", .{ cell, e.fixture, ENGINE, e.mode });
+        // Parser dedups on (fixture, engine, mode), so len is 0 or 1.
+        const r = rows.items[0];
+        const f = first orelse
+            return ctx.err("[{s}] reject arm produced no first-open refusal to grade against family[{s}]", .{ cell, r.family });
+        var fam_buf: [256]u8 = undefined;
+        const fam_where = std.fmt.bufPrint(&fam_buf, "[{s}] family[{s}]", .{ cell, r.family }) catch cell;
+        try assertFamily(ctx, fam_where, opener, r.family, f);
+        try owed.consume(ctx, "family {s}", .{r.family}, r);
+    }
+    // Accept path: do not consume. A family row on an accept arm is a debt the
+    // per-cell accountant refuses at requireAllConsumed.
+}
+
 /// After the cell's actions have run and the store has been closed, a SECOND
 /// open must fail with the family the row names.
+///
+/// C8f f1: reopen is stability / second grade only. First-open family is graded
+/// by `assertFirstOpenFamily` from the `family` row — including on reject arms
+/// that carry no reopen (mutating R6-audit/rw).
 fn assertReopen(
     ctx: *Ctx,
     m: *const V2,
@@ -2542,7 +2628,6 @@ fn assertReopen(
     base: []const u8,
     cell: []const u8,
     owed: *Consumption,
-    first: ?Refusal,
 ) Error!void {
     var rows: std.ArrayListUnmanaged(*const V2Reopen) = .empty;
     defer rows.deinit(ctx.alloc);
@@ -2550,22 +2635,6 @@ fn assertReopen(
     for (rows.items) |r| {
         var where_buf: [256]u8 = undefined;
         const where = std.fmt.bufPrint(&where_buf, "[{s}] reopen[{s}]", .{ cell, r.family }) catch cell;
-        // THE CELL'S OWN REFUSAL FIRST, where there was one. C5t's first draft
-        // graded the family on the reopen alone and threw the first refusal away;
-        // codex round 1 finding 2 is why it does not. The reopen is a WRITABLE
-        // open whatever the cell's mode was, so every `mode=ro` row was graded on
-        // a retry in the OTHER mode — a store that refuses read-only for one
-        // reason and writable for another passed, and so did a stateful one that
-        // got it wrong once and right on retry. The arm the corpus names is the
-        // first open; the second is the stability check.
-        //
-        // On an ACCEPT cell — Q8 — `first` is null and the reopen is the only
-        // grading there is, because the cell's own open succeeded.
-        if (first) |f| {
-            var fam_buf: [256]u8 = undefined;
-            const fam_where = std.fmt.bufPrint(&fam_buf, "[{s}] family[{s}]", .{ cell, r.family }) catch cell;
-            try assertFamily(ctx, fam_where, opener, r.family, f);
-        }
         // A reopen is a WRITABLE open whatever the cell's own mode was: the claim
         // is that the store is permanently unopenable, and a read-only probe
         // would be a weaker one.
@@ -2628,8 +2697,8 @@ pub const Cells = struct {
         self.owned.deinit(alloc);
     }
 
-    /// Every `action`/`bytes`/`reopen`/`post` row addressed to this engine in
-    /// `mode` must name a cell the engine actually runs.
+    /// Every `action`/`bytes`/`reopen`/`family`/`post` row addressed to this
+    /// engine in `mode` must name a cell the engine actually runs.
     ///
     /// **Per-cell consumption cannot see this**, and both C5j reviewers proved it
     /// independently: the accountant is built from the rows addressed to the cell
@@ -2656,9 +2725,13 @@ pub const Cells = struct {
             if (eql(r.engine, ENGINE) and eql(r.mode, mode) and !contains(ran, r.fixture))
                 return ctx.err("an oracle row addressed to {s} whose cell this engine never ran: reopen {s}/{s} {s}", .{ ENGINE, r.fixture, r.mode, r.family });
         }
-        // `post` is the FOURTH addressed row type. C5j's round 2 found that
-        // nothing on either side of the fence caught one addressed to a cell no
-        // engine runs; §2.3 names it now, and it has a per-cell debt as well.
+        for (m.families.items) |r| {
+            if (eql(r.engine, ENGINE) and eql(r.mode, mode) and !contains(ran, r.fixture))
+                return ctx.err("an oracle row addressed to {s} whose cell this engine never ran: family {s}/{s} {s}", .{ ENGINE, r.fixture, r.mode, r.family });
+        }
+        // `post` is an addressed row type. C5j's round 2 found that nothing on
+        // either side of the fence caught one addressed to a cell no engine runs;
+        // §2.3 names it now, and it has a per-cell debt as well.
         for (m.posts.items) |p| {
             if (eql(p.engine, ENGINE) and eql(p.mode, mode) and !contains(ran, p.fixture))
                 return ctx.err("an oracle row addressed to {s} whose cell this engine never ran: post {s}/{s} {s}", .{ ENGINE, p.fixture, p.mode, p.rel });
@@ -2701,6 +2774,11 @@ pub const Cells = struct {
         try m.reopensOf(e.fixture, ENGINE, e.mode, &reopens, ctx.alloc);
         for (reopens.items) |r| try owed.owe(ctx, "reopen {s}", .{r.family}, r);
 
+        var families: std.ArrayListUnmanaged(*const V2Family) = .empty;
+        defer families.deinit(ctx.alloc);
+        try m.familiesOf(e.fixture, ENGINE, e.mode, &families, ctx.alloc);
+        for (families.items) |r| try owed.owe(ctx, "family {s}", .{r.family}, r);
+
         var posts: std.ArrayListUnmanaged(*const V2Post) = .empty;
         defer posts.deinit(ctx.alloc);
         try m.postsOf(e.fixture, ENGINE, e.mode, &posts, ctx.alloc);
@@ -2733,33 +2811,19 @@ pub const Cells = struct {
         if (eql(e.verdict, "accept")) {
             try self.runAccept(ctx, e, opener, base, cell, &owed, actions.items);
         } else if (eql(e.verdict, "reject")) {
-            // A `reject` cell asserts that the open FAILED. Since C5t it can also
-            // assert WHICH failure, and that is the point of plan §3.12.
+            // A `reject` cell asserts that the open FAILED. C8f f1 grades WHICH
+            // failure on the first open via the `family` row (bijection with
+            // every reject arm, including mutating R6-audit/rw). `assertReopen`
+            // below is stability only — a second open that must refuse the same
+            // way — and is absent on family-only arms.
             //
-            // The v2 `expect` row still has no family column. What it has now is
-            // a `reopen` row per eligible reject arm, derived in `catalogue.py`
-            // from the family that was already pinned there, and the family is
-            // graded HERE, on this arm's own refusal. `assertReopen` below then
-            // opens again and grades the same family a second time, which is the
-            // STABILITY half — a store that refuses once and opens on the retry
-            // now fails, and passed before.
-            //
-            // Grading here rather than only on the reopen is codex round 1
-            // finding 2: the reopen is a WRITABLE open, so every `mode=ro` row
-            // was graded on a retry in the other mode, and a store that refuses
-            // read-only for one reason and writable for another passed. The arm
-            // the corpus names is this one.
-            //
-            // What is NOT covered: the thirteen families outside
-            // `catalogue.REOPEN_FAMILIES`, which stay graded by "it refused"
-            // alone. That is L15's remainder and its owner is C8.
-            // The refusal is HELD rather than graded here. `assertReopen` grades
-            // it, after the capture and the post-state rules, because §3.11's
-            // mutant — the direct cell dispatched to the wal3 opener — trips both
-            // this family check and the post-row rule it was written to prove,
-            // and lesson (h) says such an input measures whichever fires first.
-            // Grading here made §3.11's mutant report the family, and §3.11's own
-            // rule went unmeasured.
+            // The refusal is HELD rather than graded here. `assertFirstOpenFamily`
+            // grades it after the capture and the post-state rules, because
+            // §3.11's mutant — the direct cell dispatched to the wal3 opener —
+            // trips both the family check and the post-row rule it was written
+            // to prove, and lesson (h) says such an input measures whichever
+            // fires first. Grading before post-state made §3.11's mutant report
+            // the family, and §3.11's own rule went unmeasured.
             first_refusal = try refusalOf(ctx, opener, e.mode, base, cell) orelse
                 return ctx.err("[{s}] expected a refusal, but the store opened", .{cell});
         }
@@ -2788,7 +2852,12 @@ pub const Cells = struct {
         if (posts.items.len == 0 and eql(e.opener, "wal3"))
             return ctx.err("[{s}] a wal3 cell with no post rows asserts nothing about the directory it just opened, which is not a check", .{cell});
         try assertPostState(ctx, before.items, &after, posts.items, cell, &owed);
-        try assertReopen(ctx, m, e, opener, base, cell, &owed, first_refusal);
+        // First-open family (C8f f1), then reopen stability. Order is deliberate:
+        // family grades `first_refusal` without a second open; reopen is the
+        // second open. codex round 1 finding 2 lives in the family step now —
+        // the arm the corpus names is this first open, not a writable retry.
+        try assertFirstOpenFamily(ctx, m, e, opener, cell, &owed, first_refusal);
+        try assertReopen(ctx, m, e, opener, base, cell, &owed);
         try owed.requireAllConsumed(ctx);
     }
 
@@ -2940,7 +3009,8 @@ pub fn runV2Cells(ctx: *Ctx, sample: *const SampleV2, mode: []const u8, tmp: std
     // would be running assertions this rule never bought, and since C5 moved the
     // profile split into the grammar that is a refusal, not a widening.
     if (m.applies.items.len != 0 or m.actions.items.len != 0 or
-        m.byte_rows.items.len != 0 or m.reopens.items.len != 0)
+        m.byte_rows.items.len != 0 or m.reopens.items.len != 0 or
+        m.families.items.len != 0)
         return ctx.err("the static sample carries an oracle row; it is v2-core through C7", .{});
 
     var cells = Cells{ .sample = sample };

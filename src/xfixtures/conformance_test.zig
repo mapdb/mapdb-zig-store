@@ -645,10 +645,12 @@ test "xfixtures: the C5 oracle rows parse and are checked" {
 
     const ACT = "action\tf\tzig\tro\tcommit_one_record\top=put,payload_id=1,payload_len=2,recid_label=Q,serializer=raw\n";
 
-    // The four row types, well formed, in one manifest that must PARSE.
+    // The oracle row types, well formed, in one manifest that must PARSE.
+    // C8f f1 adds `family` (first-open grade) alongside C5's `reopen` (stability).
     try parseOk(&ctx, V2_HEAD ++ V2_FILE ++ "applies\tf\tzig\tro\n" ++ ACT ++
         "bytes\tf\tzig\tro\tx.wal.0000000000000001\t0\taabb\n" ++
-        "reopen\tf\tzig\tro\tS2\n");
+        "reopen\tf\tzig\tro\tS2\n" ++
+        "family\tf\tzig\tro\tS2\n");
 
     try refuse(&ctx, "a short applies row", V2_HEAD ++ V2_FILE ++ "applies\tf\tzig\n");
     try refuse(&ctx, "an applies row for an unknown engine", V2_HEAD ++ V2_FILE ++ "applies\tf\tgo\tro\n");
@@ -685,6 +687,8 @@ test "xfixtures: the C5 oracle rows parse and are checked" {
         "action\tf\tzig\tro\tcommit_one_record\top=p t\n");
     try refuse(&ctx, "a duplicate reopen row", V2_HEAD ++ V2_FILE ++
         "reopen\tf\tzig\tro\tS2\nreopen\tf\tzig\tro\tS2\n");
+    try refuse(&ctx, "a duplicate family row", V2_HEAD ++ V2_FILE ++
+        "family\tf\tzig\tro\tS2\nfamily\tf\tzig\tro\tS2\n");
     try refuse(&ctx, "a bytes row with an odd-length hex blob", V2_HEAD ++ V2_FILE ++
         "bytes\tf\tzig\tro\tx.wal.0000000000000001\t0\taab\n");
     try refuse(&ctx, "a bytes row with an uppercase hex blob", V2_HEAD ++ V2_FILE ++
@@ -693,11 +697,12 @@ test "xfixtures: the C5 oracle rows parse and are checked" {
         "bytes\tf\tzig\tro\tx.wal.0000000000000001\t0\taa\n" ++
         "bytes\tf\tzig\tro\tx.wal.0000000000000001\t0\tbb\n");
     // The fixture reference is a reference like any other row's: a row addressed
-    // to a fixture nothing declares must be refused, in all four types.
+    // to a fixture nothing declares must be refused, in all oracle types.
     try refuse(&ctx, "an applies row naming an undeclared fixture", V2_HEAD ++ V2_FILE ++ "applies\tghost\tzig\tro\n");
     try refuse(&ctx, "an action row naming an undeclared fixture", V2_HEAD ++ V2_FILE ++
         "action\tghost\tzig\tro\tcommit_one_record\top=put\n");
     try refuse(&ctx, "a reopen row naming an undeclared fixture", V2_HEAD ++ V2_FILE ++ "reopen\tghost\tzig\tro\tS2\n");
+    try refuse(&ctx, "a family row naming an undeclared fixture", V2_HEAD ++ V2_FILE ++ "family\tghost\tzig\tro\tS2\n");
     try refuse(&ctx, "a bytes row naming an undeclared fixture", V2_HEAD ++ V2_FILE ++
         "bytes\tghost\tzig\tro\tx.wal.0000000000000001\t0\taa\n");
 }
