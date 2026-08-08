@@ -25,11 +25,13 @@
 //! **`reopen` IS addressed to zig, and C5t is what changed that** (plan §3.12).
 //! Every eligible reject arm now carries one, derived in `catalogue.py` from the
 //! error family already pinned there. THIS ROOT — the full frozen corpus after
-//! C6 — carries all five families `catalogue.REOPEN_FAMILIES` transports
-//! (`D1`, `DataCorruption`, `S2`, `StoreFull`, `direct-magic`). So this engine
-//! grades WHICH failure a reject cell produced and that the refusal is STABLE.
-//! Until C5t the reject arm could only assert that the open failed, and a store
-//! that refused Q8 because a bug made it refuse everything passed.
+//! C6, with C8f f2/f3 sealing every reject arm's `family` row and the expanded
+//! `REOPEN_FAMILIES` set (18 names; zig reopen 42, family 43) — so this engine
+//! grades WHICH failure a reject cell produced on first open, and that the
+//! refusal is STABLE on reopen. Until C5t the reject arm could only assert that
+//! the open failed, and a store that refused Q8 because a bug made it refuse
+//! everything passed. Pre-f2 inject bridges are gone: the sealed MANIFEST is
+//! the only source of family rows.
 //!
 //! So plan §5.3 item 2 splits the flip: zig **accepts and accounts**, and its
 //! execution paths get their inputs from SYNTHETIC manifests here — where a row
@@ -223,7 +225,7 @@ const corpus_embed_table_src: []const u8 = @embedFile("embedded_v2_corpus.zig");
 /// trust upgrade over C5t's disposable staged worktree: four repositories must
 /// move together. Regenerate with
 /// `python3 todo/store-cross/freeze_v2.py --corpus --dist-seals`.
-const DIST_SEAL = "a03ab6eb4e8ae4f3ac62fe87f2aebbd501bd463d97377335e5c1e2bd831cf1f0";
+const DIST_SEAL = "cbafad196a6a9480271ddb525e2208860ed7fd7016bc6658ac2e98ec63201ec9";
 
 fn loadCorpus(ctx: *xfix.Ctx) !xfix.SampleV2 {
     return xfix.loadSampleV2(ctx, corpus_manifest_tsv, &embedded_corpus.blobs);
@@ -233,78 +235,13 @@ fn loadDoctored(ctx: *xfix.Ctx, text: []const u8) !xfix.SampleV2 {
     return xfix.loadSampleV2(ctx, text, &embedded_corpus.blobs);
 }
 
-/// Every zig reject-arm `family` row the live catalogue derives (C8f f1 T1).
-///
-/// The frozen `data-v2-corpus/MANIFEST.tsv` does not yet carry these — freeze is
-/// f2. Doctored / consumer-probe paths append this block so the executor can be
-/// exercised before the seal moves. One row per reject arm including mutating
-/// R6-audit/rw (`mut-wal3-mark-then-refusal` rw is family-only: no reopen).
-///
-/// Written as `"\t"`-escaped string literals (not `\\` multiline): Zig rejects
-/// raw tab bytes inside multiline string literals.
-const ZIG_FAMILY_ROWS =
-    "family\treject-wal3-n6-barewal\tzig\tro\tN6\n" ++
-    "family\treject-wal3-n6-barewal\tzig\trw\tN6\n" ++
-    "family\treject-wal3-d1-barebase\tzig\tro\tD1\n" ++
-    "family\treject-wal3-d1-barebase\tzig\trw\tD1\n" ++
-    "family\treject-wal3-d1-ckpt\tzig\tro\tD1\n" ++
-    "family\treject-wal3-d1-ckpt\tzig\trw\tD1\n" ++
-    "family\treject-wal3-h5-version\tzig\tro\tH5\n" ++
-    "family\treject-wal3-h5-version\tzig\trw\tH5\n" ++
-    "family\treject-wal3-h6-flags\tzig\tro\tH6\n" ++
-    "family\treject-wal3-h6-flags\tzig\trw\tH6\n" ++
-    "family\treject-wal3-h7-seq\tzig\tro\tH7\n" ++
-    "family\treject-wal3-h7-seq\tzig\trw\tH7\n" ++
-    "family\treject-wal3-h9-firstlsn\tzig\tro\tH9\n" ++
-    "family\treject-wal3-h9-firstlsn\tzig\trw\tH9\n" ++
-    "family\treject-wal3-k4-through\tzig\tro\tK4\n" ++
-    "family\treject-wal3-k4-through\tzig\trw\tK4\n" ++
-    "family\treject-wal3-k-through0\tzig\tro\tS8/K-bounds\n" ++
-    "family\treject-wal3-k-through0\tzig\trw\tS8/K-bounds\n" ++
-    "family\treject-wal3-k-logstart0\tzig\tro\tS8/K-bounds\n" ++
-    "family\treject-wal3-k-logstart0\tzig\trw\tS8/K-bounds\n" ++
-    "family\treject-wal3-k-logstart-hi\tzig\tro\tS8/K-bounds\n" ++
-    "family\treject-wal3-k-logstart-hi\tzig\trw\tS8/K-bounds\n" ++
-    "family\treject-wal3-s2-lsn-regress\tzig\tro\tS2\n" ++
-    "family\treject-wal3-s2-lsn-regress\tzig\trw\tS2\n" ++
-    "family\treject-wal3-s9-gap\tzig\tro\tS9\n" ++
-    "family\treject-wal3-s9-gap\tzig\trw\tS9\n" ++
-    "family\treject-wal3-s4-midlog-crc\tzig\tro\tS4/mid-log\n" ++
-    "family\treject-wal3-s4-midlog-crc\tzig\trw\tS4/mid-log\n" ++
-    "family\treject-wal3-r4-floor\tzig\tro\tR4-floor\n" ++
-    "family\treject-wal3-r4-floor\tzig\trw\tR4-floor\n" ++
-    "family\treject-wal3-r4-chain\tzig\tro\tR4-chain\n" ++
-    "family\treject-wal3-r4-chain\tzig\trw\tR4-chain\n" ++
-    "family\treject-wal3-r4-self\tzig\tro\tR4-self\n" ++
-    "family\treject-wal3-r4-self\tzig\trw\tR4-self\n" ++
-    "family\treject-wal3-segment-at-direct\tzig\trw\tdirect-magic\n" ++
-    "family\tmut-wal3-mark-then-refusal\tzig\tro\tR6-audit\n" ++
-    "family\tmut-wal3-mark-then-refusal\tzig\trw\tR6-audit\n" ++
-    "family\tdiv-wal3-lsn-exhausted\tzig\tro\tStoreFull\n" ++
-    "family\tdiv-wal3-lsn-exhausted\tzig\trw\tStoreFull\n" ++
-    "family\tdiv-wal3-entry-recid0\tzig\tro\tDataCorruption\n" ++
-    "family\tdiv-wal3-entry-recid0\tzig\trw\tDataCorruption\n" ++
-    "family\tdiv-wal3-packlong-overlong\tzig\tro\tDataCorruption\n" ++
-    "family\tdiv-wal3-packlong-overlong\tzig\trw\tDataCorruption\n";
-
-/// Append the pre-f2 zig `family` block to a manifest text. Callers that doctor
-/// a single family row must rewrite after this (or drop the target line first).
-fn withZigFamilyRows(a: Allocator, base: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(a);
-    try out.appendSlice(a, base);
-    if (base.len == 0 or base[base.len - 1] != '\n') try out.append(a, '\n');
-    try out.appendSlice(a, ZIG_FAMILY_ROWS);
-    return out.toOwnedSlice(a);
-}
-
 // ---------------------------------------------------------------------------
 // the corpus itself
 // ---------------------------------------------------------------------------
 
-// The frozen MANIFEST still lacks `family` rows (f2 freeze). Pure load is the
-// gap: every reject arm must fail closed on a missing family key.
-test "xfixtures corpus: frozen MANIFEST without family rows is refused (pre-f2)" {
+// C8f f3: the sealed MANIFEST carries the full family bijection. Pure load is
+// the green path — first-open family grade + reopen stability, no inject bridge.
+test "xfixtures corpus: the zig cells conform in both modes" {
     const a = testing.allocator;
     var ctx = xfix.Ctx{ .alloc = a };
     var sample = try loadCorpus(&ctx);
@@ -312,28 +249,36 @@ test "xfixtures corpus: frozen MANIFEST without family rows is refused (pre-f2)"
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try xfix.expectRefusedSaying(
-        &ctx,
-        "a reject arm with no family row in the frozen MANIFEST",
-        "reject arm has no family row",
-        xfix.runV2CorpusCells,
-        .{ &ctx, &sample, "rw", tmp.dir, xfix.Dispatch.by_manifest },
-    );
+    for (xfix.MODES) |mode| try xfix.runV2CorpusCells(&ctx, &sample, mode, tmp.dir, .by_manifest);
 }
 
-// With the catalogue-derived family block injected (what f2 will seal), every
-// zig cell in both modes must green — first-open family grade + reopen stability.
-test "xfixtures corpus: the zig cells conform in both modes (family inject)" {
+// Fail-closed raw-manifest doctor: a missing family key still reds (plan §4.2).
+test "xfixtures corpus: a MANIFEST missing a family row is refused" {
     const a = testing.allocator;
     var ctx = xfix.Ctx{ .alloc = a };
-    const text = try withZigFamilyRows(a, corpus_manifest_tsv);
-    defer a.free(text);
-    var sample = try loadDoctored(&ctx, text);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(a);
+    var it = std.mem.splitScalar(u8, corpus_manifest_tsv, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        // Strip every family row so the first reject arm fails closed.
+        if (std.mem.startsWith(u8, line, "family\t")) continue;
+        try out.appendSlice(a, line);
+        try out.append(a, '\n');
+    }
+    try testing.expect(out.items.len < corpus_manifest_tsv.len);
+    var sample = try loadDoctored(&ctx, out.items);
     defer sample.deinit(a);
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    for (xfix.MODES) |mode| try xfix.runV2CorpusCells(&ctx, &sample, mode, tmp.dir, .by_manifest);
+    try xfix.expectRefusedSaying(
+        &ctx,
+        "a reject arm with no family row in the doctored MANIFEST",
+        "reject arm has no family row",
+        xfix.runV2CorpusCells,
+        .{ &ctx, &sample, "rw", tmp.dir, xfix.Dispatch.by_manifest },
+    );
 }
 
 // §3.11's mutant, as a SUBSTITUTION rather than a deletion.
@@ -344,12 +289,9 @@ test "xfixtures corpus: the zig cells conform in both modes (family inject)" {
 test "xfixtures corpus: a direct cell sent to the wal opener goes red" {
     const a = testing.allocator;
     var ctx = xfix.Ctx{ .alloc = a };
-    // Family rows required on every reject before §3.11's mutant can be reached;
-    // inject the pre-f2 block so the red names the file-set rule, not a missing
-    // family key on an earlier arm.
-    const text = try withZigFamilyRows(a, corpus_manifest_tsv);
-    defer a.free(text);
-    var sample = try loadDoctored(&ctx, text);
+    // Sealed MANIFEST already carries every reject arm's family row (C8f f2/f3);
+    // pure load so the red names the file-set rule, not a missing family key.
+    var sample = try loadCorpus(&ctx);
     defer sample.deinit(a);
 
     var tmp = testing.tmpDir(.{});
@@ -404,7 +346,6 @@ fn actionManifest(a: Allocator, extra: []const u8) ![]u8 {
         try out.appendSlice(a, line);
         try out.append(a, '\n');
     }
-    try out.appendSlice(a, ZIG_FAMILY_ROWS);
     try out.appendSlice(a, ACTION_ROW);
     try out.appendSlice(a, "post\t" ++ CLEANED_RW ++ "\tx.wal.0000000000000004\tmodified:");
     try out.writer(a).print("{d}:{s}\n", .{ ACTION_POST_LEN, ACTION_POST_SHA });
@@ -471,7 +412,6 @@ test "xfixtures corpus: the action row's refusals each have an input" {
             try out.appendSlice(a, line);
             try out.append(a, '\n');
         }
-        try out.appendSlice(a, ZIG_FAMILY_ROWS);
         try out.writer(a).print("action\t" ++ CLEANED_RW ++ "\t{s}\t{s}\n", .{ c.verb, c.args });
         try out.writer(a).print("post\t" ++ CLEANED_RW ++ "\tx.wal.0000000000000004\tmodified:{d}:{s}\n", .{ ACTION_POST_LEN, ACTION_POST_SHA });
 
@@ -583,7 +523,6 @@ test "xfixtures corpus: the reopen row is graded" {
             try out.append(a, '\n');
         }
         try testing.expect(dropped);
-        try out.appendSlice(a, ZIG_FAMILY_ROWS);
         try out.writer(a).print("{s}{s}\n", .{ pfx, c.family });
 
         var sample = try loadDoctored(&ctx, out.items);
@@ -619,29 +558,28 @@ test "xfixtures corpus: a reject arm's own refusal is graded" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Doctor the FIRST-OPEN family row (not reopen). Reopen stays D1 so a
-    // missing first-open grade would red at reopen[H99] only if we had put H99
-    // there — asserting the family[H99] prefix proves assertFirstOpenFamily ran.
+    // Doctor the FIRST-OPEN family row on the sealed MANIFEST (not reopen).
+    // Reopen stays D1 so a missing first-open grade would red at reopen[H99]
+    // only if we had put H99 there — asserting the family[H99] prefix proves
+    // assertFirstOpenFamily ran.
     const pfx = "family\treject-wal3-d1-barebase\tzig\trw\t";
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(a);
-    var it = std.mem.splitScalar(u8, ZIG_FAMILY_ROWS, '\n');
+    var dropped = false;
+    var it = std.mem.splitScalar(u8, corpus_manifest_tsv, '\n');
     while (it.next()) |line| {
         if (line.len == 0) continue;
-        if (std.mem.startsWith(u8, line, pfx)) continue;
+        if (std.mem.startsWith(u8, line, pfx)) {
+            dropped = true;
+            continue;
+        }
         try out.appendSlice(a, line);
         try out.append(a, '\n');
     }
+    try testing.expect(dropped);
     try out.writer(a).print("{s}H99\n", .{pfx});
-    // Base corpus (with reopen D1 for this arm) + the doctored family block.
-    var full: std.ArrayListUnmanaged(u8) = .empty;
-    defer full.deinit(a);
-    try full.appendSlice(a, corpus_manifest_tsv);
-    if (corpus_manifest_tsv.len == 0 or corpus_manifest_tsv[corpus_manifest_tsv.len - 1] != '\n')
-        try full.append(a, '\n');
-    try full.appendSlice(a, out.items);
 
-    var sample = try loadDoctored(&ctx, full.items);
+    var sample = try loadDoctored(&ctx, out.items);
     defer sample.deinit(a);
     var dir = try tmp.dir.makeOpenPath("first-refusal", .{ .iterate = true });
     defer dir.close();
@@ -669,23 +607,22 @@ test "xfixtures corpus: the family row is graded" {
     };
     const pfx = "family\tdiv-wal3-lsn-exhausted\tzig\trw\t";
     for (cases, 0..) |c, i| {
-        var fam_block: std.ArrayListUnmanaged(u8) = .empty;
-        defer fam_block.deinit(a);
-        var it = std.mem.splitScalar(u8, ZIG_FAMILY_ROWS, '\n');
-        while (it.next()) |line| {
-            if (line.len == 0) continue;
-            if (std.mem.startsWith(u8, line, pfx)) continue;
-            try fam_block.appendSlice(a, line);
-            try fam_block.append(a, '\n');
-        }
-        try fam_block.writer(a).print("{s}{s}\n", .{ pfx, c.family });
-
+        // Replace the sealed family name for this arm; other family rows stay.
         var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(a);
-        try out.appendSlice(a, corpus_manifest_tsv);
-        if (corpus_manifest_tsv.len == 0 or corpus_manifest_tsv[corpus_manifest_tsv.len - 1] != '\n')
+        var dropped = false;
+        var it = std.mem.splitScalar(u8, corpus_manifest_tsv, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, pfx)) {
+                dropped = true;
+                continue;
+            }
+            try out.appendSlice(a, line);
             try out.append(a, '\n');
-        try out.appendSlice(a, fam_block.items);
+        }
+        try testing.expect(dropped);
+        try out.writer(a).print("{s}{s}\n", .{ pfx, c.family });
 
         var sample = try loadDoctored(&ctx, out.items);
         defer sample.deinit(a);
@@ -718,7 +655,6 @@ test "xfixtures corpus: a direct cell addressed to the ro mode is refused" {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(a);
     try out.appendSlice(a, corpus_manifest_tsv);
-    try out.appendSlice(a, ZIG_FAMILY_ROWS);
     try out.appendSlice(a, "applies\treject-wal3-segment-at-direct\tzig\tro\n");
     try out.appendSlice(a, "expect\treject-wal3-segment-at-direct\tzig\tro\treject\tdirect\tx\n");
     // New reject arm (direct/ro) needs a family row so the red names the mode
@@ -888,7 +824,6 @@ test "xfixtures corpus: the preconditions and bounds each refuse" {
         }
         if (c.drop.len != 0 or c.drop_ro or c.drop_contains.len != 0 or c.drop_ro_accept)
             try testing.expect(out.items.len < corpus_manifest_tsv.len);
-        try out.appendSlice(a, ZIG_FAMILY_ROWS);
         try out.appendSlice(a, c.add);
 
         var sample = try loadDoctored(&ctx, out.items);
@@ -926,10 +861,9 @@ test "xfixtures corpus: a reject cell whose store opens is refused" {
         try out.append(a, '\n');
     }
     try testing.expect(std.mem.indexOf(u8, out.items, "\treject\twal3\tx") != null);
-    // Real reject arms need family so we reach the doctored accept-turned-reject
-    // cell; that cell itself has no family row and fails at "store opened"
-    // before the first-open family lookup.
-    try out.appendSlice(a, ZIG_FAMILY_ROWS);
+    // Sealed family rows cover the real reject arms so we reach the doctored
+    // accept-turned-reject cell; that cell itself has no family row and fails
+    // at "store opened" before the first-open family lookup.
 
     var sample = try loadDoctored(&ctx, out.items);
     defer sample.deinit(a);
@@ -957,7 +891,6 @@ test "xfixtures corpus: a reopen row on a store that opens again is refused" {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(a);
     try out.appendSlice(a, corpus_manifest_tsv);
-    try out.appendSlice(a, ZIG_FAMILY_ROWS);
     try out.appendSlice(a, "reopen\t" ++ CLEANED_RW ++ "\tStoreFull\n");
 
     var sample = try loadDoctored(&ctx, out.items);
@@ -1107,7 +1040,6 @@ test "xfixtures corpus: an oracle row no arm can run fails the cell" {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(a);
     try out.appendSlice(a, corpus_manifest_tsv);
-    try out.appendSlice(a, ZIG_FAMILY_ROWS);
     try out.appendSlice(a, "action\tdiv-wal3-lsn-exhausted\tzig\trw\tcommit_one_record\top=put,payload_id=1,payload_len=2,recid_label=Q,serializer=raw\n");
 
     var sample = try loadDoctored(&ctx, out.items);
@@ -1146,9 +1078,8 @@ test "xfixtures corpus: an oracle row addressed to an absent cell fails the suit
         var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(a);
         try out.appendSlice(a, corpus_manifest_tsv);
-        // Real zig/ro reject arms need family so the suite reaches the orphan
-        // check rather than failing closed on a missing first-open key.
-        try out.appendSlice(a, ZIG_FAMILY_ROWS);
+        // Sealed zig/ro family rows let the suite reach the orphan check rather
+        // than failing closed on a missing first-open key.
         try out.appendSlice(a, row);
 
         var sample = try loadDoctored(&ctx, out.items);
@@ -1222,7 +1153,6 @@ test "xfixtures corpus: a file no post row names fails the cell" {
     // instead of the rule it is named for — lesson (h), an input that trips
     // several checks measures the first one only.
     try out.appendSlice(a, "post\t" ++ CLEANED_RW ++ "\tx.wal.0000000000000004\tunchanged\n");
-    try out.appendSlice(a, ZIG_FAMILY_ROWS);
 
     var sample = try loadDoctored(&ctx, out.items);
     defer sample.deinit(a);
@@ -1259,7 +1189,6 @@ test "xfixtures corpus: the reader contract is not vacuous" {
         try out.append(a, '\n');
     }
     try testing.expect(std.mem.indexOf(u8, out.items, "116\t121") != null);
-    try out.appendSlice(a, ZIG_FAMILY_ROWS);
 
     var sample = try loadDoctored(&ctx, out.items);
     defer sample.deinit(a);
@@ -1288,7 +1217,6 @@ test "xfixtures corpus: an accept cell that asserts nothing is refused" {
         try out.appendSlice(a, line);
         try out.append(a, '\n');
     }
-    try out.appendSlice(a, ZIG_FAMILY_ROWS);
 
     var sample = try loadDoctored(&ctx, out.items);
     defer sample.deinit(a);
@@ -1371,7 +1299,6 @@ test "xfixtures corpus: a wal3 cell with no post rows is refused" {
         try out.appendSlice(a, line);
         try out.append(a, '\n');
     }
-    try out.appendSlice(a, ZIG_FAMILY_ROWS);
 
     var sample = try loadDoctored(&ctx, out.items);
     defer sample.deinit(a);
