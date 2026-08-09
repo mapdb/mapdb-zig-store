@@ -2794,6 +2794,64 @@ test "wal3 B3: a commit crossing the trigger pays one slice not the whole pass" 
     }
 }
 
+test "wal3 B3: a commit above the hard ceiling participates until under" {
+    // Above P7's hard ceiling (log > 2 × cleaning_target), a commit's writer
+    // participates with multiple budgeted slices until the log is back under
+    // the ceiling. Contrasts with the one-slice-below-ceiling pin. Java has no
+    // dedicated IT; the production `while (cleaningUrgent())` loop is the
+    // authority. Clock cleared so multi-slice progress is not host-IO dependent.
+    var sc = try TestScratch.init(testing.allocator, "hard_ceiling");
+    defer sc.deinit();
+    var s = try StoreWAL.openSegmentBytes(testing.allocator, sc.base, 64 << 10);
+    defer s.deinit();
+    s.testSetForegroundCleanNanos(0);
+    try s.setMinLogBytes(0);
+    {
+        const payload = try testing.allocator.alloc(u8, 60_000);
+        defer testing.allocator.free(payload);
+        @memset(payload, 1);
+        const recid = try s.put([]const u8, testing.allocator, payload, TestB);
+        try s.commit();
+        var i: u16 = 1;
+        while (i <= 120) : (i += 1) {
+            const p2 = try testing.allocator.alloc(u8, 60_000);
+            defer testing.allocator.free(p2);
+            @memset(p2, @truncate(i));
+            try s.update([]const u8, testing.allocator, recid, p2, TestB);
+            try s.commit();
+        }
+
+        try s.setMinLogBytes(1);
+        try s.setSpaceAmplification(1);
+        const log_before = try s.logBytes();
+        const target = s.testCleaningTarget();
+        const ceiling = target *% 2;
+        const segs_before = blk: {
+            const segs = try s.segmentSeqs(testing.allocator);
+            defer testing.allocator.free(segs);
+            break :blk segs.len;
+        };
+        try testing.expect(log_before > ceiling);
+        try testing.expect(segs_before >= 16);
+
+        {
+            const p3 = try testing.allocator.alloc(u8, 60_000);
+            defer testing.allocator.free(p3);
+            @memset(p3, 255);
+            try s.update([]const u8, testing.allocator, recid, p3, TestB);
+        }
+        try s.commit();
+        const log_after = try s.logBytes();
+        const segs_after = blk: {
+            const segs = try s.segmentSeqs(testing.allocator);
+            defer testing.allocator.free(segs);
+            break :blk segs.len;
+        };
+        try testing.expect(log_after <= ceiling);
+        try testing.expect(segs_before -| segs_after > 2);
+    }
+}
+
 test "wal3 B3 W10: the mark is refused when a record was not re-homed" {
     // The check that cannot be deferred past the unlink: the evidence is
     // exactly what would be deleted. Fault injection drops one recid from
