@@ -352,6 +352,15 @@ const WalState = struct {
     /// retired.
     cleaner_bytes_written: i64 = 0,
     cleaner_bytes_retired: i64 = 0,
+    /// The budget inline cleaning actually runs under. `FOREGROUND_BUDGET`
+    /// unless a test replaces it via `testSetForegroundCleanNanos`.
+    ///
+    /// Exists because `max_nanos` makes any assertion about how much cleaning a
+    /// commit achieves a function of how fast the machine is. A test that pins
+    /// the cleaner's ACCOUNTING and WIDTH rules — neither of which involves a
+    /// clock — must not also depend on host IO speed. Checkpoint still runs
+    /// under `UNBOUNDED_BUDGET`.
+    foreground_budget: Budget = FOREGROUND_BUDGET,
     /// Fault injection, and the only reason it exists: W10 is a check on phase
     /// 1's loop, so a suite that cannot make that loop DROP a record cannot
     /// tell a working W10 from one that passes because nothing ever fails it.
@@ -1235,11 +1244,7 @@ const WalState = struct {
             // and give width back only when it pays HANDSOMELY.
             const cost = self.cleaner_bytes_written - self.cycle_written_at;
             const gain = self.cleaner_bytes_retired - self.cycle_retired_at - cost;
-            if (gain <= cost >> 3) {
-                self.cycle_width = @min(CYCLE_WIDTH_CAP, @max(self.cycle_width, 1) * 2);
-            } else if (gain > cost >> 1) {
-                self.cycle_width = @max(self.cycle_width / 2, 1);
-            }
+            self.cycle_width = nextCycleWidth(self.cycle_width, cost, gain);
             self.last_cycle_saturated = self.cycle_saturated;
         }
         return written;
@@ -1264,7 +1269,7 @@ const WalState = struct {
         // still paid for all of them, consecutively, with every reader and
         // writer waiting.
         if (self.cleaner != null or try self.beginCycleIfDue(closed)) {
-            _ = try self.cleanTick(closed, &FOREGROUND_BUDGET);
+            _ = try self.cleanTick(closed, &self.foreground_budget);
         }
         // The exception is the hard ceiling. Once the log has run away — past
         // twice its target — the writer participates until it is back under,
@@ -1273,7 +1278,7 @@ const WalState = struct {
         while (self.cleaningUrgent() and
             (self.cleaner != null or try self.beginCycleIfDue(closed)))
         {
-            _ = try self.cleanTick(closed, &FOREGROUND_BUDGET);
+            _ = try self.cleanTick(closed, &self.foreground_budget);
         }
     }
 
@@ -1459,6 +1464,24 @@ const Cleaner = struct {
 /// the terminal is never reached.
 fn paidForItself(retired: i64, written: i64) bool {
     return retired - written > (written >> 3);
+}
+
+/// Three-band cycle-width update after a closed cycle's net is knowable.
+///
+/// - poor (`gain <= cost/8`): double, capped at `CYCLE_WIDTH_CAP`
+/// - handsome (`gain > cost/2`): half, floored at 1
+/// - modest (between): hold
+///
+/// Pure so the bands are pin-able without host IO. `cleanTick` is the only
+/// production caller.
+fn nextCycleWidth(width: usize, cost: i64, gain: i64) usize {
+    if (gain <= cost >> 3) {
+        return @min(CYCLE_WIDTH_CAP, @max(width, 1) * 2);
+    } else if (gain > cost >> 1) {
+        return @max(width / 2, 1);
+    } else {
+        return width;
+    }
 }
 
 /// Walks up to `max_steps` entries of the retiring range, handing each entry's
@@ -1995,6 +2018,18 @@ pub const StoreWAL = struct {
         };
     }
 
+    /// Test only (private — same file as the treadmill test; not a product API):
+    /// replace the soft wall-clock ceiling on inline cleaning; 0 removes it.
+    /// Record and byte limits stay exactly as `FOREGROUND_BUDGET` sets them.
+    /// Takes the store write lock so concurrent commits cannot race the field.
+    fn testSetForegroundCleanNanos(self: *Self, max_nanos: u64) void {
+        self.rw.lock();
+        defer self.rw.unlock();
+        var b = FOREGROUND_BUDGET;
+        b.max_nanos = max_nanos;
+        self.state.foreground_budget = b;
+    }
+
     /// The store-level diagnostic (a copy): describes the most recent commit
     /// failure this handle mapped, or nothing. Post-close reads are permitted
     /// — the diag is exactly what a caller wants to inspect after W9 closed
@@ -2496,6 +2531,75 @@ test "wal3 B3: a gain of an eighth is what counts as paying for itself" {
     try testing.expect(!paidForItself(112, 100)); // exactly an eighth is not enough
     try testing.expect(paidForItself(113, 100));
     try testing.expect(paidForItself(1000, 100));
+}
+
+test "wal3 B3: cycle width doubles on a poor gain, holds on modest, halves on handsome" {
+    // Three bands pin the width search without host IO. cost = 100:
+    //   poor      gain <= 12  → double
+    //   modest    13..50      → hold
+    //   handsome  gain > 50   → half
+    try testing.expectEqual(@as(usize, 2), nextCycleWidth(1, 100, 0));
+    try testing.expectEqual(@as(usize, 2), nextCycleWidth(1, 100, 12)); // exactly cost>>3 is still poor
+    try testing.expectEqual(@as(usize, 4), nextCycleWidth(2, 100, 0));
+    try testing.expectEqual(@as(usize, 4), nextCycleWidth(4, 100, 13));
+    try testing.expectEqual(@as(usize, 4), nextCycleWidth(4, 100, 50)); // exactly cost>>1 is still modest
+    try testing.expectEqual(@as(usize, 2), nextCycleWidth(4, 100, 51));
+    try testing.expectEqual(@as(usize, 1), nextCycleWidth(1, 100, 100)); // floor at 1
+    try testing.expectEqual(@as(usize, 1), nextCycleWidth(2, 100, 100));
+    // Cap: a poor cycle at the ceiling stays there; one step below reaches it.
+    try testing.expectEqual(@as(usize, CYCLE_WIDTH_CAP), nextCycleWidth(CYCLE_WIDTH_CAP, 100, 0));
+    try testing.expectEqual(@as(usize, CYCLE_WIDTH_CAP), nextCycleWidth(CYCLE_WIDTH_CAP / 2, 100, 0));
+}
+
+test "wal3 B3: minimum-size segments do not put cleaning on a treadmill" {
+    // A cycle that retires one minimum-size segment pays for one mark, and the
+    // mark costs more than the segment holds: one-at-a-time cleaning grows the
+    // log forever on a log a single wide pass collapses. Pins file-byte
+    // accounting and the three-band width search — not the host's IO speed, so
+    // the soft wall-clock ceiling is cleared and only record/byte limits remain.
+    const build: usize = 20_000;
+    const drive: usize = 600;
+    var sc = try TestScratch.init(testing.allocator, "treadmill");
+    defer sc.deinit();
+    var s = try StoreWAL.openSegmentBytes(testing.allocator, sc.base, MIN_SEGMENT_BYTES);
+    defer s.deinit();
+    s.testSetForegroundCleanNanos(0);
+    try s.setMinLogBytes(0); // no cleaning while building
+    var i: usize = 0;
+    while (i < build) : (i += 1) {
+        _ = try s.preallocate();
+        try s.commit();
+    }
+
+    try s.setMinLogBytes(1);
+    try s.setSpaceAmplification(1);
+    const log_before = try s.logBytes();
+    const target = s.state.cleaningTarget();
+    try testing.expect(log_before > target); // trigger must be live
+
+    const segs_before = blk: {
+        const segs = try s.segmentSeqs(testing.allocator);
+        defer testing.allocator.free(segs);
+        break :blk segs.len;
+    };
+
+    i = 0;
+    while (i < drive) : (i += 1) {
+        _ = try s.preallocate();
+        try s.commit();
+    }
+
+    const cb = s.cleanerBytes();
+    const gained = cb.retired - cb.written;
+    try testing.expect(gained > @divTrunc(cb.written, 8)); // paid for itself
+    const segs_after = blk: {
+        const segs = try s.segmentSeqs(testing.allocator);
+        defer testing.allocator.free(segs);
+        break :blk segs.len;
+    };
+    // Segment count must not climb with the commit count.
+    try testing.expect(segs_after -| segs_before < drive / 4);
+    try testing.expect(!s.cleaningExhausted());
 }
 
 test "wal3 B3 W10: the mark is refused when a record was not re-homed" {
