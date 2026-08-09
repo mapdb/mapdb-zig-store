@@ -2030,6 +2030,30 @@ pub const StoreWAL = struct {
         self.state.foreground_budget = b;
     }
 
+    /// Test only (private): end the current episode as if it had retired
+    /// exactly what it re-emitted, arming the futility latch through the real
+    /// path rather than by field assignment. A genuinely futile episode is not
+    /// reachable from the public API; what this pins is the release rule.
+    /// Matches Java `StoreWAL.testArmFutility`. Takes the store write lock.
+    fn testArmFutility(self: *Self, records_re_emitted: i64) void {
+        self.rw.lock();
+        defer self.rw.unlock();
+        self.state.clean_floor_seq = self.state.segs.active().?.seq;
+        self.state.episode_retired = self.state.cleaner_bytes_retired;
+        self.state.episode_written = self.state.cleaner_bytes_written;
+        self.state.episode_records = records_re_emitted;
+        // Only a whole-range cycle may arm; see endEpisode.
+        self.state.last_cycle_saturated = true;
+        self.state.endEpisode();
+    }
+
+    /// Test only (private): the cleaning trigger's current target.
+    fn testCleaningTarget(self: *Self) u64 {
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
+        return self.state.cleaningTarget();
+    }
+
     /// The store-level diagnostic (a copy): describes the most recent commit
     /// failure this handle mapped, or nothing. Post-close reads are permitted
     /// — the diag is exactly what a caller wants to inspect after W9 closed
@@ -2600,6 +2624,174 @@ test "wal3 B3: minimum-size segments do not put cleaning on a treadmill" {
     // Segment count must not climb with the commit count.
     try testing.expect(segs_after -| segs_before < drive / 4);
     try testing.expect(!s.cleaningExhausted());
+}
+
+test "wal3 B3: a material target drop releases the futility latch" {
+    // Port of Java `a_material_target_drop_releases_the_futility_latch`.
+    // The latch releases on EITHER side of the ratio. Waiting only for the
+    // log to grow wedges the delete direction. Ordinary allocator jitter on
+    // one update must not release.
+    const recs: usize = 20;
+    const size: usize = 60_000;
+    var sc = try TestScratch.init(testing.allocator, "latch_drop");
+    defer sc.deinit();
+    var s = try StoreWAL.openSegmentBytes(testing.allocator, sc.base, 128 << 10);
+    defer s.deinit();
+    try s.setMinLogBytes(0);
+    var r: [recs]u64 = undefined;
+    var i: usize = 0;
+    while (i < recs) : (i += 1) {
+        const payload = try testing.allocator.alloc(u8, size);
+        defer testing.allocator.free(payload);
+        @memset(payload, @as(u8, @truncate(i)));
+        r[i] = try s.put([]const u8, testing.allocator, payload, TestB);
+    }
+    try s.commit();
+    var w: usize = 1;
+    while (w <= 6) : (w += 1) {
+        i = 0;
+        while (i < recs) : (i += 1) {
+            const payload = try testing.allocator.alloc(u8, size);
+            defer testing.allocator.free(payload);
+            @memset(payload, @as(u8, @truncate(i + w)));
+            try s.update([]const u8, testing.allocator, r[i], payload, TestB);
+        }
+        try s.commit();
+    }
+    try s.setMinLogBytes(1);
+    try s.setSpaceAmplification(1);
+    const log = try s.logBytes();
+    const target = s.testCleaningTarget();
+    try testing.expect(log > target); // trigger must be live
+
+    // Large re-emitted count keeps the churn rule out of this test.
+    s.testArmFutility(1_000);
+    try testing.expect(s.cleaningExhausted());
+
+    {
+        const payload = try testing.allocator.alloc(u8, size);
+        defer testing.allocator.free(payload);
+        @memset(payload, 99);
+        try s.update([]const u8, testing.allocator, r[0], payload, TestB);
+    }
+    try s.commit();
+    try testing.expect(s.cleaningExhausted()); // allocator jitter must not release
+
+    const before = try s.logBytes();
+    i = 1;
+    while (i < recs) : (i += 1) {
+        try s.delete(r[i]);
+    }
+    try s.commit(); // log grew; store shrank ~40%
+    try testing.expect(!s.cleaningExhausted()); // target drop releases
+
+    {
+        const payload = try testing.allocator.alloc(u8, size);
+        defer testing.allocator.free(payload);
+        @memset(payload, 100);
+        try s.update([]const u8, testing.allocator, r[0], payload, TestB);
+    }
+    try s.commit();
+    const after = try s.logBytes();
+    try testing.expect(after < before); // cleaning actually ran after release
+}
+
+test "wal3 B3: a state-only churn releases the futility latch" {
+    // Port of Java `a_state_only_churn_releases_the_futility_latch`.
+    // Mass delete of null-content records is not needed here: preallocate
+    // commits move neither log nor target enough for growth/target rules, but
+    // a live-set's worth of state changes invalidates the proof.
+    const recs: i64 = 24;
+    var sc = try TestScratch.init(testing.allocator, "latch_churn");
+    defer sc.deinit();
+    var s = try StoreWAL.openSegmentBytes(testing.allocator, sc.base, 128 << 10);
+    defer s.deinit();
+    try s.setMinLogBytes(0);
+    var r: [24]u64 = undefined;
+    var i: usize = 0;
+    while (i < 24) : (i += 1) {
+        const payload = try testing.allocator.alloc(u8, 60_000);
+        defer testing.allocator.free(payload);
+        @memset(payload, @as(u8, @truncate(i)));
+        r[i] = try s.put([]const u8, testing.allocator, payload, TestB);
+    }
+    try s.commit();
+    var w: usize = 1;
+    while (w <= 4) : (w += 1) {
+        i = 0;
+        while (i < 24) : (i += 1) {
+            const payload = try testing.allocator.alloc(u8, 60_000);
+            defer testing.allocator.free(payload);
+            @memset(payload, @as(u8, @truncate(i + w)));
+            try s.update([]const u8, testing.allocator, r[i], payload, TestB);
+        }
+        try s.commit();
+    }
+    try s.setMinLogBytes(1);
+    try s.setSpaceAmplification(1);
+    try testing.expect((try s.logBytes()) > s.testCleaningTarget());
+
+    s.testArmFutility(recs);
+    try testing.expect(s.cleaningExhausted());
+    const log_at_arming = try s.logBytes();
+    const target_at_arming = s.testCleaningTarget();
+
+    var c: i64 = 0;
+    while (c < recs) : (c += 1) {
+        _ = try s.preallocate();
+        try s.commit();
+    }
+    const log_now = try s.logBytes();
+    const target_now = s.testCleaningTarget();
+    try testing.expect(log_now < log_at_arming + target_at_arming); // not growth
+    try testing.expect(target_now > target_at_arming - (target_at_arming >> 3)); // not target
+    try testing.expect(!s.cleaningExhausted()); // churn released
+}
+
+test "wal3 B3: a commit crossing the trigger pays one slice not the whole pass" {
+    // Port of Java `a_commit_crossing_the_trigger_pays_one_slice_not_the_whole_pass`.
+    var sc = try TestScratch.init(testing.allocator, "one_slice");
+    defer sc.deinit();
+    var s = try StoreWAL.openSegmentBytes(testing.allocator, sc.base, 64 << 10);
+    defer s.deinit();
+    try s.setMinLogBytes(0);
+    {
+        const payload = try testing.allocator.alloc(u8, 60_000);
+        defer testing.allocator.free(payload);
+        @memset(payload, 1);
+        const recid = try s.put([]const u8, testing.allocator, payload, TestB);
+        try s.commit();
+        var i: u8 = 1;
+        while (i <= 60) : (i += 1) {
+            const p2 = try testing.allocator.alloc(u8, 60_000);
+            defer testing.allocator.free(p2);
+            @memset(p2, i);
+            try s.update([]const u8, testing.allocator, recid, p2, TestB);
+            try s.commit();
+        }
+        const segs_before = blk: {
+            const segs = try s.segmentSeqs(testing.allocator);
+            defer testing.allocator.free(segs);
+            break :blk segs.len;
+        };
+        try testing.expect(segs_before >= 8);
+
+        try s.setMinLogBytes(1);
+        try s.setSpaceAmplification(1);
+        {
+            const p3 = try testing.allocator.alloc(u8, 60_000);
+            defer testing.allocator.free(p3);
+            @memset(p3, 255);
+            try s.update([]const u8, testing.allocator, recid, p3, TestB);
+        }
+        try s.commit();
+        const segs_after = blk: {
+            const segs = try s.segmentSeqs(testing.allocator);
+            defer testing.allocator.free(segs);
+            break :blk segs.len;
+        };
+        try testing.expect(segs_before -| segs_after <= 2);
+    }
 }
 
 test "wal3 B3 W10: the mark is refused when a record was not re-homed" {
