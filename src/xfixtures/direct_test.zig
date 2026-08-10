@@ -87,6 +87,34 @@ test "xfixtures direct: StoreDirect cross-port cells (engine=zig)" {
         const after = try std.fs.cwd().readFileAlloc(a, target, 16 * 1024 * 1024);
         defer a.free(after);
         try testing.expectEqualSlices(u8, before, after);
+
+        // ...AND NOTHING NEW IN THE CELL DIRECTORY. Byte-identity of the image
+        // is only half the post-state rule: an opener that wrote a companion
+        // file — a journal, a temp, a checkpoint — passes the first half and
+        // leaves evidence only a directory listing can see. The retired
+        // schema-v1 executor carried this check; `17db512`'s rewrite of the
+        // StoreDirect root as `data-direct/` dropped it, so from C7z until now
+        // this root asserted nothing about a directory it had just opened
+        // (r1 finding 7, "direct residual roots have no nothing-unexplained
+        // test").
+        //
+        // `.lock` is excepted because a lock sidecar is an OPENER's business,
+        // not a store mutation. `.ckpt` is deliberately NOT excepted, exactly
+        // as in the v1 original: a clean close must leave no checkpoint temp
+        // behind. Everything else is an input the manifest named, so the
+        // allowed set is derived from the `file` rows rather than listed.
+        var it = cell_dir.iterate();
+        while (try it.next()) |entry| {
+            if (std.mem.endsWith(u8, entry.name, ".lock")) continue;
+            var an_input = false;
+            for (sample.manifest.files.items) |f| {
+                if (!std.mem.eql(u8, f.fixture, e.fixture)) continue;
+                if (std.mem.eql(u8, f.rel, entry.name)) an_input = true;
+            }
+            if (an_input) continue;
+            std.debug.print("[xfixtures-direct] {s}: unexpected new file `{s}`\n", .{ cell, entry.name });
+            return error.XFixtures;
+        }
     }
 
     try testing.expectEqual(@as(usize, 3), accepts);
