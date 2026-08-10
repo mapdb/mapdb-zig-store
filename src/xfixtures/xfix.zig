@@ -3041,11 +3041,18 @@ pub const Cells = struct {
         // **it can never fire here.** The corpus holds THREE divergent fixtures
         // and therefore SIX divergent (fixture, mode) groups, since each
         // diverges in both `rw` and `ro`: `div-wal3-lsn-exhausted`,
-        // `div-wal3-entry-recid0`, `div-wal3-packlong-overlong`. The preflight
-        // root holds the two groups of the first. All eight are java ACCEPT
-        // against ports REJECT — round 5 re-enumerated them, because round 4's
-        // census said "three groups" and a proof that miscounts its own domain
-        // is a proof to re-check. This guard runs on the accept arm only, so for
+        // `div-wal3-entry-recid0`, `div-wal3-packlong-overlong`. SIX, and not
+        // the "eight" an earlier draft of this comment reached: it added "the
+        // preflight root holds the two groups of the first" as if those were a
+        // seventh and an eighth, but `data-v2-corpus/` **is** the preflight
+        // root — the two `div-wal3-lsn-exhausted` groups it holds are two of
+        // the six already counted, not two more. (The other root, `data-v2/`,
+        // is the static `v2-core` sample and declares no `div-` fixture at
+        // all.) All six are java ACCEPT against ports REJECT — round 5
+        // re-enumerated them, because round 4's census said "three groups",
+        // and this line is the third census of the same domain to be
+        // corrected: a proof that miscounts what it ranges over is a proof to
+        // re-check. This guard runs on the accept arm only, so for
         // every zig accept cell in either root the arm was `false` outright,
         // not masked by an earlier disjunct: deleting it cannot change any
         // result of any run this engine has ever done, the staged one included.
