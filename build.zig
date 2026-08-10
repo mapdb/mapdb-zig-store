@@ -90,18 +90,39 @@ pub fn build(b: *std.Build) void {
     probe_step.dependOn(&b.addInstallArtifact(probe_exe, .{}).step);
 
     // C8x cross-engine lock matrix probe (hold/open CLI). Dedicated target so
-    // the fixture generator is not overloaded; never part of `zig build test`.
+    // the fixture generator is not overloaded; the probe BINARY is never run by
+    // `zig build test` (it wants two processes and a held lock).
+    const lock_probe_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/wal3_lock_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "mapdb_zig_store", .module = mod }},
+    });
     const lock_probe_exe = b.addExecutable(.{
         .name = "wal3-lock-probe",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/store/wal3_lock_probe.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "mapdb_zig_store", .module = mod }},
-        }),
+        .root_module = lock_probe_mod,
     });
     const lock_probe_step = b.step("lock-probe", "Build the C8x WAL lock matrix probe");
     lock_probe_step.dependOn(&b.addInstallArtifact(lock_probe_exe, .{}).step);
+
+    // The probe's OWN unit tests, however, do belong to the gate. Nothing in
+    // `src/root.zig` imports this file, so before this the gate never compiled
+    // it: `ci/check.sh` builds no `lock-probe` step, and an executable no gate
+    // step analyses rots exactly the way an uncalled function does (r1 finding
+    // 6 found both in this repo on the same day). The verdict-line grammar
+    // `lock_matrix.py` prefix-matches is pinned here.
+    //
+    // The filter is FIXED, and not `test-filter`. A test binary rooted at the
+    // probe reaches `store/mod.zig` through its `mapdb_zig_store` import, and
+    // that file `@import`s every `*_test.zig` in the store — so an unfiltered
+    // probe binary RUNS THE WHOLE SUITE A SECOND TIME, measured: two test
+    // processes, both pinned at 100% for minutes. `lock probe:` is the name
+    // prefix of every test in that file, so this runs exactly them.
+    const lock_probe_tests = b.addTest(.{
+        .root_module = lock_probe_mod,
+        .filters = &.{"lock probe:"},
+    });
+    test_step.dependOn(&b.addRunArtifact(lock_probe_tests).step);
 }
 
 /// The `*.gz` basenames in `rel_dir`, sorted, as a zig source file.
