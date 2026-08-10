@@ -557,6 +557,20 @@ pub fn decodeComplete(ctx: *Ctx, raw: []const u8, where: []const u8, out: *Segme
         return ctx.err("{s}: {d} bytes follow the last section", .{ where, out.trailing });
 }
 
+/// The largest legal APPEND delta at section LSN `lsn` — `lsn - 1` — or `null`
+/// when the section LSN is not positive and no delta can be legal.
+///
+/// The section LSN is a wire i64 and a hand-built segment may carry any value
+/// in that range, including zero and negatives. `lsn - 1` is therefore NOT a
+/// `u64` in general, and casting it as one is a panic in every safe build
+/// rather than the refusal a decoder owes a malformed input (r1 finding 3).
+/// Both APPEND sites — the entry decode and the grading mirror — go through
+/// here, so neither can reach an `@intCast` with a value it cannot represent.
+fn maxAppendDelta(lsn: i64) ?u64 {
+    if (lsn <= 0) return null;
+    return @intCast(lsn - 1);
+}
+
 /// Decodes the ordered entry stream of an `'S'` or `'C'` section.
 ///
 /// `'C'` is decoded exactly like `'S'`: the two tags differ in what recovery
@@ -593,7 +607,9 @@ pub fn entries(ctx: *Ctx, s: *const Section, where: []const u8, out: *std.ArrayL
                 // 1 <= delta <= lsn - 1. C9a / O1.
                 const delta = in.unpackLong() catch
                     return ctx.err("{s} section {d}: entry at {d} ends mid-append-delta", .{ where, s.index, at });
-                if (delta < 1 or delta > @as(u64, @intCast(s.lsn - 1)))
+                const max_delta = maxAppendDelta(s.lsn) orelse
+                    return ctx.err("{s} section {d}: an APPEND at {d} under non-positive section LSN {d}", .{ where, s.index, at, s.lsn });
+                if (delta < 1 or delta > max_delta)
                     return ctx.err("{s} section {d}: append delta {d} outside [1, {d}] for section LSN {d}", .{ where, s.index, delta, s.lsn - 1, s.lsn });
                 e.delta = delta;
                 e.base_lsn = s.lsn - @as(i64, @intCast(delta));
@@ -1696,7 +1712,15 @@ pub fn renderBody(ctx: *Ctx, sample: *const SampleV2, out: *Strings) Error!void 
                     const alen = e.append_len.?;
                     if (base_lsn != s.lsn - @as(i64, @intCast(delta)))
                         return ctx.err("{s}: base_lsn {d} != section.lsn {d} - delta {d}", .{ ectx, base_lsn, s.lsn, delta });
-                    if (delta < 1 or delta > @as(u64, @intCast(s.lsn - 1)))
+                    // `entries` above already refused a non-positive section
+                    // LSN, so this arm is dominated and carries no red of its
+                    // own. It is here so the BOUND is computed the same way in
+                    // both places: the alternative is a second unguarded
+                    // `@intCast` that panics the day the two paths stop being
+                    // adjacent. See `maxAppendDelta`.
+                    const max_delta = maxAppendDelta(s.lsn) orelse
+                        return ctx.err("{s}: non-positive section LSN {d}", .{ ectx, s.lsn });
+                    if (delta < 1 or delta > max_delta)
                         return ctx.err("{s}: delta {d} outside [1, {d}]", .{ ectx, delta, s.lsn - 1 });
                     const c = e.content orelse
                         return ctx.err("{s}: APPEND carries no content slice", .{ectx});

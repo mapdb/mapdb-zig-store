@@ -772,6 +772,32 @@ test "wal3 decode: a malformed entry stream is refused, not truncated" {
         defer a.free(raw);
         try xfix.expectRefused(&ctx, "a T_APPEND whose len overruns the section body", decodeEntries, .{ &ctx, raw, "append-over-len" });
     }
+    // A T_APPEND under a NON-POSITIVE section LSN. No writer emits one and the
+    // frozen corpus holds none, so the decoder's `lsn - 1` bound was computed
+    // by an unguarded `@intCast` of a value that can be negative: at LSN 0 the
+    // bound is `@as(u64, @intCast(-1))`, which is a PANIC in every safe build,
+    // not a refusal (r1 finding 3). Lesson (g) again — the field is constant in
+    // every bundle, so only a built input reaches it. Both `lsn = 0` and a
+    // frankly negative LSN are probed: the first is the boundary the writer's
+    // own numbering makes plausible, the second is the arbitrary-i64 case.
+    for ([_]i64{ 0, -7 }) |bad_lsn| {
+        var o = DataOutput2.init(a);
+        defer o.deinit();
+        try o.writeU8(xfix.T_APPEND);
+        try o.packLong(1);
+        try o.packLong(1);
+        try o.packLong(0);
+        const e = try o.copyBytes(a);
+        defer a.free(e);
+        var b = SegBuilder.init(a, 1, 1, 0);
+        defer b.deinit();
+        try b.push(xfix.TAG_SECTION, bad_lsn, e);
+        const raw = try b.bytes();
+        defer a.free(raw);
+        var buf: [96]u8 = undefined;
+        const what = try std.fmt.bufPrint(&buf, "a T_APPEND under section LSN {d}", .{bad_lsn});
+        try xfix.expectRefused(&ctx, what, decodeEntries, .{ &ctx, raw, "append-bad-lsn" });
+    }
 
     // A 'K' body is a mark, not an entry stream, and must not be decoded as one.
     {
