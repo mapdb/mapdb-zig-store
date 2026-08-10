@@ -2664,9 +2664,13 @@ test "wal3 B3: a material target drop releases the futility latch" {
     const target = s.testCleaningTarget();
     try testing.expect(log > target); // trigger must be live
 
-    // Large re-emitted count keeps the churn rule out of this test.
+    // Large re-emitted count keeps the churn rule out of this test: the whole
+    // run commits fewer than 200 state changes, and only those AFTER arming
+    // count towards `futile_records`.
     s.testArmFutility(1_000);
     try testing.expect(s.cleaningExhausted());
+    const log_at_arming = try s.logBytes();
+    const target_at_arming = s.testCleaningTarget();
 
     {
         const payload = try testing.allocator.alloc(u8, size);
@@ -2684,6 +2688,28 @@ test "wal3 B3: a material target drop releases the futility latch" {
     }
     try s.commit(); // log grew; store shrank ~40%
     try testing.expect(!s.cleaningExhausted()); // target drop releases
+
+    // WHICH ARM RELEASED IT. `beginCycleIfDue` releases on `grew or shrank or
+    // churned`, so `!cleaningExhausted()` alone does not say the target drop
+    // did anything: a mass delete also appends to the log, and had that append
+    // crossed the growth threshold the assertion above would hold with the
+    // `shrank` arm deleted outright. The churn sibling isolates its arm this
+    // way and this one did not (r1); these are the same two bounds.
+    //
+    // WHAT IS AND IS NOT MEASURED HERE, stated rather than implied. That the
+    // release really is `shrank` was established by a MUTANT — production's
+    // `shrank` forced false turns this test red — not by these two lines,
+    // which under this workload cannot fail: the release makes cleaning run in
+    // the same commit, so the log is retired back down and `grew` stays out of
+    // reach (three widening workload drifts were tried; none provoked it).
+    // They stay as the machine-checked form of that mutant's answer, so a
+    // future workload change that quietly moves the release onto `grew` — the
+    // exact way this pin could rot back into measuring nothing — is caught by
+    // the suite instead of by the next review.
+    const log_now = try s.logBytes();
+    const target_now = s.testCleaningTarget();
+    try testing.expect(log_now < log_at_arming + target_at_arming); // not `grew`
+    try testing.expect(target_now <= target_at_arming - (target_at_arming >> 3)); // IS `shrank`
 
     {
         const payload = try testing.allocator.alloc(u8, size);
@@ -2825,7 +2851,14 @@ test "wal3 B3: a commit above the hard ceiling participates until under" {
         try s.setSpaceAmplification(1);
         const log_before = try s.logBytes();
         const target = s.testCleaningTarget();
-        const ceiling = target *% 2;
+        // SATURATING, like production's `cleaningUrgent` (`*|`, :673). With
+        // `*%` a target above `maxInt(u64)/2` wraps to a small ceiling, and
+        // both of this test's bounds — `log_before > ceiling` and
+        // `log_after <= ceiling` — would then be asserted against a number
+        // production never uses. The magnitudes here make no difference today;
+        // a test that computes the quantity under test differently from the
+        // code under test is the defect, not the arithmetic.
+        const ceiling = target *| 2;
         const segs_before = blk: {
             const segs = try s.segmentSeqs(testing.allocator);
             defer testing.allocator.free(segs);
