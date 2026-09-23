@@ -38,8 +38,12 @@ const string_group = @import("../ser/string_group.zig");
 const StringGroupFormat = string_group.StringGroupFormat;
 const listenermod = @import("../listener.zig");
 const io_mod = @import("../io.zig");
+const DataInput2 = io_mod.DataInput2;
 const DataOutput2 = io_mod.DataOutput2;
 const StringSer = serializers.StringSer;
+const object_array = @import("../ser/object_array.zig");
+const SearchResult = @import("../ser/mod.zig").SearchResult;
+const Order = std.math.Order;
 
 fn Map(comptime S: type) type {
     return BTreeMap(S, LongFormat, LongFormat);
@@ -2328,4 +2332,153 @@ test "golden: external value record is the String element encoding" {
     const g = try m.get(&@as(i64, 1));
     try expectStrEq("hello", g);
     a.free(g.?);
+}
+
+// Regression guard for the byte-side point get (S1). On a format with
+// supportsBinary(), GetAction.onBytes searches the key group with binarySearch
+// and, on a hit, reads the value with binaryGet. deserializeGroup runs only
+// when that format declares no binary support. A present-key get of an inline
+// value still does not deserialize the node as objects.
+
+const DIRECT_GET_KEYS: i64 = 16;
+/// Large enough that 16 keys stay in the root leaf, so one get is one node.
+const DIRECT_GET_MAX_NODE: usize = 32;
+
+fn CountingFormat(comptime Inner: type) type {
+    return struct {
+        const Self = @This();
+        pub const Elem = Inner.Elem;
+        pub const Group = Inner.Group;
+        pub const Cursor = Inner.Cursor;
+
+        inner: Inner,
+        deserialize_n: *usize,
+        binary_n: *usize,
+
+        pub fn empty(self: Self, alloc: Allocator) DbError!Group {
+            return self.inner.empty(alloc);
+        }
+        pub fn size(self: Self, g: *const Group) usize {
+            return self.inner.size(g);
+        }
+        pub fn compare(self: Self, a: Elem, b: Elem) Order {
+            return self.inner.compare(a, b);
+        }
+        pub fn naturalOrder(self: Self) bool {
+            return self.inner.naturalOrder();
+        }
+        pub fn equalsElem(self: Self, a: Elem, b: Elem) bool {
+            return self.inner.equalsElem(a, b);
+        }
+        pub fn cloneElem(self: Self, alloc: Allocator, v: Elem) DbError!Elem {
+            return self.inner.cloneElem(alloc, v);
+        }
+        pub fn deinitElem(self: Self, alloc: Allocator, v: Elem) void {
+            self.inner.deinitElem(alloc, v);
+        }
+        pub fn get(self: Self, alloc: Allocator, g: *const Group, pos: usize) DbError!Elem {
+            return self.inner.get(alloc, g, pos);
+        }
+        pub fn search(self: Self, g: *const Group, key: Elem) SearchResult {
+            return self.inner.search(g, key);
+        }
+        pub fn insert(self: Self, alloc: Allocator, g: *const Group, pos: usize, v: Elem) DbError!Group {
+            return self.inner.insert(alloc, g, pos, v);
+        }
+        pub fn set(self: Self, alloc: Allocator, g: *const Group, pos: usize, v: Elem) DbError!Group {
+            return self.inner.set(alloc, g, pos, v);
+        }
+        pub fn delete(self: Self, alloc: Allocator, g: *const Group, pos: usize) DbError!Group {
+            return self.inner.delete(alloc, g, pos);
+        }
+        pub fn copyRange(self: Self, alloc: Allocator, g: *const Group, from: usize, to: usize) DbError!Group {
+            return self.inner.copyRange(alloc, g, from, to);
+        }
+        pub fn fromSlice(self: Self, alloc: Allocator, values: []const Elem) DbError!Group {
+            return self.inner.fromSlice(alloc, values);
+        }
+        pub fn cloneGroup(self: Self, alloc: Allocator, g: *const Group) DbError!Group {
+            return self.inner.cloneGroup(alloc, g);
+        }
+        pub fn deinitGroup(self: Self, alloc: Allocator, g: Group) void {
+            self.inner.deinitGroup(alloc, g);
+        }
+        pub fn serializeGroup(self: Self, out: *DataOutput2, g: *const Group) DbError!void {
+            return self.inner.serializeGroup(out, g);
+        }
+        pub fn deserializeGroup(self: Self, alloc: Allocator, input: *DataInput2, count: usize) DbError!Group {
+            self.deserialize_n.* += 1;
+            return self.inner.deserializeGroup(alloc, input, count);
+        }
+        pub fn supportsBinary(self: Self) bool {
+            return self.inner.supportsBinary();
+        }
+        pub fn binarySearch(self: Self, alloc: Allocator, key: Elem, input: *DataInput2, count: usize) DbError!SearchResult {
+            self.binary_n.* += 1;
+            return self.inner.binarySearch(alloc, key, input, count);
+        }
+        pub fn binaryGet(self: Self, alloc: Allocator, input: *DataInput2, count: usize, pos: usize) DbError!Elem {
+            self.binary_n.* += 1;
+            return self.inner.binaryGet(alloc, input, count, pos);
+        }
+        pub fn rangeCursor(self: Self, alloc: Allocator, input: *DataInput2, count: usize, from: usize, to: usize) DbError!Cursor {
+            return self.inner.rangeCursor(alloc, input, count, from, to);
+        }
+    };
+}
+
+fn putDirectGetKeys(comptime MapT: type, map: MapT) !void {
+    var k: i64 = 0;
+    while (k < DIRECT_GET_KEYS) : (k += 1) {
+        try testing.expectEqual(@as(?i64, null), try map.put(k, k + 100));
+    }
+}
+
+fn assertByteSideGet(comptime MapT: type, map: MapT, deserialize_n: *usize, binary_n: *usize) !void {
+    deserialize_n.* = 0;
+    binary_n.* = 0;
+    try testing.expectEqual(@as(?i64, 100), try map.get(&@as(i64, 0)));
+    try testing.expectEqual(@as(?i64, null), try map.get(&@as(i64, -1)));
+    try testing.expectEqual(@as(usize, 0), deserialize_n.*);
+    try testing.expect(binary_n.* > 0);
+}
+
+test "direct get does not deserialize" {
+    const a = testing.allocator;
+    var store = try StoreDirect.init(a, true);
+    defer store.deinit();
+    var deserialize_n: usize = 0;
+    var binary_n: usize = 0;
+    const Fmt = CountingFormat(LongFormat);
+    const keys = Fmt{ .inner = .{}, .deserialize_n = &deserialize_n, .binary_n = &binary_n };
+    const values = Fmt{ .inner = .{}, .deserialize_n = &deserialize_n, .binary_n = &binary_n };
+    const MapT = BTreeMap(StoreDirect, Fmt, Fmt);
+    var map = try MapT.create(a, &store, keys, values, DIRECT_GET_MAX_NODE);
+    defer map.deinit();
+    try putDirectGetKeys(MapT, map);
+    // StoreDirect writes the node on put. No separate commit.
+    try assertByteSideGet(MapT, map, &deserialize_n, &binary_n);
+}
+
+test "object format get does deserialize" {
+    const a = testing.allocator;
+    var store = try StoreDirect.init(a, true);
+    defer store.deinit();
+    var deserialize_n: usize = 0;
+    var binary_n: usize = 0;
+    const KeyFmt = CountingFormat(object_array.ObjectArrayFormat(serializers.LongSer));
+    const keys = KeyFmt{
+        .inner = .{ .element = serializers.LongSer.instance },
+        .deserialize_n = &deserialize_n,
+        .binary_n = &binary_n,
+    };
+    const MapT = BTreeMap(StoreDirect, KeyFmt, LongFormat);
+    var map = try MapT.create(a, &store, keys, .{}, DIRECT_GET_MAX_NODE);
+    defer map.deinit();
+    try putDirectGetKeys(MapT, map);
+    deserialize_n = 0;
+    binary_n = 0;
+    try testing.expectEqual(@as(?i64, 100), try map.get(&@as(i64, 0)));
+    try testing.expectEqual(@as(?i64, null), try map.get(&@as(i64, -1)));
+    try testing.expect(deserialize_n > 0);
 }
