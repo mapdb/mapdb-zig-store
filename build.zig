@@ -123,6 +123,21 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"lock probe:"},
     });
     test_step.dependOn(&b.addRunArtifact(lock_probe_tests).step);
+
+    // S2 measurement: requested growth of the Direct put serialization
+    // buffer. Not a dependency of `zig build test`.
+    const put_buffer_exe = b.addExecutable(.{
+        .name = "put-buffer",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/store/put_buffer_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "mapdb_zig_store", .module = mod }},
+        }),
+    });
+    const run_put_buffer = b.addRunArtifact(put_buffer_exe);
+    const put_buffer_step = b.step("put-buffer", "Measure StoreDirect put serialization buffer growth (not a test)");
+    put_buffer_step.dependOn(&run_put_buffer.step);
 }
 
 /// The `*.gz` basenames in `rel_dir`, sorted, as a zig source file.
