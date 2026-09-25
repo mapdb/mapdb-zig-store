@@ -71,7 +71,7 @@ runs identically over each. They differ in durability and cost:
 | `StoreOnHeap` | live objects, never serialized | no | no | no | fastest in-memory maps; tests |
 | `StoreByteArray` | one `[]u8` per record | no | yes | no | the reference oracle; in-memory with byte semantics |
 | `StoreDirect` | single mmap file (`MDBS.SD1`) | yes (on `commit`) | yes | no | durable maps without transactions |
-| `StoreWAL` | `StoreDirect` (heap volume) + write-ahead log (`MDBS.WAL`) | yes (on `commit`) | yes | yes | durable maps with atomic commit/rollback and crash recovery |
+| `StoreWAL` | `StoreDirect` (heap volume) + segmented WAL v3 (`MDBS.WAL` headers) | yes (on `commit`) | yes | yes | durable maps with atomic commit/rollback and crash recovery |
 
 - **`StoreOnHeap`** keeps records as boxed live objects and dispatches
   `onObject` push-down reads; it requires a **stateless** (zero-sized)
@@ -82,9 +82,11 @@ runs identically over each. They differ in durability and cost:
 - **`StoreDirect`** puts the recid index, free lists, allocator metadata and
   record data all on the volume, in the layout ported from the Rust port.
   `verify()` is a stop-the-world on-disk tiling check.
-- **`StoreWAL`** wraps a heap-volume `StoreDirect`, staging mutations in a WAL
-  file until `commit` fsyncs them; `rollback` discards staged work; a checkpoint
-  compacts the log into a fresh snapshot via atomic rename. Single global writer.
+- **`StoreWAL`** wraps a heap-volume `StoreDirect`, staging mutations before
+  `commit` appends and fdatasyncs a section in a numbered WAL segment; `rollback`
+  discards staged work. `checkpoint()` cleans the segment set by re-emitting
+  committed records, forcing a clean mark, then retiring older segments.
+  Single global writer.
 
 ## How the TCK ties them together
 

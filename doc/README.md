@@ -13,7 +13,7 @@ docs.
 | [architecture.md](architecture.md) | Layer map, per-layer roles, the four store implementations compared, the test model |
 | [ownership-and-errors.md](ownership-and-errors.md) | Who owns which bytes, the clone/deinit contract, the full `DbError` taxonomy, diagnostics, tainted-data discipline |
 | [concurrency.md](concurrency.md) | Locking primitives, the `Shared(T)` pin protocol, guard discipline, per-layer lock hierarchies, reentrancy |
-| [durability.md](durability.md) | Two-phase sync, unclean-reopen refusal, the WAL commit protocol, torn-tail handling, fsync guarantees, and the documented gaps |
+| [durability.md](durability.md) | Direct commit sync and reopen checks, the segmented WAL commit and cleaner protocols, torn-tail handling, sync guarantees, and documented limits |
 
 Repository-level information — support status, scope, requirements, build
 commands, usage example, license — is in the [root README](../README.md).

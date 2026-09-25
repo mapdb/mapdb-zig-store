@@ -38,14 +38,14 @@ Built:
 | `ser` | serializers and all group formats (scalar, delta, prefix, tuple, columnar), UTF-16-order compare |
 | store core | `Store` interface, `StoreOnHeap`, `StoreByteArray`, segment locks, lease table, the `Shared(T)` pin kernel |
 | `StoreDirect` | durable single-file store (`MDBS.SD1`), volume, two-phase sync, `verify`, `compact` |
-| `StoreWAL` | transactional store (`MDBS.WAL`), streaming replay, checkpoint, rollback |
+| `StoreWAL` | transactional segmented WAL v3 store (`MDBS.WAL` segment headers), streaming replay, incremental cleaning, checkpoint, rollback |
 | `BTreeMap` | B-link tree, push-down readers with Lehman-Yao writers, `RangeView`, `TreePump`, columnar scan |
 
 **Not built:** `StoreAppendOnly`, `BufferedPageFormat` + `BufferTreeMap`, the
 htree family, indextree, sortedtable, and the background maintenance/checkpoint
 executor.
 
-**Deliberate v1 limits:** locked reads only (no optimistic or seqlock read
+**Current limits:** locked reads only (no optimistic or seqlock read
 path), synchronous operations only (no async), no C ABI, 64-bit targets only,
 and ReleaseSafe as the shipping profile. `PORTING-GAPS.md` records what this
 port does not carry over from the Rust and Java implementations.

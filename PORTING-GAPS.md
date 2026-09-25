@@ -1,10 +1,9 @@
 # PORTING-GAPS — mapdb5 Java to Zig
 
-Deliberate deviations from the Java `org.mapdb` reference implementation
-(<https://github.com/mapdb/mapdb-java-store>). These are intentional v1 choices,
-not defects: each preserves correctness and, for persisted formats, Java
-byte-compatibility. Read this before depending on a behaviour that matters to
-you — it is the honest limits list for this port.
+Deliberate deviations from the Java `org.mapdb` behavioural reference
+(<https://github.com/mapdb/mapdb-java-store>). Read this before depending on
+a behaviour that matters to you. Value-codec compatibility claims below are
+narrow; they do not promise whole-store file compatibility.
 
 ## Both ports (serializer scope)
 - **Skipped serializers:** `STRING_INTERN` (JVM string intern pool), `CLASS`, and
@@ -124,9 +123,9 @@ strings, the queue node records, the serializer families. Those statements are
 narrow and they are tested: each is pinned by golden vectors taken from the
 encoding it was ported from.
 
-They are **not** a statement that a store file interoperates. A store file is
-those codecs plus a header, an allocator layout, a WAL framing and a recovery
-protocol, and those have diverged — the Java engine is on segmented WAL format
-v3 while this lineage is on v1. A per-codec fidelity claim says the bytes of one
-value match; it says nothing about whether another engine can open the file
-those bytes live in. It cannot.
+They are **not** a statement that arbitrary store files interoperate. A store
+file includes a header, allocator layout, WAL framing, and recovery protocol.
+Java, Rust, and Zig now implement segmented WAL v3, and a sealed cross-engine
+fixture corpus exercises specified cases. That agreement is implementation
+evidence, not a frozen format or a guarantee that another engine can open any
+file written here. The v3 opener refuses legacy v1 single-file WAL artifacts.

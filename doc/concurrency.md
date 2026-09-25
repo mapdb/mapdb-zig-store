@@ -1,7 +1,7 @@
 # Concurrency
 
 The concurrency contract follows the Rust port, not Java's
-optimistic mode: **locked reads are the v1 baseline** (no seqlock/optimistic
+optimistic mode: **locked reads are the current baseline** (no seqlock/optimistic
 path). Since Zig has no `Drop`, the recurring hazard is a lock/lease/refcount
 released on one path but leaked on an error path — so every acquire pairs with a
 same-scope `defer`/`errdefer`, and guards are non-copyable-by-discipline
@@ -83,12 +83,11 @@ runs stop-the-world; `getAllRecids` takes each recid's read lock. `index_pages`
 is published via `Shared([]u64)`.
 
 **`StoreWAL`** — a single global `RwLock` over the whole `WalState` (inner
-StoreDirect on a heap volume, WAL file, staged map, LSN counters). **One global
+StoreDirect on a heap volume, WAL segment set, staged map, LSN counters). **One global
 writer**: `commit`/`rollback` are transaction boundaries that never race
 in-flight mutations. Reads take the atomic `closed` fast-path, then `lockShared`
-and re-gate on `closed`. Every mutation additionally gates on `poisoned` (a
-poisoned store fails `DataCorruption`); `close` is exempt so it can retry the
-directory fsync and is poison-aware idempotent. `rollback` bumps
+and re-gate on `closed`. A failed section write or post-force apply fails the
+handle closed; `close` is idempotent. `rollback` bumps
 `structuralGeneration` so open collections know their structural caches may have
 reverted.
 
