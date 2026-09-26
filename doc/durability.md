@@ -72,6 +72,11 @@ merge staged-over-inner. There is one global writer.
 4. Run a budgeted inline cleaner step when the log crosses its configured
    trigger; above the hard ceiling, cleaning may take longer in `commit()`.
 
+An error from `commit()` can occur after step 2, including during inline
+cleaning. In that case the transaction may already be durable; the handle
+closes and further mutations return `StoreClosed`. Reopen and inspect the
+record before deciding whether to retry the application operation.
+
 **`rollback()`** discards the staged operations (nothing was applied yet) and
 bumps `structuralGeneration`, so an open `BTreeMap` knows to rebuild its
 left-edge spine cache before the next structural op.

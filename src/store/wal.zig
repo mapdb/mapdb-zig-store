@@ -135,6 +135,10 @@ pub const W_COMMIT_WRITE: []const u8 =
 /// diverged, the store is closed, reopen replays the committed section.
 pub const W_COMMIT_APPLY: []const u8 =
     "wal commit: apply failed after the durability point; store closed, reopen to recover the committed section";
+/// Inline cleaning failed after this commit's section was forced and applied.
+/// The error retains its original identity; reopening reveals the durable result.
+pub const W_COMMIT_CLEAN: []const u8 =
+    "wal commit: inline cleaner failed after the transaction became durable; store closed, reopen to inspect the result";
 /// The inner store refused a committed append during apply — a writer bug
 /// surfacing after the durability point, never an operational condition.
 pub const W_COMMIT_APPEND_REFUSED: []const u8 =
@@ -561,7 +565,13 @@ const WalState = struct {
             return e;
         };
         self.clearStaged();
-        try self.autoCleanLocked(closed);
+        self.autoCleanLocked(closed) catch |e| {
+            if (self.diag.reason.len == 0) self.diag.note(W_COMMIT_CLEAN, 0, 0, 0, 0);
+            // The transaction is already durable and applied. The caller must
+            // reopen to learn its result; this handle may not accept a retry.
+            if (!closed.load(.acquire)) self.failClosed(closed);
+            return e;
+        };
     }
 
     /// Applies one committed section's ops and moves the identities by the SAME
@@ -2243,6 +2253,8 @@ pub const StoreWAL = struct {
         s.base_set = false;
     }
 
+    /// An error after the WAL force can still leave the transaction durable.
+    /// The handle closes in that case; reopen and inspect before retrying.
     pub fn commit(self: *Self) DbError!void {
         mod.assertNotInAction("commit");
         // writeGate re-checks `closed` under the lock: otherwise a commit of a

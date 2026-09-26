@@ -1348,6 +1348,71 @@ test "wal3: allocator failure at EVERY index of a commit is OutOfMemory and all-
     try testing.expect(durable_errors > 0);
 }
 
+fn stageAutoCleanOomCommit(fa: *FailingAllocator, sc: *const Scratch, big: []const u8) !struct { store: StoreWAL, recid: u64 } {
+    const alloc = fa.allocator();
+    var s = try StoreWAL.openCfg(alloc, sc.base, .{ .segment_bytes = TINY });
+    errdefer s.deinit();
+    try s.setMinLogBytes(0); // build a large superseded section before cleaning
+    const recid = try s.put([]const u8, alloc, big, R);
+    try s.commit();
+    try s.setMinLogBytes(1);
+    try s.setSpaceAmplification(1);
+    try s.update([]const u8, alloc, recid, "new", R);
+    return .{ .store = s, .recid = recid };
+}
+
+test "wal3: auto-clean allocation failure after a durable commit closes the handle" {
+    const a = testing.allocator;
+    const big = try bytes(a, 73, 3 << 20);
+    defer a.free(big);
+    var commit_allocs: usize = 0;
+    {
+        var sc = try Scratch.init(a, "auto-oom-count");
+        defer sc.deinit();
+        var fa = FailingAllocator{ .inner = a, .fail_at = null };
+        var setup = try stageAutoCleanOomCommit(&fa, &sc, big);
+        defer setup.store.deinit();
+        const before = fa.calls;
+        try setup.store.commit();
+        commit_allocs = fa.calls - before;
+        try testing.expect(commit_allocs > 4);
+    }
+    var after_durable_failures: usize = 0;
+    var cleaner_failures: usize = 0;
+    for (0..commit_allocs) |k| {
+        var sc = try Scratch.init(a, "auto-oom-sweep");
+        defer sc.deinit();
+        var fa = FailingAllocator{ .inner = a, .fail_at = null };
+        var setup = try stageAutoCleanOomCommit(&fa, &sc, big);
+        var deinited = false;
+        defer if (!deinited) setup.store.deinit();
+        const before_lsn = setup.store.nextLsn();
+        fa.fail_at = fa.calls + k;
+        try testing.expectError(error.OutOfMemory, setup.store.commit());
+        fa.fail_at = null;
+        if (setup.store.nextLsn() > before_lsn) {
+            after_durable_failures += 1;
+            if (setup.store.lastDiag().reason.ptr == wal.W_COMMIT_CLEAN.ptr) cleaner_failures += 1;
+            try testing.expect(setup.store.isClosed());
+            try testing.expectError(error.StoreClosed, setup.store.commit());
+            try testing.expectError(error.StoreClosed, setup.store.update([]const u8, a, setup.recid, "retry", R));
+            try setup.store.close(); // idempotent after failClosed
+            setup.store.deinit();
+            deinited = true;
+            var reopened = try StoreWAL.open(a, sc.base, true);
+            defer reopened.deinit();
+            const got = (try getRaw(&reopened, a, setup.recid)).?;
+            defer a.free(@constCast(got));
+            try testing.expectEqualStrings("new", got);
+        } else {
+            setup.store.deinit();
+            deinited = true;
+        }
+    }
+    try testing.expect(after_durable_failures > 0);
+    try testing.expect(cleaner_failures > 0);
+}
+
 /// The oracle rounds' canonical LSN-edge image: a LONE retained segment at
 /// seq 2 whose only section is a valid `'K'` at `lsn`, its header and the
 /// mark's logStart both stating `lsn` (a cleaned log whose live range starts
