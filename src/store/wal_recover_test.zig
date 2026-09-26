@@ -104,6 +104,18 @@ const Scratch = struct {
         return (try f.stat()).size;
     }
 
+    fn expectSegmentBytes(self: *const Scratch, seq: i64, want: []const u8) !void {
+        const p = try self.segPath(seq);
+        defer self.alloc.free(p);
+        const f = try std.fs.cwd().openFile(p, .{});
+        defer f.close();
+        try testing.expectEqual(@as(u64, want.len), (try f.stat()).size);
+        const got = try self.alloc.alloc(u8, want.len);
+        defer self.alloc.free(got);
+        try testing.expectEqual(want.len, try f.readAll(got));
+        try testing.expectEqualSlices(u8, want, got);
+    }
+
     /// The sequence numbers present in the directory, ascending. Owned.
     fn onDisk(self: *const Scratch) ![]i64 {
         var d = try std.fs.cwd().openDir(self.dir, .{ .iterate = true });
@@ -627,6 +639,68 @@ test "wal3 B1: a damaged header followed by the exact next section is corruption
     img.damage(img.off(1));
     try img.write(&sc);
     try expectRefusal(a, &sc, wr.H_MIDLOG_HDR);
+}
+
+test "wal3 B1: a damaged length cannot hide a later commit" {
+    const a = testing.allocator;
+    for ([_]bool{ false, true }) |read_only| {
+        var sc = try Scratch.init(a, "s3-damaged-length");
+        defer sc.deinit();
+        var img = try SegImage.init(a, 1, 1);
+        defer img.deinit();
+        try img.commitRec(1, 10, "a");
+        try img.commitRec(2, 11, "b");
+        img.bytes.items[@as(usize, SEG_HDR) + 16] ^= 1;
+        try img.write(&sc);
+        var diag: Diag = .{};
+        const result = tryRecover(a, &sc, read_only, BUF, &diag);
+        if (result) |ok| {
+            var r = ok;
+            r.deinit();
+            return error.TestExpectedCorruption;
+        } else |e| try testing.expectEqual(DbError.DataCorruption, e);
+        try testing.expectEqualStrings(wr.H_MIDLOG_HDR, diag.reason);
+        try sc.expectSegmentBytes(1, img.bytes.items);
+    }
+}
+
+test "wal3 B1: damaged length finds a successor across a scan window" {
+    const a = testing.allocator;
+    var sc = try Scratch.init(a, "s3-window-edge");
+    defer sc.deinit();
+    var img = try SegImage.init(a, 1, 1);
+    defer img.deinit();
+    const target = SEG_HDR + 1 + 64 * 1024 - 12;
+    const padding = try a.alloc(u8, target - SEG_HDR - SEC_HDR);
+    defer a.free(padding);
+    @memset(padding, 7);
+    try img.section(TAG_SECTION, 1, padding);
+    try testing.expectEqual(target, img.len());
+    try img.commitRec(2, 11, "b");
+    img.bytes.items[@as(usize, SEG_HDR) + 16] ^= 1;
+    try img.write(&sc);
+    try expectRefusal(a, &sc, wr.H_MIDLOG_HDR);
+    try sc.expectSegmentBytes(1, img.bytes.items);
+}
+
+test "wal3 B1: overlapping candidates exhaust the body check budget" {
+    const a = testing.allocator;
+    var sc = try Scratch.init(a, "s3-budget");
+    defer sc.deinit();
+    var img = try SegImage.init(a, 1, 1);
+    defer img.deinit();
+    const padding = try a.alloc(u8, 130_000);
+    defer a.free(padding);
+    @memset(padding, 7);
+    try img.section(TAG_SECTION, 1, padding);
+    for ([_]u64{ 128, 256 }) |at| {
+        const candidate = wr.sealSecHdr(&img.header, at, TAG_SECTION, 2, 100_000, 0);
+        @memcpy(img.bytes.items[@intCast(at)..][0..SECH], &candidate);
+    }
+    img.bytes.items[@as(usize, SEG_HDR) + 16] ^= 1;
+    try img.write(&sc);
+    try expectRefusal(a, &sc, wr.H_MIDLOG_HDR);
+    try sc.expectSegmentBytes(1, img.bytes.items);
 }
 
 test "wal3 B1: a damaged header with nothing after it is a torn tail" {

@@ -706,22 +706,14 @@ fn scanSegment(
         const body_start = pos + SEC_HDR;
 
         if (hdrCrc(seg, pos, &hdr) != h.hdr_crc or !validTag(h.tag)) {
-            // S3. The declared bodyLen is UNTRUSTED — it lives in the bytes that
-            // just failed their own checksum — so proving corruption needs a
-            // section at exactly the declared end carrying exactly the LSN the
-            // damaged one would have been followed by.
+            // S3. Every byte of this header, including bodyLen, is untrusted.
+            // Search independently from the next byte for the exact successor.
             if (!is_active) {
                 hold(seg, H_HDR_DAMAGED, pos);
                 return seg_through;
             }
-            if (h.body_len >= 0 and @as(u64, @intCast(h.body_len)) <= len - body_start) {
-                // The untrusted anchor: the walk STARTS at the damaged header's
-                // declared end and may advance through several framed candidates
-                // before finding `lookLastLsn + 2`.
-                if (try anyValidSectionFrom(seg, body_start + @as(u64, @intCast(h.body_len)), len, look_last, true, replay_buf, alloc)) {
-                    hold(seg, H_MIDLOG_HDR, pos);
-                }
-            }
+            if (try laterSectionOrScanLimit(seg, pos + 1, len, look_last, replay_buf, alloc))
+                hold(seg, H_MIDLOG_HDR, pos);
             // TORN TAIL: stop immediately; `valid_end` is already the end of the
             // last accepted section (SEG_HDR when none was accepted).
             return seg_through;
@@ -745,7 +737,7 @@ fn scanSegment(
                 hold(seg, H_BODY_CRC, pos);
                 return seg_through;
             }
-            if (try anyValidSectionFrom(seg, body_end, len, look_last, false, replay_buf, alloc)) {
+            if (try anyValidSectionFrom(seg, body_end, len, look_last, replay_buf, alloc)) {
                 hold(seg, H_MIDLOG_BODY, pos);
             }
             return seg_through;
@@ -855,12 +847,9 @@ fn readMark(
 /// deliberately NOT checked here — a port that calls its complete section
 /// validator classifies torn tails differently from the reference.
 ///
-/// With `exact_next` (untrusted anchor: the damaged section's own bodyLen) the
-/// candidate must carry EXACTLY `last_lsn + 2`, the damaged section having been
-/// `last_lsn + 1`; otherwise (trusted anchor) any strictly future LSN counts. Both
-/// reject "embedded fake" patterns from user data holding copies of earlier
-/// sections: stale copies carry old LSNs, and under the CRC domain a copied
-/// section fails its checksums at any other offset anyway.
+/// This walk starts at a trusted boundary after a body CRC mismatch, so any
+/// strictly future LSN counts. The damaged-header path uses the independent
+/// bytewise search below.
 ///
 /// Never crosses a segment boundary — `limit` is this segment's length.
 fn anyValidSectionFrom(
@@ -868,7 +857,6 @@ fn anyValidSectionFrom(
     from: u64,
     limit: u64,
     last_lsn: i64,
-    exact_next: bool,
     replay_buf: usize,
     alloc: Allocator,
 ) DbError!bool {
@@ -885,15 +873,9 @@ fn anyValidSectionFrom(
             return false;
         }
         const body_end = body_start + @as(u64, @intCast(h.body_len));
-        // WRAPPING, not checked and not saturating: `last_lsn` is a number read off
-        // a disk that may hold anything, Java's long arithmetic wraps, and a
-        // safe-build panic here downs the process where the reference merely
-        // answers "no proof follows". A candidate LSN that matches the wrapped
-        // value is a legitimate (if unreachable) answer; a panic is not.
-        const lsn_ok = if (exact_next)
-            h.lsn == last_lsn +% 2
-        else
-            h.lsn > last_lsn +% 1;
+        // Wrapping matches the on-disk Java LSN arithmetic even for a crafted
+        // last_lsn at the edge of the signed range.
+        const lsn_ok = h.lsn > last_lsn +% 1;
         if (lsn_ok) {
             const c = (try bodyCrc(seg, pos, body_start, body_end, replay_buf, alloc)) orelse
                 return false;
@@ -901,6 +883,46 @@ fn anyValidSectionFrom(
         }
         // Wrong lsn, or right lsn with a bad body CRC: advance the frame.
         pos = body_end;
+    }
+    return false;
+}
+
+/// S3's search after an untrusted section header. Each fixed window overlaps
+/// the next by SEC_HDR-1 bytes, so a header crossing the edge is checked at its
+/// actual offset. Candidate bodies may overlap arbitrarily; cap aggregate CRC
+/// work at the length of the searched remainder and refuse on exhaustion.
+fn laterSectionOrScanLimit(
+    seg: *const Segment,
+    from: u64,
+    limit: u64,
+    last_lsn: i64,
+    replay_buf: usize,
+    alloc: Allocator,
+) DbError!bool {
+    const window_size = 64 * 1024;
+    var window: [window_size]u8 = undefined;
+    var budget = limit - from;
+    var pos = from;
+    while (pos <= limit and limit - pos >= SEC_HDR) {
+        const count: usize = @intCast(@min(limit - pos, window_size));
+        if (!try readAtOpt(handle(seg), window[0..count], pos)) return false;
+        const candidates = count - @as(usize, SEC_HDR) + 1;
+        for (0..candidates) |i| {
+            const hdr: *const [@as(usize, SEC_HDR)]u8 = window[i..][0..@as(usize, SEC_HDR)];
+            const h = parseSecHdr(hdr);
+            if (!validTag(h.tag) or h.lsn != last_lsn +% 2) continue;
+            const section_pos = pos + i;
+            const body_start = section_pos + SEC_HDR;
+            if (h.body_len < 0 or @as(u64, @intCast(h.body_len)) > limit - body_start) continue;
+            if (hdrCrc(seg, section_pos, hdr) != h.hdr_crc) continue;
+            const body_len: u64 = @intCast(h.body_len);
+            if (body_len > budget) return true;
+            budget -= body_len;
+            const got = (try bodyCrc(seg, section_pos, body_start, body_start + body_len, replay_buf, alloc)) orelse
+                return false;
+            if (got == h.body_crc) return true;
+        }
+        pos += candidates;
     }
     return false;
 }

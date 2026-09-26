@@ -682,10 +682,9 @@ pub const WalSegmentSet = struct {
     /// alias a segment a later create reuses.
     ///
     /// The asymmetry in table H is the whole point: a torn create produces an
-    /// invalid `headerCrc` with overwhelming probability, so an invalid header on
-    /// the **highest** name is an ordinary crash artifact, while the same bytes
-    /// anywhere else are corruption — something above it exists, so its creation
-    /// completed once.
+    /// invalid `headerCrc` with overwhelming probability. Only a highest-name
+    /// file no longer than the header can be a create-crash residue; a longer
+    /// file may contain committed sections and must be preserved on refusal.
     fn classify(self: *Self, found: []const i64) DbError!void {
         var max_observed: i64 = 0;
         for (found) |s| max_observed = @max(max_observed, s);
@@ -735,8 +734,8 @@ pub const WalSegmentSet = struct {
                     return error.DataCorruption;
                 },
                 .torn => {
-                    if (highest != null and highest.? == seq) {
-                        // H1-H4 on the highest name: the create crashed. A
+                    if (highest != null and highest.? == seq and len <= SEG_HDR) {
+                        // H1-H4 on a header-sized highest name: the create crashed. A
                         // read-only open excludes it from the set but keeps the
                         // file — the next writable open removes it.
                         residue.append(self.alloc, seq) catch return error.OutOfMemory;

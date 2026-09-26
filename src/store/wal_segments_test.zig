@@ -528,6 +528,56 @@ test "wal3 B0: torn-create residue on the highest name is removed" {
     }
 }
 
+test "wal3 B0: a nonempty highest segment with a damaged header is preserved" {
+    const a = testing.allocator;
+    for ([_]bool{ false, true }) |read_only| {
+        var sc = try Scratch.init(a, "long-damaged-header");
+        defer sc.deinit();
+        const hdr = buildHeader(1, 1);
+        var bytes: [@as(usize, SEG_HDR) + 1]u8 = undefined;
+        @memcpy(bytes[0..@as(usize, SEG_HDR)], &hdr);
+        bytes[0] ^= 1;
+        bytes[@as(usize, SEG_HDR)] = 42;
+        try sc.writeSegment(1, &bytes);
+        const opened = sc.open(read_only);
+        if (opened) |ok| {
+            var set = ok;
+            set.deinit();
+            return error.TestExpectedCorruption;
+        } else |e| try testing.expectEqual(error.DataCorruption, e);
+        try testing.expect(try sc.segExists(1));
+        const path = try sc.segPath(1);
+        defer a.free(path);
+        const f = try std.fs.cwd().openFile(path, .{});
+        defer f.close();
+        var actual: [bytes.len]u8 = undefined;
+        try testing.expectEqual(bytes.len, try f.readAll(&actual));
+        try testing.expectEqualSlices(u8, &bytes, &actual);
+    }
+}
+
+test "wal3 B0: a long highest segment with CRC-valid wrong magic is preserved" {
+    const a = testing.allocator;
+    for ([_]bool{ false, true }) |read_only| {
+        var sc = try Scratch.init(a, "long-wrong-magic");
+        defer sc.deinit();
+        var bytes: [@as(usize, SEG_HDR) + 1]u8 = undefined;
+        const hdr = buildHeader(1, 1);
+        @memcpy(bytes[0..@as(usize, SEG_HDR)], &hdr);
+        bytes[0] ^= 1;
+        reseal(bytes[0..@as(usize, SEG_HDR)]);
+        bytes[@as(usize, SEG_HDR)] = 42;
+        try sc.writeSegment(1, &bytes);
+        const opened = sc.open(read_only);
+        if (opened) |ok| {
+            var set = ok;
+            set.deinit();
+            return error.TestExpectedCorruption;
+        } else |e| try testing.expectEqual(error.DataCorruption, e);
+        try testing.expect(try sc.segExists(1));
+    }
+}
+
 // The same shapes anywhere below the highest name are corruption: a segment
 // exists above them, so their create completed once. Every shape is tried,
 // because the highest-only forgiveness is a property of the POSITION, and an
