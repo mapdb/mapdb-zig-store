@@ -60,7 +60,7 @@ narrow; they do not promise whole-store file compatibility.
   a live **map/set** handle is via `clone()` (refcounted); a **queue** has no
   `clone` — the DB returns a stable heap pointer callers share directly. Handle-count
   close/deinit contract: makers `incHandle`; the caller tears down via
-  `closeMap`/`closeSet`/`closeAtomic`/`closeQueue` (`close*` refuse with
+  `closeMap`/`closeSet`/`closeAtomic(&handle)`/`closeQueue` (`close*` refuse with
   `error.HandlesOpen` unless the handle is the last BTree ref); `Db.close()` fails
   `HandlesOpen` while any handle is open; `Db.deinit()` asserts
   `state==closed && open_handles==0`. **Raw-handle lifetime contract:** the last-ref
@@ -68,7 +68,13 @@ narrow; they do not promise whole-store file compatibility.
   by-value copy-sharing) a single handle on a thread that may be concurrently doing
   its FINAL close is caller-UB (the clone can CAS through a just-freed `Inner`) —
   give each thread its own `clone`; same class as issuing a new queue op concurrent
-  with `closeQueue`.
+  with `closeQueue`. **Atomic handles** are plain values (store pointer +
+  recid); `closeAtomic(&handle)` flips a `closed` flag in that value so later
+  `get`/`set`/`compareAndSet` return `error.StoreClosed` instead of touching a
+  recid that `delete(name)` freed and the store may have reused for the next
+  collection (astra25 Z4). A by-value copy made before the close keeps the old
+  flag and is the same caller-UB class as copy-sharing a map handle across its
+  final close: close the handle you were given and keep no copies.
 - **`maxNodeSize` domain** is `[4, maxInt(i32)]` (Java's positive `int` domain) at
   both create (→`WrongConfiguration`) and reopen/validate (→`DataCorruption`).
   Matches Java exactly — no artificial cap (the Rust port caps at `1<<20`).

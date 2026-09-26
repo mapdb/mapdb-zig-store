@@ -550,8 +550,16 @@ pub fn Db(comptime S: type) type {
             if (!set.closeIfLast()) return error.HandlesOpen;
             self.decHandle();
         }
-        /// Release an atomic handle (atomics own no resources).
-        pub fn closeAtomic(self: *Self) void {
+        /// Release an atomic handle (atomics own no resources) and invalidate it:
+        /// `handle` is a pointer to the value returned by the maker; after this
+        /// call its `get`/`set`/`compareAndSet` return `error.StoreClosed`. Without
+        /// the invalidation a handle kept past `closeAtomic` + `delete(name)` still
+        /// wrote the freed recid after the store reused it for the next
+        /// collection (astra25 Z4). By-value copies taken before the close are
+        /// NOT invalidated (same class as the raw-handle contract in
+        /// PORTING-GAPS): close the handle you were given and keep no copies.
+        pub fn closeAtomic(self: *Self, handle: anytype) void {
+            handle.closeHandle();
             self.decHandle();
         }
         /// Wake+join blocked waiters, free the heap-boxed queue, release its handle.
@@ -1396,10 +1404,9 @@ test "close fails HandlesOpen while a handle is live" {
     var db = try memoryByteArrayDb(a);
     defer db.deinit();
     defer db.close() catch {};
-    const al = try db.atomicLong("n").create();
+    var al = try db.atomicLong("n").create();
     try testing.expectError(error.HandlesOpen, db.close());
-    db.closeAtomic();
-    _ = al;
+    db.closeAtomic(&al);
     try db.close();
 }
 
@@ -1408,9 +1415,8 @@ test "wrong type / mismatched descriptor rejected on open" {
     var db = try memoryByteArrayDb(a);
     defer db.deinit();
     defer db.close() catch {};
-    const al = try db.atomicLong("x").create();
-    db.closeAtomic();
-    _ = al;
+    var al = try db.atomicLong("x").create();
+    db.closeAtomic(&al);
     // opening "x" as an integer → WrongType
     try testing.expectError(error.WrongType, db.atomicInteger("x").open());
     // treeMap with the wrong key descriptor → WrongType (name exists as AtomicLong)
@@ -1454,8 +1460,7 @@ test "atomicVar over a serializer value round-trips + getAndSet" {
     try testing.expectEqual(@as(?i64, 7), try av.get());
     try testing.expectEqual(@as(?i64, 7), try av.getAndSet(@as(?i64, 9)));
     try testing.expectEqual(@as(?i64, 9), try av.get());
-    db.closeAtomic();
-    _ = &av;
+    db.closeAtomic(&av);
 }
 
 test "queue create/open + mode-mismatch rejected" {
@@ -1584,13 +1589,11 @@ test "atomicString / atomicBoolean / circularQueue (smoke)" {
         defer if (v) |x| a.free(x);
         try testing.expectEqualStrings("hi", v.?);
     }
-    db.closeAtomic();
-    _ = &as_;
+    db.closeAtomic(&as_);
     var ab = try db.atomicBoolean("b").create();
     try ab.set(true);
     try testing.expect(try ab.get());
-    db.closeAtomic();
-    _ = &ab;
+    db.closeAtomic(&ab);
     const cq = try db.circularQueue("c", StringSer.instance, 2).create();
     try cq.add("a");
     try cq.add("b");
@@ -1717,4 +1720,69 @@ test "tempFileDb creates + cleans up its file" {
     try m.putOnly(1, 2);
     try db.closeMap(m);
     try db.close(); // deletes the temp file
+}
+
+test "closeAtomic invalidates the handle: stale writes after delete cannot reach a reused recid (astra25 Z4)" {
+    const a = testing.allocator;
+    var db = try memoryByteArrayDb(a);
+    defer db.deinit();
+    defer db.close() catch {};
+    var al = try db.atomicLong("n").create();
+    try al.set(7);
+    db.closeAtomic(&al);
+    try testing.expect(try db.delete("n"));
+    var m = try db.treeMap("m", LongFormat.instance, StringGroupFormat.instance).create();
+    try m.putOnly(1, "one-hundred");
+    // Before the fix this set succeeded, wrote the atomic's freed recid (reused
+    // by the new map), and the next map read reported DataCorruption.
+    try testing.expectError(error.StoreClosed, al.set(123456));
+    try testing.expectError(error.StoreClosed, al.get());
+    try testing.expectError(error.StoreClosed, al.compareAndSet(7, 1));
+    try testing.expectError(error.StoreClosed, al.incrementAndGet());
+    const v = try m.get(&@as(i64, 1));
+    defer if (v) |x| a.free(x);
+    try testing.expectEqualStrings("one-hundred", v.?);
+    try db.closeMap(m);
+    // A fresh handle under the deleted name is a new, live atomic.
+    var al2 = try db.atomicLong("n").create();
+    try testing.expectEqual(@as(i64, 0), try al2.get());
+    try testing.expectError(error.StoreClosed, al.get());
+    db.closeAtomic(&al2);
+}
+
+test "closeAtomic invalidates every atomic kind; live handles are unaffected" {
+    const a = testing.allocator;
+    var db = try memoryByteArrayDb(a);
+    defer db.deinit();
+    defer db.close() catch {};
+    var ai = try db.atomicInteger("i").create();
+    var ab = try db.atomicBoolean("b").create();
+    var as_ = try db.atomicString("s").create();
+    var av = try db.atomicVar("v", serializers.LongSer.instance, @as(?i64, 7)).create();
+    var live = try db.atomicLong("live").create();
+    try live.set(1);
+
+    db.closeAtomic(&ai);
+    try testing.expectError(error.StoreClosed, ai.get());
+    try testing.expectError(error.StoreClosed, ai.set(1));
+    try testing.expectError(error.StoreClosed, ai.compareAndSet(0, 1));
+    try testing.expectError(error.StoreClosed, ai.getAndIncrement());
+    db.closeAtomic(&ab);
+    try testing.expectError(error.StoreClosed, ab.get());
+    try testing.expectError(error.StoreClosed, ab.set(true));
+    try testing.expectError(error.StoreClosed, ab.getAndSet(true));
+    db.closeAtomic(&as_);
+    try testing.expectError(error.StoreClosed, as_.get());
+    try testing.expectError(error.StoreClosed, as_.set("x"));
+    try testing.expectError(error.StoreClosed, as_.compareAndSet(null, "x"));
+    db.closeAtomic(&av);
+    try testing.expectError(error.StoreClosed, av.get());
+    try testing.expectError(error.StoreClosed, av.set(@as(?i64, 1)));
+    try testing.expectError(error.StoreClosed, av.getAndSet(@as(?i64, 1)));
+
+    // The untouched handle still works, and the DB still counts it as open.
+    try testing.expectEqual(@as(i64, 2), try live.incrementAndGet());
+    try testing.expectError(error.HandlesOpen, db.close());
+    db.closeAtomic(&live);
+    try db.close();
 }

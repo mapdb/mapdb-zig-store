@@ -6,6 +6,15 @@
 //! allocator), so a second facade open of the same name is rejected by the DB's
 //! lease/handle model, not by an instance cache (Zig no-cache deviation).
 //!
+//! **Handle lifetime.** `Db.closeAtomic(&handle)` marks the handle closed as it
+//! releases its DB handle count; every later `get`/`set`/`compareAndSet` (and the
+//! helpers built on them) returns `error.StoreClosed`. Without that, a handle kept
+//! past `closeAtomic` + `Db.delete(name)` still carried a recid the store reuses
+//! for the next collection and silently overwrote that collection's record
+//! (astra25 24 Z4). The flag lives in the handle VALUE: a by-value copy taken
+//! before the close is not invalidated, so treat copies like the map-clone
+//! contract in PORTING-GAPS (close the one you were given, do not keep copies).
+//!
 //! `AtomicLong`/`AtomicInteger`/`AtomicBoolean` hold a non-null primitive record;
 //! `AtomicString`/`AtomicVar` are nullable (a null record decodes to `null`).
 //! Catalog rows: `type=AtomicLong|AtomicInteger|AtomicBoolean|AtomicString|AtomicVar`,
@@ -85,6 +94,7 @@ fn NumericAtomic(comptime S: type, comptime P: type, comptime Ser: anytype) type
         store: *S,
         alloc: Allocator,
         recid: u64,
+        closed: bool = false,
 
         pub fn init(store: *S, alloc: Allocator, recid: u64) Self {
             return .{ .store = store, .alloc = alloc, .recid = recid };
@@ -92,13 +102,23 @@ fn NumericAtomic(comptime S: type, comptime P: type, comptime Ser: anytype) type
         pub fn getRecid(self: Self) u64 {
             return self.recid;
         }
+        /// Invalidate this handle (called by `Db.closeAtomic`).
+        pub fn closeHandle(self: *Self) void {
+            self.closed = true;
+        }
+        fn checkOpen(self: Self) DbError!void {
+            if (self.closed) return error.StoreClosed;
+        }
         pub fn get(self: Self) DbError!P {
+            try self.checkOpen();
             return (try self.store.get(P, self.alloc, self.recid, Ser)) orelse missing();
         }
         pub fn set(self: Self, value: P) DbError!void {
+            try self.checkOpen();
             return self.store.update(P, self.alloc, self.recid, value, Ser);
         }
         pub fn compareAndSet(self: Self, expect: P, new: P) DbError!bool {
+            try self.checkOpen();
             return self.store.compareAndSwap(P, self.alloc, self.recid, @as(?P, expect), @as(?P, new), Ser);
         }
         pub fn getAndSet(self: Self, new: P) DbError!P {
@@ -122,6 +142,10 @@ fn NumericAtomicWithMath(comptime S: type, comptime P: type, comptime Ser: anyty
         }
         pub fn getRecid(self: Self) u64 {
             return self.base.recid;
+        }
+        /// Invalidate this handle (called by `Db.closeAtomic`).
+        pub fn closeHandle(self: *Self) void {
+            self.base.closeHandle();
         }
         pub fn get(self: Self) DbError!P {
             return self.base.get();
@@ -182,6 +206,7 @@ pub fn AtomicString(comptime S: type) type {
         store: *S,
         alloc: Allocator,
         recid: u64,
+        closed: bool = false,
 
         pub fn init(store: *S, alloc: Allocator, recid: u64) Self {
             return .{ .store = store, .alloc = alloc, .recid = recid };
@@ -189,16 +214,26 @@ pub fn AtomicString(comptime S: type) type {
         pub fn getRecid(self: Self) u64 {
             return self.recid;
         }
+        /// Invalidate this handle (called by `Db.closeAtomic`).
+        pub fn closeHandle(self: *Self) void {
+            self.closed = true;
+        }
+        fn checkOpen(self: Self) DbError!void {
+            if (self.closed) return error.StoreClosed;
+        }
         /// `null` when the stored value is null; otherwise an OWNED string.
         pub fn get(self: Self) DbError!?[]const u8 {
+            try self.checkOpen();
             const outer = try self.store.get(?[]const u8, self.alloc, self.recid, STRING_NULLABLE);
             // outer is ?(?[]const u8): the record is always present, so unwrap once.
             return outer orelse null;
         }
         pub fn set(self: Self, value: ?[]const u8) DbError!void {
+            try self.checkOpen();
             return self.store.update(?[]const u8, self.alloc, self.recid, value, STRING_NULLABLE);
         }
         pub fn compareAndSet(self: Self, expect: ?[]const u8, new: ?[]const u8) DbError!bool {
+            try self.checkOpen();
             return self.store.compareAndSwap(?[]const u8, self.alloc, self.recid, @as(??[]const u8, expect), @as(??[]const u8, new), STRING_NULLABLE);
         }
         /// Atomically set to `new` and return the OWNED previous value (Java
@@ -231,6 +266,7 @@ pub fn AtomicVar(comptime S: type, comptime Se: type) type {
         alloc: Allocator,
         recid: u64,
         se: Se,
+        closed: bool = false,
 
         pub fn init(store: *S, alloc: Allocator, recid: u64, se: Se) Self {
             return .{ .store = store, .alloc = alloc, .recid = recid, .se = se };
@@ -238,14 +274,24 @@ pub fn AtomicVar(comptime S: type, comptime Se: type) type {
         pub fn getRecid(self: Self) u64 {
             return self.recid;
         }
+        /// Invalidate this handle (called by `Db.closeAtomic`).
+        pub fn closeHandle(self: *Self) void {
+            self.closed = true;
+        }
+        fn checkOpen(self: Self) DbError!void {
+            if (self.closed) return error.StoreClosed;
+        }
         /// `null` when the record is null; otherwise an OWNED `E`.
         pub fn get(self: Self) DbError!?E {
+            try self.checkOpen();
             return self.store.get(E, self.alloc, self.recid, self.se);
         }
         pub fn set(self: Self, value: ?E) DbError!void {
+            try self.checkOpen();
             return self.store.update(E, self.alloc, self.recid, value, self.se);
         }
         pub fn compareAndSet(self: Self, expect: ?E, new: ?E) DbError!bool {
+            try self.checkOpen();
             return self.store.compareAndSwap(E, self.alloc, self.recid, expect, new, self.se);
         }
         /// Atomically set to `new`, returning the OWNED previous value (Java
