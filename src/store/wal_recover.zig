@@ -92,6 +92,7 @@ const iv = @import("index_val.zig");
 const tainted = @import("../tainted.zig");
 const direct = @import("direct.zig");
 const StoreDirect = direct.StoreDirect;
+pub const DEFAULT_RECOVERY_INDEX_MAX_BYTES: u64 = 64 << 20;
 const STATE_LIVE = direct.STATE_LIVE;
 const mod = @import("mod.zig");
 const AppendResult = mod.AppendResult;
@@ -1028,6 +1029,7 @@ fn pass2(
     inner: *StoreDirect,
     ids: *Identities,
     replay_buf: usize,
+    recovery_index_max_bytes: u64,
     alloc: Allocator,
     diag: *Diag,
 ) DbError!void {
@@ -1062,7 +1064,7 @@ fn pass2(
         // A 'K' body carries no entries and is NEVER passed to the entry decoder;
         // 'C' is semantically identical to 'S' and gets no special handling.
         if (h.tag != TAG_MARK) {
-            try applySection(inner, &input, &seen, body_start, body_end, h.lsn, ids, alloc, diag);
+            try applySection(inner, &input, &seen, body_start, body_end, h.lsn, ids, recovery_index_max_bytes, alloc, diag);
         }
         pos = body_end;
     }
@@ -1097,6 +1099,7 @@ fn applySection(
     end: u64,
     lsn: i64,
     ids: *Identities,
+    recovery_index_max_bytes: u64,
     alloc: Allocator,
     diag: *Diag,
 ) DbError!void {
@@ -1124,6 +1127,7 @@ fn applySection(
                     diag.note(R_PREALLOC_LIVE, 0, 0, recid, lsn);
                     return error.DataCorruption;
                 }
+                if (direct.indexBytesForRecid(recid) > recovery_index_max_bytes) return error.StoreFull;
                 inner.walPrealloc(recid) catch |e| return innerFault(e, diag, recid, lsn);
                 try ids.stateOnly(alloc, recid, lsn);
             },
@@ -1157,6 +1161,7 @@ fn applySection(
                     diag.note(R_RECORD_CAP, 0, 0, recid, @bitCast(cap));
                     return error.DataCorruption;
                 }
+                if (direct.indexBytesForRecid(recid) > recovery_index_max_bytes) return error.StoreFull;
                 inner.walPut(recid, try tainted.u64ToUsize(cap), data) catch |e|
                     return innerFault(e, diag, recid, lsn);
                 if (data == null) {
@@ -1307,6 +1312,18 @@ pub fn recover(
     alloc: Allocator,
     diag: *Diag,
 ) DbError!Recovered {
+    return recoverWithIndexLimit(set, inner, replay_buf, DEFAULT_RECOVERY_INDEX_MAX_BYTES, alloc, diag);
+}
+
+pub fn recoverWithIndexLimit(
+    set: *WalSegmentSet,
+    inner: *StoreDirect,
+    replay_buf: usize,
+    recovery_index_max_bytes: u64,
+    alloc: Allocator,
+    diag: *Diag,
+) DbError!Recovered {
+    if (recovery_index_max_bytes < direct.INDEX_ZERO_PAGE_BYTES) return error.WrongConfiguration;
     // The reason must describe THIS recovery: a caller that reuses a `Diag` would
     // otherwise read an earlier open's explanation for this one's refusal.
     diag.* = .{};
@@ -1403,7 +1420,7 @@ pub fn recover(
         if (set.segmentsSlice()[i].seq <= cleaned_through) continue;
         const is_active = i == n - 1;
         try set.segmentsSlice()[i].ensureOpen();
-        const applied = pass2(&set.segmentsSlice()[i], inner, &ids, replay_buf, alloc, diag);
+        const applied = pass2(&set.segmentsSlice()[i], inner, &ids, replay_buf, recovery_index_max_bytes, alloc, diag);
         // The active segment keeps its handle: R7 may still truncate it.
         if (!is_active) set.segmentsSlice()[i].release();
         try applied;

@@ -24,6 +24,7 @@ const DataOutput2 = io.DataOutput2;
 const iv = @import("index_val.zig");
 const direct = @import("direct.zig");
 const StoreDirect = direct.StoreDirect;
+const StoreWAL = @import("wal.zig").StoreWAL;
 const ws = @import("wal_segments.zig");
 const WalSegmentSet = ws.WalSegmentSet;
 const Segment = ws.Segment;
@@ -623,6 +624,71 @@ test "wal3 B1: an untorn open does not rotate" {
     // legitimately empty highest segment to non-highest (H8).
     try expectOnDisk(&sc, &.{1});
     try testing.expectEqual(@as(i64, 2), r.next_lsn);
+}
+
+test "wal3 recovery index budget bounds sparse replay and permits an explicit raise" {
+    const a = testing.allocator;
+    try testing.expectEqual(@as(u128, 1 << 20), direct.indexBytesForRecid(65_528));
+    try testing.expectEqual(@as(u128, 2 << 20), direct.indexBytesForRecid(65_529));
+    try testing.expect(direct.indexBytesForRecid(std.math.maxInt(u64)) > wr.DEFAULT_RECOVERY_INDEX_MAX_BYTES);
+    var sc = try Scratch.init(a, "index-budget");
+    defer sc.deinit();
+    var img = try SegImage.init(a, 1, 1);
+    defer img.deinit();
+    var body = Body.init(a);
+    defer body.deinit();
+    try body.prealloc(65_529); // first recid requiring a second 1 MiB index page
+    try img.commit(1, &body);
+    try img.write(&sc);
+    try testing.expectError(error.WrongConfiguration, StoreWAL.openCfg(a, sc.base, .{
+        .read_only = true,
+        .recovery_index_max_bytes = (1 << 20) - 1,
+    }));
+    try testing.expectError(error.StoreFull, StoreWAL.openCfg(a, sc.base, .{
+        .read_only = true,
+        .recovery_index_max_bytes = 1 << 20,
+    }));
+    try sc.expectSegmentBytes(1, img.bytes.items);
+    var opened = try StoreWAL.openCfg(a, sc.base, .{
+        .read_only = true,
+        .recovery_index_max_bytes = 2 << 20,
+    });
+    defer opened.deinit();
+    try sc.expectSegmentBytes(1, img.bytes.items);
+}
+
+test "wal3 default recovery index budget rejects an extreme recid before growth" {
+    const a = testing.allocator;
+    var sc = try Scratch.init(a, "index-budget-default");
+    defer sc.deinit();
+    var img = try SegImage.init(a, 1, 1);
+    defer img.deinit();
+    var body = Body.init(a);
+    defer body.deinit();
+    try body.prealloc(65_528 + 64 * 131_070);
+    try img.commit(1, &body);
+    try img.write(&sc);
+    try testing.expectError(error.StoreFull, StoreWAL.openCfg(a, sc.base, .{ .read_only = true }));
+    try sc.expectSegmentBytes(1, img.bytes.items);
+}
+
+test "wal3 recovery index budget leaves high void deletes valid" {
+    const a = testing.allocator;
+    var sc = try Scratch.init(a, "index-budget-delete");
+    defer sc.deinit();
+    var img = try SegImage.init(a, 1, 1);
+    defer img.deinit();
+    var body = Body.init(a);
+    defer body.deinit();
+    try body.delete(std.math.maxInt(u64));
+    try img.commit(1, &body);
+    try img.write(&sc);
+    var opened = try StoreWAL.openCfg(a, sc.base, .{
+        .read_only = true,
+        .recovery_index_max_bytes = 1 << 20,
+    });
+    defer opened.deinit();
+    try sc.expectSegmentBytes(1, img.bytes.items);
 }
 
 test "wal3 B1: a damaged header followed by the exact next section is corruption" {

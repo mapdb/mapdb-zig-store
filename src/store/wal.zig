@@ -264,6 +264,10 @@ pub const WalOptions = struct {
     segment_bytes: u64 = DEFAULT_SEGMENT_BYTES,
     /// Streaming window for replay; a tiny value forces refill edges in tests.
     replay_buf: usize = DEFAULT_REPLAY_BUF,
+    /// Maximum dense inner-index bytes replay may require for any logged recid.
+    /// This limits recovery growth only, not live writes or total heap use.
+    /// Raise it before reopening a store whose valid sparse index needs more.
+    recovery_index_max_bytes: u64 = wr.DEFAULT_RECOVERY_INDEX_MAX_BYTES,
     /// The durability-event seam, installed into the segment set — the ONE
     /// store-owned pointer (`segs.io`); nothing else holds a copy. Borrowed
     /// for the life of the store; the installer owns the lifetime.
@@ -1757,6 +1761,7 @@ pub const StoreWAL = struct {
         if (opts.segment_bytes < MIN_SEGMENT_BYTES) {
             return error.WrongConfiguration; // WAL segment size below the 61-byte minimum (a segment header plus one section header)
         }
+        if (opts.recovery_index_max_bytes < direct.INDEX_ZERO_PAGE_BYTES) return error.WrongConfiguration;
         // D4, the platform gate: a durable writable open REQUIRES a working
         // directory fsync — the acknowledgement rule is "the section is forced
         // AND the directory entry of the segment holding it is durable" — and
@@ -1788,7 +1793,7 @@ pub const StoreWAL = struct {
         };
         // A failed recovery closes and frees the set, which releases the store
         // lock — Java's `finally { closeQuietly() }`.
-        const rec = wr.recover(&segs, &inner, opts.replay_buf, alloc, diag) catch |e| {
+        const rec = wr.recoverWithIndexLimit(&segs, &inner, opts.replay_buf, opts.recovery_index_max_bytes, alloc, diag) catch |e| {
             segs.deinit();
             inner.deinit();
             return e;

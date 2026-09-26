@@ -65,6 +65,16 @@ const ZERO_SLOTS_START: u64 = HEAD_END + 16;
 const RECIDS_PER_ZERO_PAGE: u64 = (PAGE_SIZE - ZERO_SLOTS_START) / 8; // 65528
 const RECIDS_PER_PAGE: u64 = (PAGE_SIZE - 16) / 8; // 131070
 
+/// Dense index geometry required to address a replayed recid. Compute in a
+/// wider domain so a crafted maximum recid cannot wrap the budget comparison.
+pub fn indexBytesForRecid(recid: u64) u128 {
+    const extra: u128 = if (recid > RECIDS_PER_ZERO_PAGE) recid - RECIDS_PER_ZERO_PAGE else 0;
+    const pages = 1 + (extra + RECIDS_PER_PAGE - 1) / RECIDS_PER_PAGE;
+    return pages * PAGE_SIZE;
+}
+
+pub const INDEX_ZERO_PAGE_BYTES: u64 = PAGE_SIZE;
+
 const HEAD_CHECKSUM_SEED: i32 = @bitCast(@as(u32, 0x5D1B_A5E1));
 
 const LONG_STACK_PREF_SIZE: u64 = 160;
@@ -314,21 +324,20 @@ pub const StoreDirect = struct {
     fn loadIndexPages(self: *Self, file_tail: u64) DbError!void {
         var pages: std.ArrayListUnmanaged(u64) = .empty;
         errdefer pages.deinit(self.alloc);
-        // detect chain cycles by repeated offset (a
-        // one-node self-cycle must not spin/allocate up to a huge fixed bound)
-        // and cap the count by the physical maximum derivable from fileTail
-        // (unique page-aligned pages cannot exceed fileTail / PAGE_SIZE).
-        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        defer seen.deinit(self.alloc);
+        // The writer allocates index pages from an increasing fileTail. Require
+        // that order here: it rejects cycles/reordered chains and permits a
+        // binary membership check on every data extent read or release.
         const max_pages = file_tail / PAGE_SIZE;
         var ptr = ZERO_PAGE_LINK;
+        var previous: u64 = 0;
         while (true) {
             const page = try parity.p16get(try self.vol.getU64(ptr));
             if (page == 0) break;
             if (page % PAGE_SIZE != 0 or page >= file_tail) return error.DataCorruption; // bad index page pointer
-            if ((try seen.fetchPut(self.alloc, page, {})) != null) return error.DataCorruption; // index page chain cycle
+            if (page <= previous) return error.DataCorruption; // index pages must follow allocation order
             try pages.append(self.alloc, page);
             if (pages.items.len > max_pages) return error.DataCorruption; // more pages than fileTail admits
+            previous = page;
             ptr = page + 8;
         }
         const owned = try pages.toOwnedSlice(self.alloc);
@@ -550,9 +559,37 @@ pub const StoreDirect = struct {
         try self.setDataTail(if (new_tail % PAGE_SIZE == 0) 0 else new_tail);
     }
 
+    /// Validate the complete extent described by a possibly corrupt index slot
+    /// before placing it on a free list or writing through it.
+    fn validateDataExtent(self: *Self, size_bytes: u64, offset: u64) DbError!void {
+        if (size_bytes & 15 != 0 or size_bytes < 16 or size_bytes / 16 > MAX_CAP_UNITS or
+            offset < PAGE_SIZE or offset & 15 != 0)
+            return error.DataCorruption;
+        const within_page = offset % PAGE_SIZE;
+        if (size_bytes > PAGE_SIZE - within_page) return error.DataCorruption;
+        const page = offset - within_page;
+        var g: SharedPages.Guard = undefined;
+        self.index_pages.loadInto(&g);
+        defer g.release();
+        const pages = g.get().*;
+        var lo: usize = 0;
+        var hi: usize = pages.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (pages[mid] < page) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo < pages.len and pages[lo] == page) return error.DataCorruption;
+        const file_tail = try self.fileTail();
+        if (offset >= file_tail or size_bytes > file_tail - offset) return error.DataCorruption;
+        try self.vol.checkRange(offset, size_bytes);
+    }
+
     fn releaseDataLocked(self: *Self, size_bytes: u64, offset: u64) DbError!void {
-        std.debug.assert(size_bytes & 15 == 0 and size_bytes >= 16 and size_bytes / 16 <= MAX_CAP_UNITS);
-        std.debug.assert(offset & 15 == 0 and offset >= PAGE_SIZE);
+        try self.validateDataExtent(size_bytes, offset);
         try self.longStackPut(masterLinkOffset(size_bytes / 16), parity.p1set(offset >> 3));
         _ = self.free_data_bytes.fetchAdd(@intCast(size_bytes), .monotonic);
     }
@@ -709,9 +746,8 @@ pub const StoreDirect = struct {
         var total: u64 = 0;
         while (true) {
             const cap_bytes = cap_units * 16;
-            if (off < PAGE_SIZE or off & 15 != 0) return error.DataCorruption; // chunk offset in header/misaligned
+            try self.validateDataExtent(cap_bytes, off);
             if ((try seen.fetchPut(self.alloc, off, {})) != null) return error.DataCorruption; // linked chunk chain cycle
-            try self.vol.checkRange(off, cap_bytes);
             const len = try self.vol.getI32(off);
             if (len < 0 or LINKED_CHUNK_HDR + @as(u64, @intCast(len)) > cap_bytes)
                 return error.DataCorruption; // linked chunk length out of range
@@ -806,8 +842,7 @@ pub const StoreDirect = struct {
     /// Read record header of a non-linked live iv, validating `used`.
     fn readUsed(self: *Self, ivval: u64) DbError!OffUsed {
         const off = iv.offset(ivval);
-        if (off < PAGE_SIZE or off & 15 != 0) return error.DataCorruption; // offset in header/misaligned
-        try self.vol.checkRange(off, 4);
+        try self.validateDataExtent(@as(u64, iv.capUnits(ivval)) * 16, off);
         const used = try self.vol.getI32(off);
         const cap_bytes: i64 = @as(i64, iv.capUnits(ivval)) * 16;
         if (used < 0 or 4 + @as(i64, used) > cap_bytes) return error.DataCorruption; // used beyond capacity
@@ -1538,8 +1573,7 @@ pub const StoreDirect = struct {
             // in-place: validate the value-derived offset BEFORE writing (a
             // corrupt index must not clobber header/allocator words).
             const off = iv.offset(ivval);
-            if (off < PAGE_SIZE or off & 15 != 0) return error.DataCorruption; // offset in header/misaligned
-            try self.vol.checkRange(off, @as(u64, old_cap) * 16);
+            try self.validateDataExtent(@as(u64, old_cap) * 16, off);
             try self.vol.putI32(off, @intCast(buf.len));
             try self.vol.putData(off + 4, buf);
             try self.indexSet(recid, iv.compose(old_cap, off, 0));

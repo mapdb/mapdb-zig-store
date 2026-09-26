@@ -33,6 +33,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const DbError = @import("../errors.zig").DbError;
 const storemod = @import("../store/mod.zig");
+const walmod = @import("../store/wal.zig");
 const btree = @import("../btree/mod.zig");
 const blocking = @import("../queue/blocking.zig");
 const catalogmod = @import("catalog.zig");
@@ -1282,10 +1283,24 @@ fn uniqueTempPath(alloc: Allocator, dir: []const u8) DbError![]u8 {
 /// regular file at `<path>` or `<path>.wal`, or anything at `<path>.ckpt`,
 /// refuses the open — those are pre-v3 artifacts and there is no migration.
 pub fn fileWalDb(alloc: Allocator, path: []const u8) DbError!Db(StoreWAL) {
+    return fileWalDbWithOptions(alloc, path, .{});
+}
+
+pub const FileWalDbOptions = struct {
+    /// Replay-only dense index budget. Raise before reopening a valid sparse DB.
+    recovery_index_max_bytes: u64 = @import("../store/wal_recover.zig").DEFAULT_RECOVERY_INDEX_MAX_BYTES,
+    delete_after_close: bool = false,
+};
+
+/// Open a WAL DB with a recovery budget and optional namespace removal at close.
+pub fn fileWalDbWithOptions(alloc: Allocator, path: []const u8, opts: FileWalDbOptions) DbError!Db(StoreWAL) {
     const s = try alloc.create(StoreWAL);
     errdefer alloc.destroy(s);
-    s.* = try StoreWAL.open(alloc, path, true);
+    s.* = try StoreWAL.openCfg(alloc, path, walmod.WalOptions{
+        .recovery_index_max_bytes = opts.recovery_index_max_bytes,
+    });
     errdefer s.deinit();
+    if (opts.delete_after_close) s.setDeleteOnClose(true);
     return Db(StoreWAL).init(alloc, s, true);
 }
 
@@ -1296,12 +1311,7 @@ pub fn fileWalDb(alloc: Allocator, path: []const u8) DbError!Db(StoreWAL) {
 /// second opener can acquire the namespace mid-delete. The DB layer registers
 /// no cleanup paths of its own — the store owns the deletion.
 pub fn fileWalDbDeleteAfterClose(alloc: Allocator, base: []const u8) DbError!Db(StoreWAL) {
-    const s = try alloc.create(StoreWAL);
-    errdefer alloc.destroy(s);
-    s.* = try StoreWAL.open(alloc, base, true);
-    errdefer s.deinit();
-    s.setDeleteOnClose(true);
-    return Db(StoreWAL).init(alloc, s, true);
+    return fileWalDbWithOptions(alloc, base, .{ .delete_after_close = true });
 }
 
 /// A read-only DB over an existing file (Java `fileDB(f).readOnly().make()`).
@@ -1639,6 +1649,60 @@ test "rollback rejects missing recid-1 catalog + poisons the facade" {
     try store.commit();
     try testing.expectError(error.DataCorruption, db.rollback());
     try testing.expect(db.isClosed()); // poisoned to a terminal state; deinit safe
+}
+
+test "WAL DB facade passes the recovery index option through reopen" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+    const file = try std.fmt.allocPrint(a, "{s}/wal.db", .{dir});
+    defer a.free(file);
+    try testing.expectError(error.WrongConfiguration, fileWalDbWithOptions(a, file, .{
+        .recovery_index_max_bytes = (1 << 20) - 1,
+    }));
+    {
+        var db = try fileWalDbWithOptions(a, file, .{ .recovery_index_max_bytes = 2 << 20 });
+        defer db.deinit();
+        try db.close();
+    }
+    // Add a CRC-valid section after the facade's committed catalog at LSN 1.
+    // Recid 65,529 is the first one needing a second dense index page.
+    const segment = try std.fmt.allocPrint(a, "{s}.wal.0000000000000001", .{file});
+    defer a.free(segment);
+    {
+        const wr = @import("../store/wal_recover.zig");
+        const segs = @import("../store/wal_segments.zig");
+        const DataOutput2 = @import("../io.zig").DataOutput2;
+        const f = try std.fs.cwd().openFile(segment, .{ .mode = .read_write });
+        defer f.close();
+        const end = try f.getEndPos();
+        var hdr: [@as(usize, segs.SEG_HDR)]u8 = undefined;
+        try testing.expectEqual(hdr.len, try f.preadAll(&hdr, 0));
+        var first: [@as(usize, wr.SEC_HDR)]u8 = undefined;
+        try testing.expectEqual(first.len, try f.preadAll(&first, segs.SEG_HDR));
+        try testing.expectEqual(@as(i64, 1), wr.parseSecHdr(&first).lsn);
+        var out = DataOutput2.init(a);
+        defer out.deinit();
+        try out.writeU8(wr.T_PREALLOC);
+        try out.packLong(65_529);
+        const section = wr.buildSecHdr(&hdr, end, wr.TAG_SECTION, 2, out.bytes());
+        try f.pwriteAll(&section, end);
+        try f.pwriteAll(out.bytes(), end + wr.SEC_HDR);
+    }
+    try testing.expectError(error.StoreFull, fileWalDbWithOptions(a, file, .{
+        .recovery_index_max_bytes = 1 << 20,
+    }));
+    {
+        var db = try fileWalDbWithOptions(a, file, .{
+            .recovery_index_max_bytes = 2 << 20,
+            .delete_after_close = true,
+        });
+        defer db.deinit();
+        try db.close();
+    }
+    try testing.expectError(error.FileNotFound, std.fs.cwd().access(segment, .{}));
 }
 
 test "tempFileDb creates + cleans up its file" {

@@ -14,7 +14,8 @@ pub const DbError = error{
     RecordTooLarge,
     /// Persisted bytes failed a structural/parity/checksum invariant.
     DataCorruption,
-    /// Allocator hit the 44-bit volume ceiling (or backing store full).
+    /// Allocator hit its volume ceiling, backing store is full, or WAL replay
+    /// needs a larger configured dense-index budget.
     StoreFull,
     /// Operation attempted on a closed store.
     StoreClosed,

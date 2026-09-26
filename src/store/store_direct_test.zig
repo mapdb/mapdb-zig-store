@@ -335,6 +335,7 @@ test "free list reuse across reopen hot path" {
 const O_HEAD_CHECKSUM: usize = 16;
 const O_DATA_TAIL: usize = 24;
 const O_MAX_RECID: usize = 32;
+const O_FILE_TAIL: usize = 40;
 const O_FREE_RECID_STACK: usize = 64;
 const MASTER_U1: usize = 72; // O_FREE_DATA_STACKS
 const ZERO_SLOTS_START: usize = 524352;
@@ -665,6 +666,118 @@ test "capUnits==0 index slot → DataCorruption on delete and update (no trap)" 
     try testing.expectError(error.DataCorruption, s.get([]const u8, a, 1, R));
 }
 
+test "parity-valid invalid data extents refuse before destructive operations" {
+    const a = testing.allocator;
+    const modes = enum { delete, update_null, update_grow, wal_put, wal_delete };
+    for ([_]u8{ 0, 1, 2 }) |bad_kind| {
+        for ([_]modes{ .delete, .update_null, .update_grow, .wal_put, .wal_delete }) |mode| {
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try tmpPath(a, &tmp, "store.sd1");
+            defer a.free(path);
+            {
+                var s = try StoreDirect.openFile(a, path, true);
+                defer s.deinit();
+                const v = try bytes(a, 1, 12);
+                defer a.free(v);
+                _ = try s.put([]const u8, a, v, R);
+                try s.close();
+            }
+            const buf = try readWholeFile(a, path);
+            defer a.free(buf);
+            const original = try parity.p1get(u64At(buf, ZERO_SLOTS_START));
+            const cap = iv.capUnits(original);
+            const file_tail = try parity.p16get(u64At(buf, O_FILE_TAIL));
+            const bad_off: u64 = switch (bad_kind) {
+                0 => 0,
+                1 => 2 * PAGE_SIZE - 16,
+                else => file_tail,
+            };
+            const bad_cap: u32 = if (bad_kind == 1) 2 else cap;
+            putU64At(buf, ZERO_SLOTS_START, parity.p1set(iv.compose(bad_cap, bad_off, 0)));
+            try writeWholeFile(path, buf);
+            var s = try StoreDirect.openFile(a, path, true);
+            defer s.deinit();
+            const big = try bytes(a, 2, 100);
+            defer a.free(big);
+            switch (mode) {
+                .delete => try testing.expectError(error.DataCorruption, s.delete(1)),
+                .update_null => try testing.expectError(error.DataCorruption, s.update([]const u8, a, 1, null, R)),
+                .update_grow => try testing.expectError(error.DataCorruption, s.update([]const u8, a, 1, big, R)),
+                .wal_put => try testing.expectError(error.DataCorruption, s.walPut(1, 16, "x")),
+                .wal_delete => try testing.expectError(error.DataCorruption, s.walDelete(1)),
+            }
+            const after = try readWholeFile(a, path);
+            defer a.free(after);
+            try testing.expectEqualSlices(u8, buf, after);
+        }
+    }
+}
+
+test "parity-valid data extent inside an index page is rejected" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(a, &tmp, "store.sd1");
+    defer a.free(path);
+    {
+        var s = try StoreDirect.openFile(a, path, true);
+        defer s.deinit();
+        try s.walPut(1, 16, "a");
+        try s.walPut(65_529, 16, "b"); // allocates the first nonzero index page
+        try s.close();
+    }
+    const buf = try readWholeFile(a, path);
+    defer a.free(buf);
+    const index_page = try parity.p16get(u64At(buf, ZERO_PAGE_LINK));
+    try testing.expect(index_page >= PAGE_SIZE);
+    putU64At(buf, ZERO_SLOTS_START, parity.p1set(iv.compose(1, index_page, 0)));
+    try writeWholeFile(path, buf);
+    var s = try StoreDirect.openFile(a, path, true);
+    defer s.deinit();
+    try testing.expectError(error.DataCorruption, s.delete(1));
+    try testing.expectError(error.DataCorruption, s.update([]const u8, a, 1, "longer value", R));
+    try testing.expectError(error.DataCorruption, s.walPut(1, 16, "c"));
+    try testing.expectError(error.DataCorruption, s.append(1, "d"));
+    try testing.expectError(error.DataCorruption, s.get([]const u8, a, 1, R));
+    const after = try readWholeFile(a, path);
+    defer a.free(after);
+    try testing.expectEqualSlices(u8, buf, after);
+}
+
+test "writer index pages reopen in order and a reordered chain is refused" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(a, &tmp, "store.sd1");
+    defer a.free(path);
+    {
+        var s = try StoreDirect.openFile(a, path, true);
+        defer s.deinit();
+        try s.walPut(65_529, 16, "a");
+        try s.walPut(196_599, 16, "b");
+        try s.close();
+    }
+    {
+        var s = try StoreDirect.openFile(a, path, true);
+        defer s.deinit();
+        try expectContent(&s, a, 65_529, "a");
+        try expectContent(&s, a, 196_599, "b");
+        try s.close();
+    }
+    const buf = try readWholeFile(a, path);
+    defer a.free(buf);
+    const first = try parity.p16get(u64At(buf, ZERO_PAGE_LINK));
+    const second = try parity.p16get(u64At(buf, @intCast(first + 8)));
+    try testing.expect(first < second);
+    putU64At(buf, ZERO_PAGE_LINK, parity.p16set(second));
+    putU64At(buf, @intCast(second + 8), parity.p16set(first));
+    putU64At(buf, @intCast(first + 8), parity.p16set(0));
+    restampHeaderChecksum(buf);
+    try writeWholeFile(path, buf);
+    try testing.expectError(error.DataCorruption, StoreDirect.openFile(a, path, true));
+}
+
 // (c) A parity-corrupt (bit-flipped) index slot must surface DataCorruption
 // through getAllRecids, not silently emit/omit a recid.
 test "parity-corrupt index slot → getAllRecids DataCorruption" {
@@ -785,6 +898,39 @@ test "one-node linked-record chain cycle → DataCorruption, bounded memory" {
     var s = try StoreDirect.openFile(ca, path, true);
     defer s.deinit();
     try testing.expectError(error.DataCorruption, s.get([]const u8, ca, 1, R));
+}
+
+test "late invalid linked chunk refuses before any chunk is freed" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(a, &tmp, "store.sd1");
+    defer a.free(path);
+    {
+        var s = try StoreDirect.openFile(a, path, true);
+        defer s.deinit();
+        const big = try bytes(a, 1, 1_100_000);
+        defer a.free(big);
+        _ = try s.put([]const u8, a, big, R);
+        try s.walPrealloc(65_529); // creates an index page after the linked data
+        try s.close();
+    }
+    const buf = try readWholeFile(a, path);
+    defer a.free(buf);
+    const index_page = try parity.p16get(u64At(buf, ZERO_PAGE_LINK));
+    const fake_chunk = index_page + 32; // unused index slot bytes, still mapped
+    const iv_h = try parity.p1get(u64At(buf, ZERO_SLOTS_START));
+    const head_off = iv.offset(iv_h);
+    putU64At(buf, @intCast(head_off + 4), parity.p1set((@as(u64, 1) << 48) | fake_chunk));
+    std.mem.writeInt(i32, buf[@intCast(fake_chunk)..][0..4], 0, .big);
+    putU64At(buf, @intCast(fake_chunk + 4), parity.p1set(0));
+    try writeWholeFile(path, buf);
+    var s = try StoreDirect.openFile(a, path, true);
+    defer s.deinit();
+    try testing.expectError(error.DataCorruption, s.delete(1));
+    const after = try readWholeFile(a, path);
+    defer a.free(after);
+    try testing.expectEqualSlices(u8, buf, after);
 }
 
 // (e) FailingAllocator sweep at the index-page mirror publication + the compact

@@ -32,6 +32,8 @@ pub const fileDbDeleteAfterClose = db.fileDbDeleteAfterClose;
 pub const fileDbDeleteAfterOpen = db.fileDbDeleteAfterOpen;
 pub const tempFileDb = db.tempFileDb;
 pub const fileWalDb = db.fileWalDb;
+pub const FileWalDbOptions = db.FileWalDbOptions;
+pub const fileWalDbWithOptions = db.fileWalDbWithOptions;
 pub const fileReadOnlyDb = db.fileReadOnlyDb;
 pub const validateFileOptions = db.validateFileOptions;
 

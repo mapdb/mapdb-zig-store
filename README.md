@@ -141,6 +141,16 @@ for `mapdb.StoreWAL.open(alloc, path, true)` and use `store.commit()` /
 [`doc/durability.md`](doc/durability.md). For an **in-memory** map, use
 `mapdb.StoreOnHeap.init(alloc, true)` (no path, non-durable).
 
+WAL replay defaults to a 64 MiB dense-index budget. A valid sparse store can
+need more: reopen it with `mapdb.StoreWAL.openCfg(alloc, path,
+.{ .recovery_index_max_bytes = 128 << 20 })`, or use
+`mapdb.db.fileWalDbWithOptions(alloc, path,
+.{ .recovery_index_max_bytes = 128 << 20 })` for the DB facade. Add
+`.delete_after_close = true` to that DB option when desired. The minimum budget
+is 1 MiB; a smaller setting is `WrongConfiguration`, while a valid replay that
+exceeds it returns `StoreFull`. This limits replay index growth only: live
+writes can outgrow the chosen budget, and it does not cap total heap or RSS.
+
 Owned-slice keys and values (for example `[]const u8` via
 `ser.bytearray.ByteArrayFormat`) follow the same shape but require freeing what
 you get back — see [`doc/ownership-and-errors.md`](doc/ownership-and-errors.md).
